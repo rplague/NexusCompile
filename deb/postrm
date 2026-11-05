@@ -1,0 +1,19 @@
+#!/bin/sh
+# @BIN@ deb package postrm (after removal)
+# Arguments:
+#   remove       normal removal
+#   upgrade      upgrade
+#   purge        full purge (dpkg -P)
+# Note: runtime data under /var/lib/@PKG@ is not removed, and the @USER@ account is not removed.
+#       Logs are managed by journald and handled elsewhere.
+set -e
+
+UNIT_NAME="@PKG@"
+
+case "$1" in
+    remove|upgrade|abort-install|abort-upgrade|disappear|purge)
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ;;
+esac
+
+exit 0

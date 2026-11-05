@@ -1,0 +1,19 @@
+#!/bin/sh
+# @BIN@ deb package prerm (before removal)
+# Arguments:
+#   remove       removal
+#   upgrade      upgrade
+set -e
+
+UNIT_NAME="@PKG@"
+
+case "$1" in
+    remove)
+        systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+        ;;
+    upgrade|deconfigure)
+        systemctl stop "${UNIT_NAME}" >/dev/null 2>&1 || true
+        ;;
+esac
+
+exit 0
