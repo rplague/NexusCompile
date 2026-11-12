@@ -1,6 +1,5 @@
 //! Background capacity sampling, provider publishing, and consumer targeting.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use tokio::sync::watch;
@@ -15,8 +14,35 @@ use crate::control::{self, ControlHandle};
 use crate::log::{LogLevel, LogStruct};
 use crate::util::time::now_ms;
 
+const DISCOVERY_NORMAL_INTERVAL_MS: u64 = 60 * 60 * 1000;
+const DISCOVERY_FAULT_INTERVAL_MS: u64 = 30 * 1000;
+
+#[derive(Debug, Default)]
+pub struct DiscoveryState {
+    last_attempt_ms: Option<u64>,
+    last_abnormal: bool,
+}
+
+fn discovery_due(state: &DiscoveryState, now: u64, visible: u32) -> bool {
+    let interval = if visible == 0 || state.last_abnormal {
+        DISCOVERY_FAULT_INTERVAL_MS
+    } else {
+        DISCOVERY_NORMAL_INTERVAL_MS
+    };
+    match state.last_attempt_ms {
+        None => true,
+        Some(last) => now.saturating_sub(last) >= interval,
+    }
+}
+
+fn compatible(node: &NodeConfig, toolchain: &str, target: &str) -> bool {
+    (node.toolchain.is_empty() || node.toolchain == toolchain)
+        && (node.target.is_empty() || node.target == target)
+}
+
 pub async fn publish_due(
     control: &ControlHandle,
+    service_name: &str,
     provider: &Arc<Provider>,
     interval_ms: u64,
 ) -> usize {
@@ -25,7 +51,7 @@ pub async fn publish_due(
 
     let mut sent = 0;
     for (peer, request) in due {
-        match control::send(control, &peer, request).await {
+        match control::send(control, service_name, &peer, request).await {
             Ok(AppResponse::Ack) => sent += 1,
             Ok(_) | Err(_) => {
                 provider.unsubscribe(&peer);
@@ -41,27 +67,63 @@ pub async fn ensure_target(
     consumer: &Arc<Consumer>,
     node: &NodeConfig,
     subscription: &SubscriptionConfig,
+    service_name: &str,
+    discovery: &mut DiscoveryState,
 ) -> usize {
     if subscription.target_slots == 0 {
         return 0;
     }
 
     let provider_id = provider.provider_id();
-    let mut visible_capacity = provider.max_slots() + consumer.visible_max_slots();
-    let mut known: HashSet<PeerId> = consumer
-        .providers()
-        .into_iter()
-        .map(|view| view.provider)
-        .collect();
+    let mut visible_capacity =
+        provider.max_slots() + consumer.compatible_max_slots(&node.toolchain, &node.target);
+    if visible_capacity >= subscription.target_slots {
+        return 0;
+    }
+
+    let now = now_ms();
+    if !discovery_due(discovery, now, visible_capacity) {
+        return 0;
+    }
+    discovery.last_attempt_ms = Some(now);
+
+    let peers = match control::discover(control, service_name).await {
+        Ok(peers) if !peers.is_empty() => {
+            discovery.last_abnormal = false;
+            peers
+        }
+        Ok(_) => {
+            discovery.last_abnormal = true;
+            LogStruct::new(
+                LogLevel::Warning,
+                "自动发现异常",
+                format!("service={service_name}: 空 provider 列表"),
+            )
+            .emit();
+            clear_providers(control, consumer, service_name, &provider_id).await;
+            return 0;
+        }
+        Err(error) => {
+            discovery.last_abnormal = true;
+            LogStruct::new(
+                LogLevel::Warning,
+                "自动发现异常",
+                format!("service={service_name}: {error}"),
+            )
+            .emit();
+            clear_providers(control, consumer, service_name, &provider_id).await;
+            return 0;
+        }
+    };
 
     let mut subscribed = 0;
-    for raw_peer in &subscription.static_peers {
+    for raw_peer in peers {
         if visible_capacity >= subscription.target_slots {
             break;
         }
 
-        let peer = PeerId::new(raw_peer.clone());
-        if peer == provider_id || known.contains(&peer) {
+        let peer = PeerId::new(raw_peer);
+        if peer == provider_id || consumer.has_provider(&peer) {
             continue;
         }
 
@@ -73,22 +135,54 @@ pub async fn ensure_target(
             target: node.target.clone(),
         };
 
-        match control::send(control, &peer, request).await {
+        match control::send(control, service_name, &peer, request).await {
             Ok(AppResponse::Subscribed {
                 provider: _,
                 toolchain,
                 target,
                 max_slots,
             }) => {
-                consumer.record_subscribed(peer.clone(), toolchain, target, max_slots);
-                visible_capacity = visible_capacity.saturating_add(max_slots);
-                known.insert(peer);
-                subscribed += 1;
+                if compatible(node, &toolchain, &target) {
+                    consumer.record_subscribed(peer.clone(), toolchain, target, max_slots);
+                    visible_capacity = visible_capacity.saturating_add(max_slots);
+                    subscribed += 1;
+                } else {
+                    consumer.remove_provider(&peer);
+                    let _ = control::send(
+                        control,
+                        service_name,
+                        &peer,
+                        AppRequest::Unsubscribe {
+                            consumer: provider_id.clone(),
+                        },
+                    )
+                    .await;
+                }
             }
             Ok(_) | Err(_) => consumer.remove_provider(&peer),
         }
     }
     subscribed
+}
+
+async fn clear_providers(
+    control: &ControlHandle,
+    consumer: &Arc<Consumer>,
+    service_name: &str,
+    provider_id: &PeerId,
+) {
+    let cleared = consumer.clear();
+    for peer in cleared {
+        let _ = control::send(
+            control,
+            service_name,
+            &peer,
+            AppRequest::Unsubscribe {
+                consumer: provider_id.clone(),
+            },
+        )
+        .await;
+    }
 }
 
 pub fn expire_providers(consumer: &Arc<Consumer>, ttl_ms: u64) -> Vec<PeerId> {
@@ -105,7 +199,11 @@ fn sampled_snapshot(
     node: &NodeConfig,
 ) -> Result<CapacitySnapshot, SampleError> {
     let sample = source.sample().map_err(SampleError::Source)?;
-    Ok(calculate_capacity(&sample, provider.queue_len(), node))
+    Ok(calculate_capacity(
+        &sample,
+        provider.queue_len(),
+        node.max_usage_percent,
+    ))
 }
 
 fn apply_capacity(provider: &Arc<Provider>, snapshot: CapacitySnapshot) {
@@ -114,11 +212,13 @@ fn apply_capacity(provider: &Arc<Provider>, snapshot: CapacitySnapshot) {
 
 async fn publish_capacity_tick(
     control: &ControlHandle,
+    service_name: &str,
     provider: &Arc<Provider>,
     subscription: &SubscriptionConfig,
 ) {
     let _ = publish_due(
         control,
+        service_name,
         provider,
         subscription
             .update_interval_secs
@@ -134,8 +234,19 @@ async fn subscribe_capacity_tick(
     consumer: &Arc<Consumer>,
     node: &NodeConfig,
     subscription: &SubscriptionConfig,
+    service_name: &str,
+    discovery: &mut DiscoveryState,
 ) {
-    let _ = ensure_target(control, provider, consumer, node, subscription).await;
+    let _ = ensure_target(
+        control,
+        provider,
+        consumer,
+        node,
+        subscription,
+        service_name,
+        discovery,
+    )
+    .await;
 }
 
 fn expire_capacity_tick(consumer: &Arc<Consumer>, subscription: &SubscriptionConfig) {
@@ -161,8 +272,10 @@ pub async fn run_pool(
     mut shutdown: watch::Receiver<bool>,
     mut source: Box<dyn CapacitySource + Send>,
 ) {
+    let service_name = config.service_name;
     let node = config.node;
     let subscription = config.subscription;
+    let mut discovery = DiscoveryState::default();
 
     // Seed capacity before the first Subscribe/Subscribed exchange so `max_slots`
     // does not start at the placeholder value.
@@ -194,10 +307,19 @@ pub async fn run_pool(
                 }
             }
             _ = provider_tick.tick() => {
-                publish_capacity_tick(&control, &provider, &subscription).await;
+                publish_capacity_tick(&control, &service_name, &provider, &subscription).await;
             }
             _ = consumer_tick.tick() => {
-                subscribe_capacity_tick(&control, &provider, &consumer, &node, &subscription).await;
+                subscribe_capacity_tick(
+                    &control,
+                    &provider,
+                    &consumer,
+                    &node,
+                    &subscription,
+                    &service_name,
+                    &mut discovery,
+                )
+                .await;
             }
             _ = ttl_tick.tick() => {
                 expire_capacity_tick(&consumer, &subscription);
@@ -221,19 +343,34 @@ mod tests {
 
     struct MockControl {
         sent: Mutex<Vec<(PeerId, AppRequest)>>,
+        service_names: Mutex<Vec<String>>,
         responses: Mutex<VecDeque<Result<AppResponse, SidecarError>>>,
+        discoveries: Mutex<VecDeque<Result<Vec<String>, SidecarError>>>,
     }
 
     impl MockControl {
         fn new(responses: Vec<Result<AppResponse, SidecarError>>) -> Self {
+            Self::with_discoveries(responses, Vec::new())
+        }
+
+        fn with_discoveries(
+            responses: Vec<Result<AppResponse, SidecarError>>,
+            discoveries: Vec<Result<Vec<String>, SidecarError>>,
+        ) -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
+                service_names: Mutex::new(Vec::new()),
                 responses: Mutex::new(responses.into()),
+                discoveries: Mutex::new(discoveries.into()),
             }
         }
 
         fn sent(&self) -> Vec<(PeerId, AppRequest)> {
             self.sent.lock().unwrap().clone()
+        }
+
+        fn discovered_services(&self) -> Vec<String> {
+            self.service_names.lock().unwrap().clone()
         }
     }
 
@@ -241,12 +378,13 @@ mod tests {
     impl crate::control::ControlPlane for MockControl {
         async fn service_request_to(
             &self,
-            _service: &str,
+            service: &str,
             peer: &str,
             payload: Vec<u8>,
         ) -> Result<Vec<u8>, SidecarError> {
             let envelope: Envelope<AppRequest> = ciborium::de::from_reader(payload.as_slice())
                 .map_err(|e| SidecarError::new("decode_error", e.to_string()))?;
+            self.service_names.lock().unwrap().push(service.to_string());
             self.sent
                 .lock()
                 .unwrap()
@@ -270,6 +408,15 @@ mod tests {
                 description: String::new(),
             })
         }
+
+        async fn discover_providers(&self, service: &str) -> Result<Vec<String>, SidecarError> {
+            self.service_names.lock().unwrap().push(service.to_string());
+            self.discoveries
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(Vec::new()))
+        }
     }
 
     fn control_with(control: Arc<MockControl>) -> ControlHandle {
@@ -286,7 +433,7 @@ mod tests {
 
         let control = Arc::new(MockControl::new(vec![Ok(AppResponse::Ack)]));
         let handle = control_with(control.clone());
-        let sent = publish_due(&handle, &provider, 30_000).await;
+        let sent = publish_due(&handle, "rustc-pool", &provider, 30_000).await;
         assert_eq!(sent, 1);
         assert_eq!(control.sent().len(), 1);
         assert_eq!(provider.subscription_count(), 1);
@@ -294,7 +441,7 @@ mod tests {
         provider.subscribe(PeerId::new("consumer-2"), String::new(), String::new());
         let control = Arc::new(MockControl::new(vec![Err(SidecarError::new("io", "down"))]));
         let handle = control_with(control);
-        let sent = publish_due(&handle, &provider, 30_000).await;
+        let sent = publish_due(&handle, "rustc-pool", &provider, 30_000).await;
         assert_eq!(sent, 0);
         assert!(!provider.has_subscription(&PeerId::new("consumer-2")));
     }
@@ -310,31 +457,50 @@ mod tests {
         };
         let subscription = SubscriptionConfig {
             target_slots: 4,
-            static_peers: vec!["a".into(), "b".into(), "c".into()],
             ..SubscriptionConfig::default()
         };
-        let control = Arc::new(MockControl::new(vec![
-            Ok(AppResponse::Subscribed {
-                provider: PeerId::new("a"),
-                toolchain: "rustc-provider".into(),
-                target: "aarch64".into(),
-                max_slots: 2,
-            }),
-            Ok(AppResponse::Subscribed {
-                provider: PeerId::new("b"),
-                toolchain: "rustc-provider".into(),
-                target: "aarch64".into(),
-                max_slots: 2,
-            }),
-        ]));
+        let control = Arc::new(MockControl::with_discoveries(
+            vec![
+                Ok(AppResponse::Subscribed {
+                    provider: PeerId::new("a"),
+                    toolchain: "rustc".into(),
+                    target: "x86_64".into(),
+                    max_slots: 2,
+                }),
+                Ok(AppResponse::Subscribed {
+                    provider: PeerId::new("b"),
+                    toolchain: "rustc".into(),
+                    target: "x86_64".into(),
+                    max_slots: 2,
+                }),
+            ],
+            vec![Ok(vec!["a".into(), "b".into(), "c".into()])],
+        ));
         let handle = control_with(control.clone());
+        let mut discovery = DiscoveryState::default();
 
-        let subscribed = ensure_target(&handle, &provider, &consumer, &node, &subscription).await;
+        let subscribed = ensure_target(
+            &handle,
+            &provider,
+            &consumer,
+            &node,
+            &subscription,
+            "rustc-pool",
+            &mut discovery,
+        )
+        .await;
         assert_eq!(subscribed, 2);
         assert_eq!(control.sent().len(), 2);
+        assert_eq!(control.discovered_services().len(), 3);
+        assert!(
+            control
+                .discovered_services()
+                .iter()
+                .all(|service| service == "rustc-pool")
+        );
         let views = consumer.providers();
         assert_eq!(views.len(), 2);
-        assert!(views.iter().all(|view| view.toolchain == "rustc-provider"));
+        assert!(views.iter().all(|view| view.toolchain == "rustc"));
     }
 
     #[tokio::test]
@@ -344,16 +510,125 @@ mod tests {
         let node = NodeConfig::default();
         let subscription = SubscriptionConfig {
             target_slots: 1,
-            static_peers: vec!["a".into()],
             ..SubscriptionConfig::default()
         };
-        let control = Arc::new(MockControl::new(vec![Err(SidecarError::new("io", "down"))]));
+        let control = Arc::new(MockControl::with_discoveries(
+            vec![Err(SidecarError::new("io", "down"))],
+            vec![Ok(vec!["a".into()])],
+        ));
         let handle = control_with(control);
+        let mut discovery = DiscoveryState::default();
 
         assert_eq!(
-            ensure_target(&handle, &provider, &consumer, &node, &subscription).await,
+            ensure_target(
+                &handle,
+                &provider,
+                &consumer,
+                &node,
+                &subscription,
+                "rustc-pool",
+                &mut discovery
+            )
+            .await,
             0
         );
         assert!(consumer.providers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_discovery_clears_views_and_retries_after_30s() {
+        let provider = Arc::new(Provider::new(PeerId::new("self"), 1, "", ""));
+        let consumer = Arc::new(Consumer::new());
+        consumer.record_subscribed(PeerId::new("old"), "".into(), "".into(), 2);
+        let node = NodeConfig::default();
+        let subscription = SubscriptionConfig {
+            target_slots: 4,
+            ..SubscriptionConfig::default()
+        };
+        let control = Arc::new(MockControl::with_discoveries(vec![], vec![Ok(Vec::new())]));
+        let handle = control_with(control);
+        let mut discovery = DiscoveryState::default();
+
+        let subscribed = ensure_target(
+            &handle,
+            &provider,
+            &consumer,
+            &node,
+            &subscription,
+            "rustc-pool",
+            &mut discovery,
+        )
+        .await;
+        assert_eq!(subscribed, 0);
+        assert!(consumer.providers().is_empty());
+        assert!(discovery.last_abnormal);
+        let last = discovery.last_attempt_ms.unwrap();
+        assert!(!discovery_due(&discovery, last + 29_999, 1));
+        assert!(discovery_due(&discovery, last + 30_000, 1));
+        assert!(discovery_due(&discovery, last + 59 * 60_000, 1));
+    }
+
+    #[tokio::test]
+    async fn incompatible_provider_is_not_counted() {
+        let provider = Arc::new(Provider::new(PeerId::new("self"), 0, "rustc", "x86_64"));
+        let consumer = Arc::new(Consumer::new());
+        let node = NodeConfig {
+            toolchain: "rustc".into(),
+            target: "x86_64".into(),
+            ..NodeConfig::default()
+        };
+        let subscription = SubscriptionConfig {
+            target_slots: 4,
+            ..SubscriptionConfig::default()
+        };
+        let control = Arc::new(MockControl::with_discoveries(
+            vec![Ok(AppResponse::Subscribed {
+                provider: PeerId::new("p"),
+                toolchain: "other".into(),
+                target: "aarch64".into(),
+                max_slots: 4,
+            })],
+            vec![Ok(vec!["p".into()])],
+        ));
+        let handle = control_with(control.clone());
+        let mut discovery = DiscoveryState::default();
+
+        let subscribed = ensure_target(
+            &handle,
+            &provider,
+            &consumer,
+            &node,
+            &subscription,
+            "rustc-pool",
+            &mut discovery,
+        )
+        .await;
+        assert_eq!(subscribed, 0);
+        assert!(consumer.providers().is_empty());
+        assert!(
+            control
+                .sent()
+                .iter()
+                .any(|(_, request)| matches!(request, AppRequest::Unsubscribe { .. }))
+        );
+    }
+
+    #[test]
+    fn discovery_intervals_follow_capacity_and_abnormal_state() {
+        let mut discovery = DiscoveryState::default();
+        assert!(discovery_due(&discovery, 1_000, 1));
+
+        discovery.last_attempt_ms = Some(1_000);
+        discovery.last_abnormal = false;
+        assert!(!discovery_due(&discovery, 1_000 + 59 * 60_000, 1));
+        assert!(discovery_due(&discovery, 1_000 + 60 * 60_000, 1));
+
+        discovery.last_abnormal = true;
+        assert!(!discovery_due(&discovery, 1_000 + 29_999, 1));
+        assert!(discovery_due(&discovery, 1_000 + 30_000, 1));
+
+        discovery.last_abnormal = false;
+        assert!(!discovery_due(&discovery, 1_000 + 29_999, 0));
+        assert!(discovery_due(&discovery, 1_000 + 30_000, 0));
     }
 }

@@ -24,6 +24,9 @@ pub trait ControlPlane: Send + Sync {
 
     /// Query this node's identity.
     async fn whoami(&self) -> Result<WhoamiInfo, SidecarError>;
+
+    /// Discover providers for a service via NexusNet.
+    async fn discover_providers(&self, service: &str) -> Result<Vec<String>, SidecarError>;
 }
 
 #[async_trait]
@@ -39,6 +42,10 @@ impl ControlPlane for crate::connection::BackendClient {
 
     async fn whoami(&self) -> Result<WhoamiInfo, SidecarError> {
         crate::connection::BackendClient::whoami(self).await
+    }
+
+    async fn discover_providers(&self, service: &str) -> Result<Vec<String>, SidecarError> {
+        crate::connection::BackendClient::discover_providers(self, service).await
     }
 }
 
@@ -70,9 +77,17 @@ pub fn clear_if(handle: &ControlHandle, expected: &Arc<dyn ControlPlane>) {
     }
 }
 
+/// Discover providers for a service through the current node connection.
+pub async fn discover(handle: &ControlHandle, service: &str) -> Result<Vec<String>, SidecarError> {
+    let control = current(handle)
+        .ok_or_else(|| SidecarError::new("not_connected", "NexusNet sidecar is not connected"))?;
+    control.discover_providers(service).await
+}
+
 /// Send one `rustc-pool` request through the current node connection.
 pub async fn send(
     handle: &ControlHandle,
+    service_name: &str,
     peer: &PeerId,
     request: AppRequest,
 ) -> Result<AppResponse, SidecarError> {
@@ -84,7 +99,7 @@ pub async fn send(
         .map_err(|e| SidecarError::new("encode_error", e.to_string()))?;
 
     let response = control
-        .service_request_to("rustc-pool", peer.as_str(), payload)
+        .service_request_to(service_name, peer.as_str(), payload)
         .await?;
 
     let envelope: Envelope<AppResponse> = ciborium::de::from_reader(response.as_slice())

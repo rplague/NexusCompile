@@ -130,12 +130,36 @@ impl Consumer {
         self.read().providers.values().cloned().collect()
     }
 
+    pub fn has_provider(&self, provider: &PeerId) -> bool {
+        self.read().providers.contains_key(provider)
+    }
+
     pub fn visible_max_slots(&self) -> u32 {
         self.read()
             .providers
             .values()
             .map(|view| view.max_slots)
             .sum()
+    }
+
+    pub fn compatible_max_slots(&self, toolchain: &str, target: &str) -> u32 {
+        self.read()
+            .providers
+            .values()
+            .filter(|view| {
+                (toolchain.is_empty() || view.toolchain == toolchain)
+                    && (target.is_empty() || view.target == target)
+            })
+            .map(|view| view.max_slots)
+            .sum()
+    }
+
+    /// Remove all views and return the peers that were dropped.
+    pub fn clear(&self) -> Vec<PeerId> {
+        let mut inner = self.write();
+        let peers: Vec<PeerId> = inner.providers.keys().cloned().collect();
+        inner.providers.clear();
+        peers
     }
 
     fn read(&self) -> RwLockReadGuard<'_, Inner> {
