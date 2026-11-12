@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::compile_protocol::{
-    APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, LeaseId, PeerId, TaskState,
+    APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, PeerId, TaskState,
 };
 use crate::control::ControlPlane;
 use crate::log::{LogLevel, LogStruct};
@@ -96,15 +96,21 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
         } => {
             if app.provider.task_entry(&task_id).is_none()
                 && let Some(outputs) = app.cache.cached_outputs(&task_id.0)
+                && app.cache.pin(&task_id.0)
             {
                 return AppResponse::Cached {
                     task_id,
                     outputs,
-                    lease_id: LeaseId::new(),
+                    lease_id: app.provider.create_lease(task_id),
                 };
             }
-            app.provider
-                .reserve(consumer, task_id, slots, input_manifest)
+            let response = app
+                .provider
+                .reserve(consumer, task_id, slots, input_manifest);
+            if matches!(response, AppResponse::Cached { .. }) {
+                app.cache.pin(&task_id.0);
+            }
+            response
         }
         AppRequest::TaskReady { task_id, lease_id } => {
             let Some(entry) = app.provider.task_entry(&task_id) else {
@@ -121,7 +127,14 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                 let bundle_hash = entry.input_manifest;
                 let cache = app.cache.clone();
                 let config = app.config.snapshot();
-                pool::spawn_task(app.provider.clone(), cache, config, task_id, bundle_hash);
+                pool::spawn_task(
+                    app.provider.clone(),
+                    cache,
+                    app.workspace.clone(),
+                    config,
+                    task_id,
+                    bundle_hash,
+                );
             }
             response
         }
@@ -138,9 +151,12 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
             }
         }
         AppRequest::Cancel { task_id } => {
+            let leases = app.provider.lease_count_for(task_id);
             let response = app.provider.cancel(task_id);
-            app.cache.release(&task_id.0);
-            TaskBlobStore::new(&app.cache).remove_task_dir(&task_id.0);
+            for _ in 0..leases {
+                app.cache.release(&task_id.0);
+            }
+            TaskBlobStore::new(&app.workspace).remove_task_dir(&task_id.0);
             response
         }
         AppRequest::ResultAck { lease_id } => {
@@ -148,7 +164,7 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                 return AppResponse::error(ErrorCode::NotFound, "unknown lease");
             };
             app.cache.release(&task_id.0);
-            TaskBlobStore::new(&app.cache).remove_task_dir(&task_id.0);
+            TaskBlobStore::new(&app.workspace).remove_task_dir(&task_id.0);
             AppResponse::Ack
         }
         AppRequest::BlobPut {
@@ -164,7 +180,7 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                 return AppResponse::rejected("bundle hash mismatch");
             }
 
-            match TaskBlobStore::new(&app.cache).put_chunk(task_id, offset, &data) {
+            match TaskBlobStore::new(&app.workspace).put_chunk(task_id, offset, &data) {
                 Ok(()) => AppResponse::Ack,
                 Err(error) => AppResponse::error(ErrorCode::Internal, error.to_string()),
             }
@@ -229,6 +245,7 @@ mod tests {
             Arc::new(Provider::placeholder()),
             Arc::new(Consumer::new()),
             Arc::new(crate::compile::cache::ResultCache::open(&cache_dir, 1024 * 1024).unwrap()),
+            Arc::new(crate::workspace::Workspace::new(&cache_dir)),
             ConfigHandle::new(crate::config::ServiceConfig::default()),
             new_control_handle(),
         )

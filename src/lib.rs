@@ -15,6 +15,7 @@ pub mod service;
 pub mod state;
 pub mod task_blob;
 pub mod util;
+pub mod workspace;
 
 #[cfg(test)]
 mod e2e;
