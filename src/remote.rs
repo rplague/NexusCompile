@@ -94,10 +94,9 @@ impl Coordinator {
         if let Some(response) = self
             .try_remote(request, &manifest, digest, &out_dir, &env)
             .await
+            && !matches!(response.body, LocalBody::Error { .. })
         {
-            if !matches!(response.body, LocalBody::Error { .. }) {
-                return response;
-            }
+            return response;
         }
 
         self.run_local(request).await
