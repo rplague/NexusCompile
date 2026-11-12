@@ -59,6 +59,17 @@ pub fn set(handle: &ControlHandle, control: Option<Arc<dyn ControlPlane>>) {
     }
 }
 
+/// Clear the handle only if it still points at `expected`.
+pub fn clear_if(handle: &ControlHandle, expected: &Arc<dyn ControlPlane>) {
+    if let Ok(mut guard) = handle.write()
+        && guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        *guard = None;
+    }
+}
+
 /// Send one `rustc-pool` request through the current node connection.
 pub async fn send(
     handle: &ControlHandle,

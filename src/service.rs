@@ -32,7 +32,7 @@ pub trait Dispatch: Clone + Send + Sync + 'static {
 
     fn on_whoami(&self, _info: &WhoamiInfo) {}
 
-    fn on_disconnected(&self) {}
+    fn on_disconnected(&self, _control: &Arc<dyn ControlPlane>) {}
 }
 
 /// Handle one inbound sidecar service request.
@@ -196,8 +196,8 @@ impl Dispatch for AppState {
         self.set_provider_id(PeerId::new(info.peer_id.clone()));
     }
 
-    fn on_disconnected(&self) {
-        self.set_control(None);
+    fn on_disconnected(&self, control: &Arc<dyn ControlPlane>) {
+        crate::control::clear_if(&self.control, control);
     }
 }
 

@@ -318,7 +318,7 @@ pub async fn handle_connection<D: Dispatch>(stream: TcpStream, dispatch: D) -> s
     }
 
     let _ = read_task.await;
-    dispatch.on_disconnected();
+    dispatch.on_disconnected(&control);
     Ok(())
 }
 
