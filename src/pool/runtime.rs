@@ -6,16 +6,16 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::time::{Duration, interval};
 
-use super::PoolOps;
 use crate::capacity::{CapacitySnapshot, CapacitySource, calculate_capacity};
 use crate::compile_protocol::{AppRequest, AppResponse, PeerId};
 use crate::config::{NodeConfig, ServiceConfig, SubscriptionConfig};
+use crate::control::{self, ControlHandle};
 use crate::log::{LogLevel, LogStruct};
 use crate::state::NodeState;
 use crate::util::time::now_ms;
 
 pub async fn publish_due(
-    ops: &dyn PoolOps,
+    control: &ControlHandle,
     state: &Arc<Mutex<NodeState>>,
     snapshot: CapacitySnapshot,
     interval_ms: u64,
@@ -29,7 +29,7 @@ pub async fn publish_due(
 
     let mut sent = 0;
     for (peer, request) in due {
-        match ops.send(&peer, request).await {
+        match control::send(control, &peer, request).await {
             Ok(AppResponse::Ack) => sent += 1,
             Ok(_) | Err(_) => {
                 if let Ok(mut state) = state.lock() {
@@ -42,7 +42,7 @@ pub async fn publish_due(
 }
 
 pub async fn ensure_target(
-    ops: &dyn PoolOps,
+    control: &ControlHandle,
     state: &Arc<Mutex<NodeState>>,
     node: &NodeConfig,
     subscription: &SubscriptionConfig,
@@ -89,7 +89,7 @@ pub async fn ensure_target(
             target: node.target.clone(),
         };
 
-        match ops.send(&peer, request).await {
+        match control::send(control, &peer, request).await {
             Ok(AppResponse::Subscribed { max_slots, .. }) => {
                 if let Ok(mut state) = state.lock() {
                     state.record_subscribed(
@@ -145,7 +145,7 @@ fn apply_capacity(state: &Arc<Mutex<NodeState>>, snapshot: CapacitySnapshot) {
 }
 
 async fn publish_capacity_tick(
-    ops: &dyn PoolOps,
+    control: &ControlHandle,
     state: &Arc<Mutex<NodeState>>,
     subscription: &SubscriptionConfig,
 ) {
@@ -156,7 +156,7 @@ async fn publish_capacity_tick(
         state.capacity_snapshot()
     };
     let _ = publish_due(
-        ops,
+        control,
         state,
         snapshot,
         subscription
@@ -168,12 +168,12 @@ async fn publish_capacity_tick(
 }
 
 async fn subscribe_capacity_tick(
-    ops: &dyn PoolOps,
+    control: &ControlHandle,
     state: &Arc<Mutex<NodeState>>,
     node: &NodeConfig,
     subscription: &SubscriptionConfig,
 ) {
-    let _ = ensure_target(ops, state, node, subscription).await;
+    let _ = ensure_target(control, state, node, subscription).await;
 }
 
 fn expire_capacity_tick(state: &Arc<Mutex<NodeState>>, subscription: &SubscriptionConfig) {
@@ -183,7 +183,7 @@ fn expire_capacity_tick(state: &Arc<Mutex<NodeState>>, subscription: &Subscripti
 }
 
 pub async fn run_pool(
-    ops: Arc<dyn PoolOps>,
+    control: ControlHandle,
     state: Arc<Mutex<NodeState>>,
     config: ServiceConfig,
     mut shutdown: watch::Receiver<bool>,
@@ -224,10 +224,10 @@ pub async fn run_pool(
                 }
             }
             _ = provider_tick.tick() => {
-                publish_capacity_tick(ops.as_ref(), &state, &subscription).await;
+                publish_capacity_tick(&control, &state, &subscription).await;
             }
             _ = consumer_tick.tick() => {
-                subscribe_capacity_tick(ops.as_ref(), &state, &node, &subscription).await;
+                subscribe_capacity_tick(&control, &state, &node, &subscription).await;
             }
             _ = ttl_tick.tick() => {
                 expire_capacity_tick(&state, &subscription);
@@ -244,15 +244,16 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::capacity::CapacitySnapshot;
-    use crate::compile_protocol::{AppRequest, AppResponse};
-    use crate::sidecar_protocol::SidecarError;
+    use crate::compile_protocol::{AppRequest, AppResponse, Envelope};
+    use crate::control::new_control_handle;
+    use crate::protocol::{SidecarError, WhoamiInfo};
 
-    struct MockOps {
+    struct MockControl {
         sent: Mutex<Vec<(PeerId, AppRequest)>>,
         responses: Mutex<VecDeque<Result<AppResponse, SidecarError>>>,
     }
 
-    impl MockOps {
+    impl MockControl {
         fn new(responses: Vec<Result<AppResponse, SidecarError>>) -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
@@ -266,19 +267,44 @@ mod tests {
     }
 
     #[async_trait]
-    impl PoolOps for MockOps {
-        async fn send(
+    impl crate::control::ControlPlane for MockControl {
+        async fn service_request_to(
             &self,
-            peer: &PeerId,
-            request: AppRequest,
-        ) -> Result<AppResponse, SidecarError> {
-            self.sent.lock().unwrap().push((peer.clone(), request));
-            self.responses
+            _service: &str,
+            peer: &str,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, SidecarError> {
+            let envelope: Envelope<AppRequest> = ciborium::de::from_reader(payload.as_slice())
+                .map_err(|e| SidecarError::new("decode_error", e.to_string()))?;
+            self.sent
+                .lock()
+                .unwrap()
+                .push((PeerId::new(peer), envelope.body));
+            let response = self
+                .responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| Ok(AppResponse::Ack))
+                .unwrap_or(Ok(AppResponse::Ack))?;
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&Envelope::new(response), &mut bytes)
+                .map_err(|e| SidecarError::new("encode_error", e.to_string()))?;
+            Ok(bytes)
         }
+
+        async fn whoami(&self) -> Result<WhoamiInfo, SidecarError> {
+            Ok(WhoamiInfo {
+                peer_id: "mock".into(),
+                name: String::new(),
+                description: String::new(),
+            })
+        }
+    }
+
+    fn control_with(control: Arc<MockControl>) -> ControlHandle {
+        let handle = new_control_handle();
+        *handle.write().unwrap() = Some(control);
+        handle
     }
 
     fn snapshot(free_slots: u32) -> CapacitySnapshot {
@@ -297,18 +323,20 @@ mod tests {
             let mut state = state.lock().unwrap();
             state.subscribe(PeerId::new("consumer"), String::new(), String::new());
         }
-        let ops = MockOps::new(vec![Ok(AppResponse::Ack)]);
-        let sent = publish_due(&ops, &state, snapshot(1), 30_000).await;
+        let control = Arc::new(MockControl::new(vec![Ok(AppResponse::Ack)]));
+        let handle = control_with(control.clone());
+        let sent = publish_due(&handle, &state, snapshot(1), 30_000).await;
         assert_eq!(sent, 1);
-        assert_eq!(ops.sent().len(), 1);
+        assert_eq!(control.sent().len(), 1);
         assert_eq!(state.lock().unwrap().subscriptions.len(), 1);
 
         {
             let mut state = state.lock().unwrap();
             state.subscribe(PeerId::new("consumer-2"), String::new(), String::new());
         }
-        let ops = MockOps::new(vec![Err(SidecarError::new("io", "down"))]);
-        let sent = publish_due(&ops, &state, snapshot(1), 30_000).await;
+        let control = Arc::new(MockControl::new(vec![Err(SidecarError::new("io", "down"))]));
+        let handle = control_with(control);
+        let sent = publish_due(&handle, &state, snapshot(1), 30_000).await;
         assert_eq!(sent, 0);
         assert!(
             !state
@@ -337,7 +365,7 @@ mod tests {
             static_peers: vec!["a".into(), "b".into(), "c".into()],
             ..SubscriptionConfig::default()
         };
-        let ops = MockOps::new(vec![
+        let control = Arc::new(MockControl::new(vec![
             Ok(AppResponse::Subscribed {
                 provider: PeerId::new("a"),
                 toolchain: "rustc".into(),
@@ -350,11 +378,12 @@ mod tests {
                 target: "x86_64".into(),
                 max_slots: 2,
             }),
-        ]);
+        ]));
+        let handle = control_with(control.clone());
 
-        let subscribed = ensure_target(&ops, &state, &node, &subscription).await;
+        let subscribed = ensure_target(&handle, &state, &node, &subscription).await;
         assert_eq!(subscribed, 2);
-        assert_eq!(ops.sent().len(), 2);
+        assert_eq!(control.sent().len(), 2);
         assert_eq!(state.lock().unwrap().providers.len(), 2);
     }
 
@@ -367,9 +396,13 @@ mod tests {
             static_peers: vec!["a".into()],
             ..SubscriptionConfig::default()
         };
-        let ops = MockOps::new(vec![Err(SidecarError::new("io", "down"))]);
+        let control = Arc::new(MockControl::new(vec![Err(SidecarError::new("io", "down"))]));
+        let handle = control_with(control);
 
-        assert_eq!(ensure_target(&ops, &state, &node, &subscription).await, 0);
+        assert_eq!(
+            ensure_target(&handle, &state, &node, &subscription).await,
+            0
+        );
         assert!(state.lock().unwrap().providers.is_empty());
     }
 }

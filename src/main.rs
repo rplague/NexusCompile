@@ -1,17 +1,19 @@
 use std::sync::{Arc, Mutex};
 
-use nexuscompile::app::AppContext;
+use nexuscompile::capacity::{CapacitySample, CapacitySource, FixedSource, LinuxProcSource};
 use nexuscompile::compile::cache::ResultCache;
 use nexuscompile::compile_protocol::PeerId;
 use nexuscompile::config::{ConfigHandle, ServiceConfig};
+use nexuscompile::connection;
+use nexuscompile::control::new_control_handle;
 use nexuscompile::local_server;
 use nexuscompile::log::{LogLevel, LogStruct};
 use nexuscompile::paths;
-use nexuscompile::pool::PoolOps;
+use nexuscompile::pool;
 use nexuscompile::remote::Coordinator;
-use nexuscompile::state::NodeState;
-use nexuscompile::transport::{self, NodeLink};
+use nexuscompile::state::{AppState, NodeState};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -39,19 +41,44 @@ async fn main() -> std::io::Result<()> {
         })
     };
 
-    let link = Arc::new(NodeLink::new());
-    let ops: Arc<dyn PoolOps> = link.clone();
-    let app = Arc::new(AppContext::new(
+    let control = new_control_handle();
+    let app = AppState::new(
         state.clone(),
         cache.clone(),
         config_handle.clone(),
-        link.clone(),
-    ));
+        control.clone(),
+    );
     let coordinator = Arc::new(Coordinator::new(
         state.clone(),
         cache.clone(),
-        ops,
+        control.clone(),
         config_snapshot.clone(),
+    ));
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let source: Box<dyn CapacitySource + Send> = match LinuxProcSource::new() {
+        Ok(source) => Box::new(source),
+        Err(error) => {
+            LogStruct::new(
+                LogLevel::Warning,
+                "容量采样初始化失败",
+                format!("{error}; 使用固定回退容量"),
+            )
+            .emit();
+            Box::new(FixedSource::new(CapacitySample {
+                total_cores: 1.0,
+                used_cores: 0.0,
+                mem_total_mb: 1024,
+                mem_available_mb: 512,
+            }))
+        }
+    };
+    let pool_task = tokio::spawn(pool::run_pool(
+        control.clone(),
+        state.clone(),
+        config_snapshot.clone(),
+        shutdown_rx,
+        source,
     ));
 
     let (local_task, local_socket): (
@@ -94,7 +121,7 @@ async fn main() -> std::io::Result<()> {
                 LogStruct::new(LogLevel::Preset, "节点接入", addr.to_string()).emit();
                 let app = app.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = transport::handle_connection(stream, app).await {
+                    if let Err(e) = connection::handle_connection(stream, app).await {
                         LogStruct::new(
                             LogLevel::Critical,
                             "连接错误",
@@ -111,7 +138,9 @@ async fn main() -> std::io::Result<()> {
     }
 
     drop(listener);
+    let _ = shutdown_tx.send(true);
     cache_sweep_task.abort();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), pool_task).await;
 
     if let Some(task) = local_task {
         task.abort();
