@@ -7,6 +7,7 @@ use crate::compile_protocol::PeerId;
 use crate::config::{ConfigHandle, ServiceConfig};
 use crate::control::{self, ControlHandle, ControlPlane};
 use crate::pool::{Consumer, Provider};
+use crate::workspace::Workspace;
 
 /// Shared state handed to the connection, pool runtime, and local compiler.
 #[derive(Clone)]
@@ -14,6 +15,7 @@ pub struct AppState {
     pub provider: Arc<Provider>,
     pub consumer: Arc<Consumer>,
     pub cache: Arc<ResultCache>,
+    pub workspace: Arc<Workspace>,
     pub config: ConfigHandle,
     pub control: ControlHandle,
 }
@@ -23,6 +25,7 @@ impl AppState {
         provider: Arc<Provider>,
         consumer: Arc<Consumer>,
         cache: Arc<ResultCache>,
+        workspace: Arc<Workspace>,
         config: ConfigHandle,
         control: ControlHandle,
     ) -> Self {
@@ -30,6 +33,7 @@ impl AppState {
             provider,
             consumer,
             cache,
+            workspace,
             config,
             control,
         }

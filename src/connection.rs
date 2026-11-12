@@ -594,6 +594,7 @@ mod tests {
             Arc::new(crate::compile::cache::ResultCache::disabled(
                 std::env::temp_dir(),
             )),
+            Arc::new(crate::workspace::Workspace::new(std::env::temp_dir())),
             crate::config::ConfigHandle::new(crate::config::ServiceConfig::default()),
             crate::control::new_control_handle(),
         );

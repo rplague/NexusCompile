@@ -18,8 +18,13 @@ use crate::log::{LogLevel, LogStruct};
 use crate::util::args;
 use crate::util::path::resolve_path;
 use crate::util::process;
+use crate::workspace::Workspace;
 
-pub fn execute_local(request: &LocalRequest, cache: &ResultCache) -> LocalResponse {
+pub fn execute_local(
+    request: &LocalRequest,
+    cache: &ResultCache,
+    workspace: &Workspace,
+) -> LocalResponse {
     if request.v != LOCAL_PROTOCOL_VERSION {
         return LocalResponse::error(
             "unsupported_version",
@@ -69,7 +74,7 @@ pub fn execute_local(request: &LocalRequest, cache: &ResultCache) -> LocalRespon
         });
     }
 
-    let staging = match cache.staging_dir(&action_digest) {
+    let staging = match workspace.staging_dir(&action_digest) {
         Ok(staging) => staging,
         Err(error) => return LocalResponse::error("cache_error", error.to_string()),
     };

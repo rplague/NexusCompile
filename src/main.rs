@@ -13,6 +13,7 @@ use nexuscompile::pool;
 use nexuscompile::pool::{Consumer, Provider};
 use nexuscompile::remote::Coordinator;
 use nexuscompile::state::AppState;
+use nexuscompile::workspace::Workspace;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -43,11 +44,16 @@ async fn main() -> std::io::Result<()> {
         })
     };
 
+    let workspace = Arc::new(Workspace::new(cache.root().to_path_buf()));
+    if let Err(error) = workspace.cleanup_staging() {
+        LogStruct::new(LogLevel::Warning, "清理 staging 失败", error.to_string()).emit();
+    }
     let control = new_control_handle();
     let app = AppState::new(
         provider.clone(),
         consumer.clone(),
         cache.clone(),
+        workspace.clone(),
         config_handle.clone(),
         control.clone(),
     );
@@ -55,6 +61,7 @@ async fn main() -> std::io::Result<()> {
         provider.clone(),
         consumer.clone(),
         cache.clone(),
+        workspace.clone(),
         control.clone(),
         config_snapshot.clone(),
     ));
@@ -81,6 +88,7 @@ async fn main() -> std::io::Result<()> {
         control.clone(),
         provider,
         consumer,
+        cache.clone(),
         config_snapshot.clone(),
         shutdown_rx,
         source,

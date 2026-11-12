@@ -158,6 +158,10 @@ impl ResultCache {
         &self.cas
     }
 
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn read_chunk(&self, hash: &Hash32, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         self.cas.read_chunk(hash, offset, len)
     }
@@ -187,20 +191,6 @@ impl ResultCache {
             .lock()
             .map(|inner| inner.total_bytes)
             .unwrap_or(0)
-    }
-
-    pub fn task_dir(&self, action_digest: &Hash32) -> PathBuf {
-        self.root.join("tmp").join(hex_hash(action_digest))
-    }
-
-    pub fn staging_dir(&self, action_digest: &Hash32) -> io::Result<PathBuf> {
-        let dir = self
-            .root
-            .join("tmp")
-            .join(hex_hash(action_digest))
-            .join(Uuid::new_v4().to_string());
-        fs::create_dir_all(&dir)?;
-        Ok(dir)
     }
 
     pub fn lookup_and_materialize(
@@ -412,8 +402,16 @@ impl ResultCache {
             if candidates.is_empty() {
                 break;
             }
-            let index = (Uuid::new_v4().as_u128() as usize) % candidates.len();
-            self.remove_entry_locked(inner, &candidates[index]);
+            let victim = inner
+                .entries
+                .iter()
+                .filter(|(digest, entry)| entry.pin_count == 0 && Some(**digest) != exclude)
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(digest, _)| *digest);
+            let Some(victim) = victim else {
+                break;
+            };
+            self.remove_entry_locked(inner, &victim);
         }
 
         if inner.total_bytes > self.max_bytes
@@ -494,7 +492,8 @@ mod tests {
     }
 
     fn store_payload(cache: &ResultCache, digest: u8, payload: &[u8]) -> Hash32 {
-        let staging = cache.staging_dir(&Hash32([digest; 32])).unwrap();
+        let workspace = crate::workspace::Workspace::new(cache.root());
+        let staging = workspace.staging_dir(&Hash32([digest; 32])).unwrap();
         fs::write(staging.join("libdemo.rlib"), payload).unwrap();
         let outputs = cache.collect_outputs(&staging).unwrap();
         let action_digest = Hash32([digest; 32]);
@@ -582,10 +581,39 @@ mod tests {
     }
 
     #[test]
+    fn pinned_entry_survives_quota_eviction() {
+        let root = temp_dir();
+        let cache = cache(&root, 10);
+        let pinned = store_payload(&cache, 7, b"123456");
+        assert!(cache.pin(&pinned));
+        let second = store_payload(&cache, 8, b"abcdef");
+        assert!(cache.total_bytes() <= 10);
+        assert!(
+            cache
+                .lookup_and_materialize(&pinned, &root.join("out-pinned"))
+                .is_some()
+        );
+        cache.release(&pinned);
+        let third = store_payload(&cache, 9, b"ghijkl");
+        let hits = [
+            cache.lookup_and_materialize(&pinned, &root.join("out-pinned-2")),
+            cache.lookup_and_materialize(&second, &root.join("out-second")),
+            cache.lookup_and_materialize(&third, &root.join("out-third")),
+        ]
+        .into_iter()
+        .flatten()
+        .count();
+        assert!(hits <= 1);
+        assert!(cache.total_bytes() <= 10);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn unsafe_output_path_is_rejected() {
         let root = temp_dir();
         let cache = cache(&root, 10 * 1024 * 1024);
-        let staging = cache.staging_dir(&Hash32([9; 32])).unwrap();
+        let workspace = crate::workspace::Workspace::new(cache.root());
+        let staging = workspace.staging_dir(&Hash32([9; 32])).unwrap();
         let outputs = vec![OutputFile {
             path: "../escape".into(),
             hash: Hash32([1; 32]),

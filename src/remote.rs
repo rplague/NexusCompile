@@ -15,6 +15,7 @@ use crate::log::{LogLevel, LogStruct};
 use crate::pool::{Consumer, Provider};
 use crate::util::args;
 use crate::util::path::resolve_path;
+use crate::workspace::Workspace;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ pub struct Coordinator {
     provider: Arc<Provider>,
     consumer: Arc<Consumer>,
     cache: Arc<ResultCache>,
+    workspace: Arc<Workspace>,
     control: ControlHandle,
     config: ServiceConfig,
 }
@@ -34,6 +36,7 @@ impl Coordinator {
         provider: Arc<Provider>,
         consumer: Arc<Consumer>,
         cache: Arc<ResultCache>,
+        workspace: Arc<Workspace>,
         control: ControlHandle,
         config: ServiceConfig,
     ) -> Self {
@@ -41,6 +44,7 @@ impl Coordinator {
             provider,
             consumer,
             cache,
+            workspace,
             control,
             config,
         }
@@ -102,7 +106,12 @@ impl Coordinator {
     async fn run_local(&self, request: &LocalRequest) -> LocalResponse {
         let request = request.clone();
         let cache = self.cache.clone();
-        match tokio::task::spawn_blocking(move || executor::execute_local(&request, &cache)).await {
+        let workspace = self.workspace.clone();
+        match tokio::task::spawn_blocking(move || {
+            executor::execute_local(&request, &cache, &workspace)
+        })
+        .await
+        {
             Ok(response) => response,
             Err(error) => LocalResponse::error("join_error", error.to_string()),
         }
