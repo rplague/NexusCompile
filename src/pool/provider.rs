@@ -9,12 +9,13 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::capacity::CapacitySnapshot;
 use crate::compile::bundle::{decode_bundle, materialize_bundle};
 use crate::compile::cache::ResultCache;
-use crate::compile::hash::hash_file;
+use crate::compile::hash::{hash_file, hex_hash};
 use crate::compile_protocol::{
     AppRequest, AppResponse, ErrorCode, Hash32, LeaseId, OutputRef, PeerId, TaskId, TaskState,
 };
 use crate::config::ServiceConfig;
 use crate::local_protocol::truncate_diagnostic;
+use crate::log::{LogLevel, LogStruct};
 use crate::util::process;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,7 +437,20 @@ fn run_task_blocking(
 ) {
     let task_dir = cache.task_dir(&task_id.0);
     let bundle_path = task_dir.join("bundle");
+    let digest_prefix = &hex_hash(&task_id.0)[..8];
+    LogStruct::new(
+        LogLevel::Debug,
+        "远端任务开始",
+        format!("action={digest_prefix}"),
+    )
+    .emit();
     let fail = |provider: &Arc<Provider>, code, message: String, stdout, stderr| {
+        LogStruct::new(
+            LogLevel::Warning,
+            "远端任务失败",
+            format!("action={digest_prefix}: {message}"),
+        )
+        .emit();
         provider.fail_task_with_logs(task_id, code, message, stdout, stderr);
         let _ = fs::remove_dir_all(&task_dir);
     };
@@ -618,6 +632,12 @@ fn run_task_blocking(
     if stored {
         cache.pin(&task_id.0);
     }
+    LogStruct::new(
+        LogLevel::Debug,
+        "远端任务完成",
+        format!("action={digest_prefix}"),
+    )
+    .emit();
     provider.complete_task(task_id, outputs);
 }
 

@@ -11,6 +11,7 @@ use crate::compile_protocol::{AppRequest, AppResponse, Hash32, TaskId};
 use crate::config::ServiceConfig;
 use crate::control::{self, ControlHandle};
 use crate::local_protocol::{LocalBody, LocalRequest, LocalResponse};
+use crate::log::{LogLevel, LogStruct};
 use crate::pool::{Consumer, Provider};
 use crate::util::args;
 use crate::util::path::resolve_path;
@@ -144,7 +145,21 @@ impl Coordinator {
             (consumer, providers)
         };
 
+        if providers.is_empty() {
+            LogStruct::new(LogLevel::Debug, "远端编译", "没有可用的 provider").emit();
+            return None;
+        }
+
         for provider in providers {
+            LogStruct::new(
+                LogLevel::Debug,
+                "远端编译",
+                format!(
+                    "尝试 provider={provider}, action={}",
+                    &crate::compile::hash::hex_hash(&digest)[..8]
+                ),
+            )
+            .emit();
             let lease = match control::send(
                 &self.control,
                 &provider,
@@ -200,7 +215,15 @@ impl Coordinator {
                 .wait_for_task(&provider, task_id, lease, digest, out_dir)
                 .await
             {
-                RemoteOutcome::Success => return Some(success_response(digest)),
+                RemoteOutcome::Success => {
+                    LogStruct::new(
+                        LogLevel::Debug,
+                        "远端编译完成",
+                        format!("provider={provider}"),
+                    )
+                    .emit();
+                    return Some(success_response(digest));
+                }
                 RemoteOutcome::CompileError(stdout, stderr) => {
                     return Some(LocalResponse::new(LocalBody::Compiled {
                         action_digest: digest,
@@ -214,6 +237,7 @@ impl Coordinator {
                 RemoteOutcome::Retry => continue,
             }
         }
+        LogStruct::new(LogLevel::Debug, "远端编译", "全部 provider 失败").emit();
         None
     }
 }

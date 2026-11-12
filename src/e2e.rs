@@ -102,3 +102,18 @@ async fn control_send_without_connection_is_not_connected() {
 
     assert_eq!(error.code, "not_connected");
 }
+
+#[tokio::test]
+async fn disconnecting_old_connection_does_not_clear_newer_control() {
+    let first: Arc<dyn ControlPlane> = Arc::new(MockControl::new(vec![]));
+    let second: Arc<dyn ControlPlane> = Arc::new(MockControl::new(vec![]));
+    let handle = new_control_handle();
+
+    control::set(&handle, Some(first.clone()));
+    control::set(&handle, Some(second.clone()));
+    control::clear_if(&handle, &first);
+    assert!(control::current(&handle).is_some());
+
+    control::clear_if(&handle, &second);
+    assert!(control::current(&handle).is_none());
+}
