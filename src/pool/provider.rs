@@ -611,6 +611,7 @@ fn run_task_blocking(
         .and_then(|_| materialize_bundle(&bundle, &work))
         .and_then(|_| fs::create_dir_all(&work_out))
         .and_then(|_| fs::create_dir_all(&work_extern))
+        .and_then(|_| fs::create_dir_all(work.join("target")))
     {
         fail(
             &provider,
