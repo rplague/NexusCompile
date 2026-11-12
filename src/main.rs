@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use nexuscompile::capacity::{CapacitySample, CapacitySource, FixedSource, LinuxProcSource};
 use nexuscompile::compile::cache::ResultCache;
@@ -10,8 +10,9 @@ use nexuscompile::local_server;
 use nexuscompile::log::{LogLevel, LogStruct};
 use nexuscompile::paths;
 use nexuscompile::pool;
+use nexuscompile::pool::{Consumer, Provider};
 use nexuscompile::remote::Coordinator;
-use nexuscompile::state::{AppState, NodeState};
+use nexuscompile::state::AppState;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -21,12 +22,13 @@ async fn main() -> std::io::Result<()> {
     let config_snapshot = config_handle.snapshot();
     let address = format!("127.0.0.1:{}", config_handle.port());
     let listener = TcpListener::bind(&address).await?;
-    let state = Arc::new(Mutex::new(NodeState::new(
+    let provider = Arc::new(Provider::new(
         PeerId::new("local"),
         1,
         config_snapshot.node.toolchain.clone(),
         config_snapshot.node.target.clone(),
-    )));
+    ));
+    let consumer = Arc::new(Consumer::new());
     LogStruct::new(LogLevel::Important, "服务启动", &address).emit();
 
     let cache = open_cache(&config_snapshot);
@@ -43,13 +45,15 @@ async fn main() -> std::io::Result<()> {
 
     let control = new_control_handle();
     let app = AppState::new(
-        state.clone(),
+        provider.clone(),
+        consumer.clone(),
         cache.clone(),
         config_handle.clone(),
         control.clone(),
     );
     let coordinator = Arc::new(Coordinator::new(
-        state.clone(),
+        provider.clone(),
+        consumer.clone(),
         cache.clone(),
         control.clone(),
         config_snapshot.clone(),
@@ -75,7 +79,8 @@ async fn main() -> std::io::Result<()> {
     };
     let pool_task = tokio::spawn(pool::run_pool(
         control.clone(),
-        state.clone(),
+        provider,
+        consumer,
         config_snapshot.clone(),
         shutdown_rx,
         source,

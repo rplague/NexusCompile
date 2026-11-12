@@ -11,17 +11,18 @@ use crate::compile_protocol::{AppRequest, AppResponse, Hash32, TaskId};
 use crate::config::ServiceConfig;
 use crate::control::{self, ControlHandle};
 use crate::local_protocol::{LocalBody, LocalRequest, LocalResponse};
-use crate::state::NodeState;
+use crate::pool::{Consumer, Provider};
 use crate::util::args;
 use crate::util::path::resolve_path;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use transfer::RemoteTransfer;
 
 pub struct Coordinator {
-    state: Arc<Mutex<NodeState>>,
+    provider: Arc<Provider>,
+    consumer: Arc<Consumer>,
     cache: Arc<ResultCache>,
     control: ControlHandle,
     config: ServiceConfig,
@@ -29,13 +30,15 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub fn new(
-        state: Arc<Mutex<NodeState>>,
+        provider: Arc<Provider>,
+        consumer: Arc<Consumer>,
         cache: Arc<ResultCache>,
         control: ControlHandle,
         config: ServiceConfig,
     ) -> Self {
         Self {
-            state,
+            provider,
+            consumer,
             cache,
             control,
             config,
@@ -78,11 +81,7 @@ impl Coordinator {
             });
         }
 
-        let local_free = self
-            .state
-            .lock()
-            .map(|state| state.free_slots > 0)
-            .unwrap_or(false);
+        let local_free = self.provider.free_slots() > 0;
         if local_free {
             return self.run_local(request).await;
         }
@@ -127,10 +126,11 @@ impl Coordinator {
         let transfer = RemoteTransfer::new(self.control.clone(), self.cache.clone());
 
         let (consumer, providers) = {
-            let state = self.state.lock().ok()?;
-            let providers: Vec<_> = state
-                .providers
-                .values()
+            let consumer = self.provider.provider_id();
+            let providers: Vec<_> = self
+                .consumer
+                .providers()
+                .into_iter()
                 .filter(|view| {
                     view.accepting
                         && view.free_slots > 0
@@ -139,9 +139,9 @@ impl Coordinator {
                         && (self.config.node.target.is_empty()
                             || view.target == self.config.node.target)
                 })
-                .map(|view| view.provider.clone())
+                .map(|view| view.provider)
                 .collect();
-            (state.provider_id.clone(), providers)
+            (consumer, providers)
         };
 
         for provider in providers {

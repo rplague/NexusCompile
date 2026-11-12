@@ -589,7 +589,8 @@ mod tests {
         let (r, w) = stream.into_split();
         let client = BackendClient::new(w, Duration::from_secs(5));
         let context = crate::state::AppState::new(
-            Arc::new(std::sync::Mutex::new(crate::state::NodeState::placeholder())),
+            Arc::new(crate::pool::Provider::placeholder()),
+            Arc::new(crate::pool::Consumer::new()),
             Arc::new(crate::compile::cache::ResultCache::disabled(
                 std::env::temp_dir(),
             )),

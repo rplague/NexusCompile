@@ -1,0 +1,208 @@
+//! Consumer-side provider views and scheduling state.
+
+use std::collections::HashMap;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use crate::compile_protocol::{AppResponse, ErrorCode, PeerId};
+use crate::util::time::now_ms;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderView {
+    pub provider: PeerId,
+    pub toolchain: String,
+    pub target: String,
+    pub max_slots: u32,
+    pub free_slots: u32,
+    pub queue_len: u32,
+    pub accepting: bool,
+    pub last_seq: u64,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct Inner {
+    providers: HashMap<PeerId, ProviderView>,
+}
+
+/// Consumer role: tracks subscribed providers and their last capacity update.
+#[derive(Debug, Default)]
+pub struct Consumer {
+    inner: RwLock<Inner>,
+}
+
+impl Consumer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a pending subscription before sending `Subscribe`.
+    pub fn record_pending(&self, provider: PeerId, toolchain: String, target: String) {
+        self.write().providers.insert(
+            provider.clone(),
+            ProviderView {
+                provider,
+                toolchain,
+                target,
+                max_slots: 0,
+                free_slots: 0,
+                queue_len: 0,
+                accepting: false,
+                last_seq: 0,
+                last_seen_ms: now_ms(),
+            },
+        );
+    }
+
+    /// Record the provider's labels from the `Subscribed` reply, not local config.
+    pub fn record_subscribed(
+        &self,
+        provider: PeerId,
+        toolchain: String,
+        target: String,
+        max_slots: u32,
+    ) {
+        let mut inner = self.write();
+        let view = inner
+            .providers
+            .entry(provider.clone())
+            .or_insert_with(|| ProviderView {
+                provider,
+                toolchain: toolchain.clone(),
+                target: target.clone(),
+                max_slots,
+                free_slots: 0,
+                queue_len: 0,
+                accepting: false,
+                last_seq: 0,
+                last_seen_ms: now_ms(),
+            });
+        view.toolchain = toolchain;
+        view.target = target;
+        view.max_slots = max_slots;
+        view.last_seen_ms = now_ms();
+    }
+
+    pub fn apply_capacity(
+        &self,
+        provider: PeerId,
+        seq: u64,
+        free_slots: u32,
+        queue_len: u32,
+        accepting: bool,
+    ) -> AppResponse {
+        let mut inner = self.write();
+        let Some(view) = inner.providers.get_mut(&provider) else {
+            return AppResponse::error(ErrorCode::NotFound, "unknown capacity provider");
+        };
+
+        if seq <= view.last_seq {
+            return AppResponse::Ack;
+        }
+
+        view.last_seq = seq;
+        view.free_slots = free_slots;
+        view.queue_len = queue_len;
+        view.accepting = accepting;
+        view.last_seen_ms = now_ms();
+        AppResponse::Ack
+    }
+
+    pub fn remove_provider(&self, provider: &PeerId) {
+        self.write().providers.remove(provider);
+    }
+
+    pub fn expire_providers(&self, now: u64, ttl_ms: u64) -> Vec<PeerId> {
+        let mut inner = self.write();
+        let expired: Vec<PeerId> = inner
+            .providers
+            .iter()
+            .filter(|(_, view)| now.saturating_sub(view.last_seen_ms) > ttl_ms)
+            .map(|(peer, _)| peer.clone())
+            .collect();
+
+        for peer in &expired {
+            inner.providers.remove(peer);
+        }
+        expired
+    }
+
+    pub fn providers(&self) -> Vec<ProviderView> {
+        self.read().providers.values().cloned().collect()
+    }
+
+    pub fn visible_max_slots(&self) -> u32 {
+        self.read()
+            .providers
+            .values()
+            .map(|view| view.max_slots)
+            .sum()
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, Inner> {
+        self.inner.read().expect("Consumer RwLock 被污染")
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, Inner> {
+        self.inner.write().expect("Consumer RwLock 被污染")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(value: &str) -> PeerId {
+        PeerId::new(value)
+    }
+
+    #[test]
+    fn subscribed_uses_provider_labels() {
+        let consumer = Consumer::new();
+        consumer.record_subscribed(peer("p"), "rustc-p".into(), "aarch64".into(), 4);
+        let view = &consumer.providers()[0];
+        assert_eq!(view.toolchain, "rustc-p");
+        assert_eq!(view.target, "aarch64");
+        assert_eq!(view.max_slots, 4);
+    }
+
+    #[test]
+    fn capacity_updates_respect_sequence() {
+        let consumer = Consumer::new();
+        consumer.record_subscribed(peer("provider"), "rustc".into(), "x86_64".into(), 4);
+
+        assert_eq!(
+            consumer.apply_capacity(peer("provider"), 2, 3, 0, true),
+            AppResponse::Ack
+        );
+        let view = &consumer.providers()[0];
+        assert_eq!(view.free_slots, 3);
+        assert!(view.accepting);
+
+        assert_eq!(
+            consumer.apply_capacity(peer("provider"), 1, 0, 0, false),
+            AppResponse::Ack
+        );
+        assert_eq!(consumer.providers()[0].free_slots, 3);
+    }
+
+    #[test]
+    fn providers_expire_after_ttl() {
+        let consumer = Consumer::new();
+        consumer.record_pending(peer("provider"), String::new(), String::new());
+        let expired = consumer.expire_providers(now_ms().saturating_add(61_000), 60_000);
+        assert_eq!(expired, vec![peer("provider")]);
+        assert!(consumer.providers().is_empty());
+    }
+
+    #[test]
+    fn unknown_provider_returns_not_found() {
+        let consumer = Consumer::new();
+        assert!(matches!(
+            consumer.apply_capacity(peer("missing"), 1, 0, 0, false),
+            AppResponse::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
+    }
+}
