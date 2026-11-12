@@ -16,6 +16,7 @@ pub struct CapacitySample {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacitySnapshot {
     pub max_slots: u32,
+    /// System-wide slots currently available, before deducting active tasks.
     pub free_slots: u32,
     pub queue_len: u32,
     pub accepting: bool,
@@ -102,7 +103,6 @@ impl CapacitySource for FixedSource {
 /// Calculate stable total capacity and current free capacity.
 pub fn calculate_capacity(
     sample: &CapacitySample,
-    active_slots: u32,
     queue_len: u32,
     config: &NodeConfig,
 ) -> CapacitySnapshot {
@@ -126,16 +126,13 @@ pub fn calculate_capacity(
         .saturating_sub(config.reserve_mem_mb)
         / mem_per_slot)
         .min(u32::MAX as u64) as u32;
-    let currently_available = free_cpu_slots.min(free_mem_slots);
-    let free_slots = max_slots
-        .saturating_sub(active_slots)
-        .min(currently_available);
+    let available_slots = free_cpu_slots.min(free_mem_slots).min(max_slots);
 
     CapacitySnapshot {
         max_slots,
-        free_slots,
+        free_slots: available_slots,
         queue_len,
-        accepting: free_slots > 0,
+        accepting: available_slots > 0,
     }
 }
 
@@ -222,23 +219,23 @@ mod tests {
             mem_total_mb: 8192,
             mem_available_mb: 4096,
         };
-        let snapshot = calculate_capacity(&sample, 0, 0, &config());
+        let snapshot = calculate_capacity(&sample, 0, &config());
         assert_eq!(snapshot.max_slots, 3);
         assert_eq!(snapshot.free_slots, 1);
         assert!(snapshot.accepting);
     }
 
     #[test]
-    fn active_slots_reduce_free_slots() {
+    fn max_slots_are_stable_without_active_tasks() {
         let sample = CapacitySample {
             total_cores: 16.0,
             used_cores: 0.0,
             mem_total_mb: 16384,
             mem_available_mb: 16384,
         };
-        let snapshot = calculate_capacity(&sample, 2, 0, &config());
+        let snapshot = calculate_capacity(&sample, 0, &config());
         assert_eq!(snapshot.max_slots, 7);
-        assert_eq!(snapshot.free_slots, 5);
+        assert_eq!(snapshot.free_slots, 7);
     }
 
     #[test]
@@ -249,7 +246,7 @@ mod tests {
             mem_total_mb: 8192,
             mem_available_mb: 1024,
         };
-        let snapshot = calculate_capacity(&sample, 0, 0, &config());
+        let snapshot = calculate_capacity(&sample, 0, &config());
         assert_eq!(snapshot.free_slots, 0);
         assert!(!snapshot.accepting);
     }
@@ -262,7 +259,7 @@ mod tests {
             mem_total_mb: 1024,
             mem_available_mb: 0,
         };
-        let snapshot = calculate_capacity(&sample, 0, 0, &config());
+        let snapshot = calculate_capacity(&sample, 0, &config());
         assert_eq!(snapshot.max_slots, 0);
         assert_eq!(snapshot.free_slots, 0);
         assert!(!snapshot.accepting);

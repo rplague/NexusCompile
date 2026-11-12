@@ -1,37 +1,19 @@
-//! Sidecar wire protocol copied from NexusNet.
-//!
-//! Source: NexusNet v0.6.2-11020 (commit b6ab8e4).
-//! Keep this file in sync with `NexusNet/src/sidecar_protocol.rs`.
-
-// NexusNet - core network layer of the OAHD project
-//
-// Copyright (C) 2026 OAHD
-//
-// This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// This program is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU General Public License for more details.
-//
-// You should have received a copy of the GNU General Public License
-// along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
-//! Node <-> sidecar/backend protocol v2 (CBOR contract).
+//! Node <-> sidecar protocol v2 contract.
 //!
 //! Wire format: `u32_be(len) || cbor(message)`, `len <= MAX_FRAME`.
+//!
+//! This module mirrors the NexusNet contract, including control operations
+//! that this backend does not currently drive. Keep it in sync with
+//! `NexusNet/src/sidecar_protocol.rs` and `nexusxray/src/protocol.rs`.
+
+#![allow(dead_code)]
 
 use std::fmt;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio_util::codec::{Decoder, Encoder};
 use uuid::Uuid;
-
-use bytes::{Buf, BufMut, BytesMut};
 
 /// Protocol version.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -53,6 +35,14 @@ impl SidecarError {
         }
     }
 }
+
+impl fmt::Display for SidecarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for SidecarError {}
 
 /// Serde default for optional boolean fields that default to `true`.
 fn default_true() -> bool {
@@ -104,7 +94,7 @@ pub enum Message {
     ReloadConfig {
         id: Uuid,
     },
-    /// Clear application SWR caches and non-self local Kademlia replicas.
+    /// Clear application caches and non-self local Kademlia replicas.
     RefreshCache {
         id: Uuid,
     },
@@ -130,11 +120,6 @@ pub enum Message {
         providing: bool,
     },
     /// Stop providing and/or remove the locally stored record for `key`.
-    ///
-    /// `providing` (default true) stops announcing this node as a provider;
-    /// `record` (default false) removes the locally stored record (only if this
-    /// node is its publisher). Both are local operations; remote copies expire
-    /// on their own TTLs.
     RemoveKey {
         id: Uuid,
         key: String,
@@ -181,6 +166,100 @@ impl Message {
             | Message::ServiceRequestTo { id, .. } => Some(*id),
         }
     }
+
+    /// Human-readable discriminant for logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Message::Hello { .. } => "hello",
+            Message::Request { .. } => "request",
+            Message::Reply { .. } => "reply",
+            Message::ListServices { .. } => "list_services",
+            Message::DiscoverProviders { .. } => "discover_providers",
+            Message::QueryPublicIp { .. } => "query_public_ip",
+            Message::Whoami { .. } => "whoami",
+            Message::ReconnectBootstrap { .. } => "reconnect_bootstrap",
+            Message::ReannounceServices { .. } => "reannounce_services",
+            Message::ReloadConfig { .. } => "reload_config",
+            Message::RefreshCache { .. } => "refresh_cache",
+            Message::RelayStatus { .. } => "relay_status",
+            Message::PqStatus { .. } => "pq_status",
+            Message::AuthStatus { .. } => "auth_status",
+            Message::QueryKey { .. } => "query_key",
+            Message::AddKey { .. } => "add_key",
+            Message::RemoveKey { .. } => "remove_key",
+            Message::ServiceRequest { .. } => "service_request",
+            Message::ServiceRequestTo { .. } => "service_request_to",
+        }
+    }
+}
+
+/// `query_public_ip`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicIpInfo {
+    #[serde(default)]
+    pub ipv4: Option<String>,
+    #[serde(default)]
+    pub ipv6: Option<String>,
+}
+
+/// `whoami`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WhoamiInfo {
+    pub peer_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// `query_key`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryKeyResult {
+    pub key: String,
+    #[serde(default)]
+    pub value: Option<Vec<u8>>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+}
+
+/// `relay_status`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayStatusResult {
+    pub need_relay: bool,
+    pub target: u64,
+    #[serde(default)]
+    pub active: Vec<String>,
+    #[serde(default)]
+    pub pending: Vec<String>,
+}
+
+/// `pq_status`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PqStatusResult {
+    pub enabled: bool,
+    pub transport: bool,
+    pub identity: bool,
+    pub required: bool,
+}
+
+/// `reconnect_bootstrap` / `reannounce_services` / `reload_config`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuccessResult {
+    pub success: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `add_key`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddKeyResult {
+    pub success: bool,
+    pub key: String,
+}
+
+/// Decode `reply.result` CBOR bytes.
+pub fn decode_result<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SidecarError> {
+    ciborium::de::from_reader(bytes).map_err(|e| SidecarError::new("decode_error", e.to_string()))
 }
 
 /// Frame encode/decode error.
@@ -232,48 +311,6 @@ pub fn decode_frame(body: &[u8]) -> Result<Message, FrameError> {
     ciborium::de::from_reader(body).map_err(|e| FrameError::Decode(e.to_string()))
 }
 
-/// A `tokio_util` codec for the sidecar wire format.
-///
-/// Wraps the same `u32_be(len) || cbor(message)` framing as [`encode_frame`] /
-/// [`decode_frame`], so a single `Framed` can be used in a `select!` (its
-/// `Stream::next` is cancel-safe, unlike a raw `read_exact`).
-pub struct SidecarCodec;
-
-impl Decoder for SidecarCodec {
-    type Item = Message;
-    type Error = FrameError;
-
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Message>, FrameError> {
-        let Some(len) = src
-            .get(..4)
-            .map(|b| u32::from_be_bytes(b.try_into().unwrap()) as usize)
-        else {
-            return Ok(None);
-        };
-        if len > MAX_FRAME {
-            return Err(FrameError::TooLarge(len));
-        }
-        if src.len() < 4 + len {
-            src.reserve(4 + len - src.len());
-            return Ok(None);
-        }
-        src.advance(4);
-        let body = src.split_to(len);
-        decode_frame(&body).map(Some)
-    }
-}
-
-impl Encoder<Message> for SidecarCodec {
-    type Error = FrameError;
-
-    fn encode(&mut self, msg: Message, dst: &mut BytesMut) -> Result<(), FrameError> {
-        let frame = encode_frame(&msg)?;
-        dst.reserve(frame.len());
-        dst.put_slice(&frame);
-        Ok(())
-    }
-}
-
 /// Read one length-prefixed CBOR frame.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message, FrameError> {
     let mut len_buf = [0u8; 4];
@@ -298,31 +335,6 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Human-readable message discriminant for logs.
-pub fn message_kind(msg: &Message) -> &'static str {
-    match msg {
-        Message::Hello { .. } => "hello",
-        Message::Request { .. } => "request",
-        Message::Reply { .. } => "reply",
-        Message::ListServices { .. } => "list_services",
-        Message::DiscoverProviders { .. } => "discover_providers",
-        Message::QueryPublicIp { .. } => "query_public_ip",
-        Message::Whoami { .. } => "whoami",
-        Message::ReconnectBootstrap { .. } => "reconnect_bootstrap",
-        Message::ReannounceServices { .. } => "reannounce_services",
-        Message::ReloadConfig { .. } => "reload_config",
-        Message::RefreshCache { .. } => "refresh_cache",
-        Message::RelayStatus { .. } => "relay_status",
-        Message::PqStatus { .. } => "pq_status",
-        Message::AuthStatus { .. } => "auth_status",
-        Message::QueryKey { .. } => "query_key",
-        Message::AddKey { .. } => "add_key",
-        Message::RemoveKey { .. } => "remove_key",
-        Message::ServiceRequest { .. } => "service_request",
-        Message::ServiceRequestTo { .. } => "service_request_to",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,25 +351,11 @@ mod tests {
     }
 
     #[test]
-    fn codec_handles_partial_then_full_frame() {
-        let msg = Message::Whoami { id: Uuid::new_v4() };
-        let frame = encode_frame(&msg).unwrap();
-        let (head, tail) = frame.split_at(3);
-
-        let mut buf = BytesMut::new();
-        buf.put_slice(head);
-        assert!(SidecarCodec.decode(&mut buf).unwrap().is_none());
-
-        buf.put_slice(tail);
-        assert_eq!(SidecarCodec.decode(&mut buf).unwrap(), Some(msg));
-    }
-
-    #[test]
     fn request_reply_round_trip() {
         let id = Uuid::new_v4();
         round_trip(Message::Request {
             id,
-            service: "cmd".into(),
+            service: "rustc-pool".into(),
             payload: vec![0, 1, 2, 255],
         });
         round_trip(Message::Reply {
@@ -371,12 +369,25 @@ mod tests {
     #[test]
     fn control_ops_round_trip() {
         let id = Uuid::new_v4();
+        round_trip(Message::Hello {
+            version: PROTOCOL_VERSION,
+        });
         round_trip(Message::ListServices { id });
         round_trip(Message::Whoami { id });
-        round_trip(Message::RefreshCache { id });
         round_trip(Message::DiscoverProviders {
             id,
-            service: "cmd".into(),
+            service: "rustc-pool".into(),
+        });
+        round_trip(Message::QueryPublicIp { id });
+        round_trip(Message::ReconnectBootstrap { id });
+        round_trip(Message::ReannounceServices { id });
+        round_trip(Message::ReloadConfig { id });
+        round_trip(Message::RelayStatus { id });
+        round_trip(Message::PqStatus { id });
+        round_trip(Message::AuthStatus { id });
+        round_trip(Message::QueryKey {
+            id,
+            key: "/oahd/service/rustc-pool".into(),
         });
         round_trip(Message::AddKey {
             id,
@@ -386,15 +397,20 @@ mod tests {
         });
         round_trip(Message::RemoveKey {
             id,
-            key: "/oahd/service/cmd".into(),
+            key: "/oahd/service/rustc-pool".into(),
             providing: true,
             record: false,
         });
+        round_trip(Message::ServiceRequest {
+            id,
+            service: "rustc-pool".into(),
+            payload: vec![],
+        });
         round_trip(Message::ServiceRequestTo {
             id,
-            service: "cmd".into(),
+            service: "rustc-pool".into(),
             peer: "12D3KooW".into(),
-            payload: vec![],
+            payload: vec![1, 2, 3],
         });
     }
 
@@ -408,7 +424,30 @@ mod tests {
 
     #[test]
     fn malformed_body_rejected() {
-        // 0xff is the CBOR "break"; standalone it is invalid.
         assert!(matches!(decode_frame(&[0xff]), Err(FrameError::Decode(_))));
+    }
+
+    #[test]
+    fn result_payloads_round_trip() {
+        fn enc<T: Serialize>(v: &T) -> Vec<u8> {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(v, &mut buf).unwrap();
+            buf
+        }
+
+        let ip = PublicIpInfo {
+            ipv4: Some("1.2.3.4".into()),
+            ipv6: None,
+        };
+        let decoded: PublicIpInfo = decode_result(&enc(&ip)).unwrap();
+        assert_eq!(decoded, ip);
+
+        let who = WhoamiInfo {
+            peer_id: "12D3KooW".into(),
+            name: "n".into(),
+            description: "d".into(),
+        };
+        let decoded: WhoamiInfo = decode_result(&enc(&who)).unwrap();
+        assert_eq!(decoded, who);
     }
 }

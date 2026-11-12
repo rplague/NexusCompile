@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 macro_rules! default_u32_fn {
     ($name:ident, $value:expr) => {
@@ -238,60 +238,8 @@ impl ConfigHandle {
         Self::from_toml_file(paths::config_path(), true)
     }
 
-    pub fn save_to_file(&self, path: impl AsRef<Path>) {
-        let path = path.as_ref();
-        let snapshot = self.snapshot();
-        let toml_string = match toml::to_string_pretty(&snapshot) {
-            Ok(s) => s,
-            Err(e) => {
-                LogStruct::new(LogLevel::Critical, "序列化配置失败", e.to_string()).emit();
-                std::process::exit(1);
-            }
-        };
-
-        let temp_path = path.with_extension("tmp");
-
-        if let Err(e) = fs::write(&temp_path, toml_string) {
-            LogStruct::new(
-                LogLevel::Critical,
-                "写入临时配置文件失败",
-                format!("路径: {}, 错误: {}", temp_path.display(), e),
-            )
-            .emit();
-            std::process::exit(1);
-        }
-
-        if let Err(e) = fs::rename(&temp_path, path) {
-            let _ = fs::remove_file(&temp_path);
-            LogStruct::new(
-                LogLevel::Critical,
-                "重命名配置文件失败",
-                format!(
-                    "从 {} 到 {}, 错误: {}",
-                    temp_path.display(),
-                    path.display(),
-                    e
-                ),
-            )
-            .emit();
-            std::process::exit(1);
-        }
-    }
-
-    pub fn save_to_default(&self) {
-        self.save_to_file(paths::config_path());
-    }
-
     pub fn read(&self) -> RwLockReadGuard<'_, ServiceConfig> {
         self.inner.read().expect("RwLock 被污染")
-    }
-
-    pub fn write(&self) -> RwLockWriteGuard<'_, ServiceConfig> {
-        self.inner.write().expect("RwLock 被污染")
-    }
-
-    pub fn replace_config(&self, new_config: ServiceConfig) {
-        *self.write() = new_config;
     }
 
     pub fn snapshot(&self) -> ServiceConfig {

@@ -170,10 +170,7 @@ fn add_extern(
     value: &str,
     inputs: &mut BTreeMap<String, InputBlob>,
 ) -> Result<(), ManifestError> {
-    let (name, path) = value
-        .split_once('=')
-        .map(|(name, path)| (name, path))
-        .unwrap_or((value, value));
+    let (name, path) = value.split_once('=').unwrap_or((value, value));
     let path = resolve_path(cwd, path);
     if !path.exists() {
         return Ok(());
@@ -475,7 +472,7 @@ mod tests {
         assert!(paths.contains(&"extern/dep"));
         assert!(!paths.iter().any(|path| path.contains("target/ignored")));
         assert!(!paths.iter().any(|path| path.contains(".git/ignored")));
-        assert_eq!(manifest.incremental, false);
+        assert!(!manifest.incremental);
 
         let args = manifest.args.join(" ");
         assert!(args.contains("<OUT>"));

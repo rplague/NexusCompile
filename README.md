@@ -31,7 +31,7 @@ A single process can act as both provider and consumer.
 ```mermaid
 graph LR
     C["cargo"] --> W["nexus-rustc"]
-    W -->|"Unix socket"| L["local_server"]
+    W -->|"Unix socket"| L["local"]
     L --> K["Coordinator"]
     K -->|"cache hit"| M["materialize outputs"]
     K -->|"local slot free"| E["executor"]
@@ -43,7 +43,7 @@ graph LR
     P --- CA2["ResultCache / CAS"]
 ```
 
-- **Local path**: cargo -> `nexus-rustc` -> Unix socket -> `local_server` -> `Coordinator::execute` -> cache or local rustc.
+- **Local path**: cargo -> `nexus-rustc` -> Unix socket -> `local` -> `Coordinator::execute` -> cache or local rustc.
 - **Remote path**: consumer -> NexusNet -> provider's `rustc-pool` service -> provider rustc -> outputs transferred back by SHA-256.
 - **Scheduling path**: `pool/runtime.rs` samples capacity; providers broadcast `CapacityUpdate`; consumers maintain provider views through `Subscribe`/`Subscribed`.
 
@@ -221,8 +221,8 @@ Reserve
   - `Rejected`: the request is invalid.
 - By default, the consumer polls `Status` once per second with an overall timeout of 30 minutes.
 - `Done` returns the `OutputRef` list; the consumer downloads each chunk, verifies hashes, and writes to its local CAS/cache.
-- `ResultAck` releases the provider-side result pin, removes the task directory, and deletes the `TaskEntry`. The provider result cache remains available for later hits.
-- `Reserve` and `Status` fall back to the provider result cache when no `TaskEntry` exists; a cache-only `Cached` reply carries a transient lease, and its `ResultAck` may return `NotFound` and be ignored by the consumer.
+- Every `Reserve` that returns a result creates a lease. `ResultAck` releases that lease's pin, removes the task directory when the last lease is gone, and deletes the `TaskEntry`. The provider result cache remains available for later hits.
+- `Reserve` and `Status` fall back to the provider result cache when no `TaskEntry` exists; a cache-only `Cached` reply carries a lease and pins the cache entry until `ResultAck` or lease expiry.
 - `Cancel` marks the task `Cancelled` and frees the slot.
 
 The provider side:
@@ -246,8 +246,9 @@ The provider side:
 
 - `ResultCache` lives at `<cache>/actions/<digest>/manifest.cbor` and records the output list.
 - Output blobs live at `<cache>/blobs/<sha256>`; writes use a temporary file plus rename, and materialization verifies the hash again.
-- The quota is controlled by `result_cache_mb`; entries that are not pinned are reclaimed when the quota is exceeded.
-- A provider pins the result when storing it so it cannot be reclaimed until the consumer acknowledges it.
+- Compile staging lives at `<cache>/staging/`; provider task bundles and work dirs live at `<cache>/work/<digest>/`.
+- The quota is controlled by `result_cache_mb`; unpinned entries are reclaimed oldest-expiry first.
+- Providers pin results while a lease is outstanding, so shared consumers can download before `ResultAck`. Expired leases release their pins.
 
 ## NexusNet integration
 
@@ -352,7 +353,7 @@ client.auth_status().await?;
 client.whoami().await?;
 ```
 
-Result structs are defined in `src/control.rs` (`PublicIpInfo`, `QueryKeyResult`, `RelayStatusResult`, `PqStatusResult`, `SuccessResult`, `AddKeyResult`); `whoami`, `refresh_cache`, and `remove_key` return `serde_json::Value`.
+Result structs are defined in `src/protocol.rs` (`PublicIpInfo`, `WhoamiInfo`, `QueryKeyResult`, `RelayStatusResult`, `PqStatusResult`, `SuccessResult`, `AddKeyResult`); `refresh_cache` and `remove_key` return `serde_json::Value`.
 
 ### rustc-pool application protocol v2
 
@@ -464,25 +465,29 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | Module | Responsibility |
 |---|---|
 | **main** | Entry point: configuration, listener, accept loop, result-cache setup, graceful shutdown |
-| **app** | Shared `AppContext` (state, cache, config, sidecar link) used by the composition root and transport sessions |
+| **state** | Shared `AppState` (provider, consumer, cache, workspace, config, control handle) |
 | **config** | Load/generate `config.toml` and expose `ConfigHandle` |
 | **paths** | Path resolution anchored by environment variables, with current-directory fallback for local runs |
 | **log** | Leveled logging split into `log/format.rs` and `log/file.rs`: terminal output, file rotation (gz at 10 MB), journald mode |
-| **sidecar_protocol** | sidecar v2 contract: `Message`, frame encoding/decoding, async frame helpers, `SidecarCodec` |
-| **control** | Typed control-result payloads and CBOR result decoding |
-| **transport** | Transport facade over `transport/client.rs`, `transport/link.rs`, and `transport/session.rs` |
+| **protocol** | sidecar v2 contract: `Message`, control result payloads, frame encoding/decoding |
+| **control** | `ControlPlane` abstraction over the local node connection |
+| **connection** | Handshake, read loop, pending table, and `BackendClient` control helpers |
 | **compile_protocol** | `rustc-pool` application v2: `AppRequest`, `AppResponse`, task states |
 | **service** | Decode and dispatch application requests: subscribe, reserve, blob, status, cancel, result ack |
 | **task_blob** | Task bundle chunk I/O and task-directory cleanup |
-| **state** | State facade over `state/model.rs`, `state/provider.rs`, and `state/task.rs` |
 | **local_protocol** | Local wrapper <-> node protocol |
-| **local_server** | Unix socket server |
+| **local** | Unix socket server and local/remote compile orchestration |
 | **nexus-rustc** (bin) | cargo `RUSTC_WRAPPER` entry point |
 | **compile** | Compile primitives: `executor` (local staging), `manifest` (digest), `bundle`, `cache`, `cas`, and `hash` |
-| **remote** | Consumer Coordinator facade over `remote/transfer.rs` (bundle upload, task polling, result import) |
-| **pool** | `PoolOps` abstraction, provider task execution, and capacity scheduling in `pool/runtime.rs` |
+| **remote** | Consumer `Coordinator` over `remote/transfer.rs` (bundle upload, task polling, result import) |
+| **pool** | `Provider` (capacity/subscriptions/tasks/leases), `Consumer` (provider views), and `runtime` scheduling |
+| **workspace** | Staging and provider task directories |
 | **capacity** | `/proc` sampling and slot calculation |
 | **util** | Shared argument, path, filesystem, process, and time helpers |
+
+## Manual test checklist
+
+See [docs/manual-test.md](docs/manual-test.md) for the two-node/local smoke checklist used before release.
 
 ## Tests
 
@@ -497,9 +502,9 @@ cargo build --release
 
 - **Shared task lifetime**: multiple consumers can share a task lease; the first `ResultAck` removes the `TaskEntry`. Other consumers recover the result through the provider cache via `Status`; if the cache entry is evicted first, they retry or fall back locally.
 - **Unacked tasks**: task entries whose consumers never send `ResultAck` remain in memory until the same task id is reserved again or the process restarts.
-- **Local builds do not consume slots**: `nexus-rustc` local execution does not go through `NodeState::reserve`; concurrency is mainly controlled by cargo/the wrapper. Capacity sampling only reflects load after the fact.
-- **Single-connection assumption**: the server accepts multiple NexusNet connections, but `NodeState` and `NodeLink` are global; multiple connections share subscriptions and provider views.
-- **Toolchain labels**: the provider does not verify that the submitter's `manifest.toolchain_id` matches its own; the consumer's provider view currently records its own labels, so cross-node toolchain/target filtering is not fully closed.
+- **Local builds do not consume slots**: `nexus-rustc` local execution does not go through `Provider::reserve`; concurrency is mainly controlled by cargo/the wrapper. Capacity sampling only reflects load after the fact.
+- **Single-connection assumption**: the server accepts multiple NexusNet connections, but `AppState` holds one control handle; the newest connection wins, and an older disconnect cannot clear it.
+- **Toolchain labels**: the provider does not verify that the submitter's `manifest.toolchain_id` matches its own. The consumer filters on the labels returned by `Subscribed`, so cross-node selection is consistent but not a security boundary.
 - **Trust boundary**: remote compilation executes the submitter's rustc arguments and externs (including proc-macros), which is equivalent to running code on the provider; the consumer only verifies output hashes and does not independently validate the compile result. Deploy only on trusted networks with NexusNet authentication enabled.
 - **Discovery**: only `static_peers` is supported; there is no DHT-based automatic discovery.
 - **Cache granularity**: the action digest hashes the entire `CARGO_MANIFEST_DIR` (excluding `target`, `.git`, and `node_modules`), so changes to non-build files also invalidate the cache; full-tree hashing and bundle construction are expensive for large packages.

@@ -9,35 +9,43 @@ use crate::compile::hash::hash_bytes;
 use crate::compile::manifest::collect_manifest;
 use crate::compile_protocol::{AppRequest, AppResponse, Hash32, TaskId};
 use crate::config::ServiceConfig;
+use crate::control::{self, ControlHandle};
 use crate::local_protocol::{LocalBody, LocalRequest, LocalResponse};
-use crate::pool::PoolOps;
-use crate::state::NodeState;
+use crate::log::{LogLevel, LogStruct};
+use crate::pool::{Consumer, Provider};
 use crate::util::args;
 use crate::util::path::resolve_path;
+use crate::workspace::Workspace;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use transfer::RemoteTransfer;
 
 pub struct Coordinator {
-    state: Arc<Mutex<NodeState>>,
+    provider: Arc<Provider>,
+    consumer: Arc<Consumer>,
     cache: Arc<ResultCache>,
-    ops: Arc<dyn PoolOps>,
+    workspace: Arc<Workspace>,
+    control: ControlHandle,
     config: ServiceConfig,
 }
 
 impl Coordinator {
     pub fn new(
-        state: Arc<Mutex<NodeState>>,
+        provider: Arc<Provider>,
+        consumer: Arc<Consumer>,
         cache: Arc<ResultCache>,
-        ops: Arc<dyn PoolOps>,
+        workspace: Arc<Workspace>,
+        control: ControlHandle,
         config: ServiceConfig,
     ) -> Self {
         Self {
-            state,
+            provider,
+            consumer,
             cache,
-            ops,
+            workspace,
+            control,
             config,
         }
     }
@@ -78,11 +86,7 @@ impl Coordinator {
             });
         }
 
-        let local_free = self
-            .state
-            .lock()
-            .map(|state| state.free_slots > 0)
-            .unwrap_or(false);
+        let local_free = self.provider.free_slots() > 0;
         if local_free {
             return self.run_local(request).await;
         }
@@ -90,10 +94,9 @@ impl Coordinator {
         if let Some(response) = self
             .try_remote(request, &manifest, digest, &out_dir, &env)
             .await
+            && !matches!(response.body, LocalBody::Error { .. })
         {
-            if !matches!(response.body, LocalBody::Error { .. }) {
-                return response;
-            }
+            return response;
         }
 
         self.run_local(request).await
@@ -102,7 +105,12 @@ impl Coordinator {
     async fn run_local(&self, request: &LocalRequest) -> LocalResponse {
         let request = request.clone();
         let cache = self.cache.clone();
-        match tokio::task::spawn_blocking(move || executor::execute_local(&request, &cache)).await {
+        let workspace = self.workspace.clone();
+        match tokio::task::spawn_blocking(move || {
+            executor::execute_local(&request, &cache, &workspace)
+        })
+        .await
+        {
             Ok(response) => response,
             Err(error) => LocalResponse::error("join_error", error.to_string()),
         }
@@ -124,13 +132,14 @@ impl Coordinator {
         };
         let bundle_hash = hash_bytes(&bundle);
         let task_id = TaskId(digest);
-        let transfer = RemoteTransfer::new(self.ops.as_ref(), self.cache.as_ref());
+        let transfer = RemoteTransfer::new(self.control.clone(), self.cache.clone());
 
         let (consumer, providers) = {
-            let state = self.state.lock().ok()?;
-            let providers: Vec<_> = state
-                .providers
-                .values()
+            let consumer = self.provider.provider_id();
+            let providers: Vec<_> = self
+                .consumer
+                .providers()
+                .into_iter()
                 .filter(|view| {
                     view.accepting
                         && view.free_slots > 0
@@ -139,24 +148,37 @@ impl Coordinator {
                         && (self.config.node.target.is_empty()
                             || view.target == self.config.node.target)
                 })
-                .map(|view| view.provider.clone())
+                .map(|view| view.provider)
                 .collect();
-            (state.provider_id.clone(), providers)
+            (consumer, providers)
         };
 
+        if providers.is_empty() {
+            LogStruct::new(LogLevel::Debug, "远端编译", "没有可用的 provider").emit();
+            return None;
+        }
+
         for provider in providers {
-            let lease = match self
-                .ops
-                .send(
-                    &provider,
-                    AppRequest::Reserve {
-                        consumer: consumer.clone(),
-                        task_id,
-                        slots: 1,
-                        input_manifest: bundle_hash,
-                    },
-                )
-                .await
+            LogStruct::new(
+                LogLevel::Debug,
+                "远端编译",
+                format!(
+                    "尝试 provider={provider}, action={}",
+                    &crate::compile::hash::hex_hash(&digest)[..8]
+                ),
+            )
+            .emit();
+            let lease = match control::send(
+                &self.control,
+                &provider,
+                AppRequest::Reserve {
+                    consumer: consumer.clone(),
+                    task_id,
+                    slots: 1,
+                    input_manifest: bundle_hash,
+                },
+            )
+            .await
             {
                 Ok(AppResponse::Granted { lease_id, .. }) => lease_id,
                 Ok(AppResponse::Cached {
@@ -168,10 +190,9 @@ impl Coordinator {
                     {
                         return Some(LocalResponse::error("result_error", error));
                     }
-                    let _ = self
-                        .ops
-                        .send(&provider, AppRequest::ResultAck { lease_id })
-                        .await;
+                    let _ =
+                        control::send(&self.control, &provider, AppRequest::ResultAck { lease_id })
+                            .await;
                     return Some(success_response(digest));
                 }
                 Ok(AppResponse::Busy { .. }) | Ok(AppResponse::Rejected { .. }) => continue,
@@ -184,17 +205,16 @@ impl Coordinator {
             {
                 return Some(LocalResponse::error("upload_error", error));
             }
-            if self
-                .ops
-                .send(
-                    &provider,
-                    AppRequest::TaskReady {
-                        task_id,
-                        lease_id: lease,
-                    },
-                )
-                .await
-                .is_err()
+            if control::send(
+                &self.control,
+                &provider,
+                AppRequest::TaskReady {
+                    task_id,
+                    lease_id: lease,
+                },
+            )
+            .await
+            .is_err()
             {
                 continue;
             }
@@ -203,7 +223,15 @@ impl Coordinator {
                 .wait_for_task(&provider, task_id, lease, digest, out_dir)
                 .await
             {
-                RemoteOutcome::Success => return Some(success_response(digest)),
+                RemoteOutcome::Success => {
+                    LogStruct::new(
+                        LogLevel::Debug,
+                        "远端编译完成",
+                        format!("provider={provider}"),
+                    )
+                    .emit();
+                    return Some(success_response(digest));
+                }
                 RemoteOutcome::CompileError(stdout, stderr) => {
                     return Some(LocalResponse::new(LocalBody::Compiled {
                         action_digest: digest,
@@ -217,6 +245,7 @@ impl Coordinator {
                 RemoteOutcome::Retry => continue,
             }
         }
+        LogStruct::new(LogLevel::Debug, "远端编译", "全部 provider 失败").emit();
         None
     }
 }

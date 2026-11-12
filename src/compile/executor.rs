@@ -9,15 +9,22 @@ use std::time::Instant;
 use walkdir::WalkDir;
 
 use crate::compile::cache::ResultCache;
+use crate::compile::hash::hex_hash;
 use crate::compile::manifest::collect_manifest;
 use crate::local_protocol::{
     LOCAL_PROTOCOL_VERSION, LocalBody, LocalRequest, LocalResponse, truncate_diagnostic,
 };
+use crate::log::{LogLevel, LogStruct};
 use crate::util::args;
 use crate::util::path::resolve_path;
 use crate::util::process;
+use crate::workspace::Workspace;
 
-pub fn execute_local(request: &LocalRequest, cache: &ResultCache) -> LocalResponse {
+pub fn execute_local(
+    request: &LocalRequest,
+    cache: &ResultCache,
+    workspace: &Workspace,
+) -> LocalResponse {
     if request.v != LOCAL_PROTOCOL_VERSION {
         return LocalResponse::error(
             "unsupported_version",
@@ -46,10 +53,17 @@ pub fn execute_local(request: &LocalRequest, cache: &ResultCache) -> LocalRespon
         Err(error) => return LocalResponse::error("manifest_error", error.to_string()),
     };
 
+    let digest_prefix = &hex_hash(&action_digest)[..8];
     if cache
         .lookup_and_materialize(&action_digest, &out_dir)
         .is_some()
     {
+        LogStruct::new(
+            LogLevel::Debug,
+            "缓存命中",
+            format!("action={digest_prefix}"),
+        )
+        .emit();
         return LocalResponse::new(LocalBody::Compiled {
             action_digest,
             exit_code: 0,
@@ -60,7 +74,7 @@ pub fn execute_local(request: &LocalRequest, cache: &ResultCache) -> LocalRespon
         });
     }
 
-    let staging = match cache.staging_dir(&action_digest) {
+    let staging = match workspace.staging_dir(&action_digest) {
         Ok(staging) => staging,
         Err(error) => return LocalResponse::error("cache_error", error.to_string()),
     };
@@ -79,6 +93,16 @@ pub fn execute_local(request: &LocalRequest, cache: &ResultCache) -> LocalRespon
     };
 
     let started = Instant::now();
+    LogStruct::new(
+        LogLevel::Debug,
+        "本地编译",
+        format!(
+            "action={digest_prefix}, crate={}",
+            args::value(&request.args, "--crate-name").unwrap_or_default()
+        ),
+    )
+    .emit();
+
     let output = Command::new(&request.rustc)
         .args(&exec_args)
         .current_dir(cwd)

@@ -1,28 +1,45 @@
-use std::sync::{Arc, Mutex};
+//! Inbound sidecar service dispatch (protocol v2 business entry point).
 
-use crate::compile::cache::ResultCache;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use crate::compile_protocol::{
-    APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, LeaseId, TaskState,
+    APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, PeerId, TaskState,
 };
-use crate::config::ServiceConfig;
+use crate::control::ControlPlane;
 use crate::log::{LogLevel, LogStruct};
 use crate::pool;
-use crate::sidecar_protocol::SidecarError;
-use crate::state::NodeState;
+use crate::protocol::{SidecarError, WhoamiInfo};
+use crate::state::AppState;
 use crate::task_blob::TaskBlobStore;
 
-#[derive(Clone)]
-pub struct ServiceContext {
-    pub state: Arc<Mutex<NodeState>>,
-    pub cache: Arc<ResultCache>,
-    pub config: ServiceConfig,
+/// Boxed future so async business logic can be spawned from the connection loop.
+pub type ServiceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, SidecarError>> + Send + 'a>>;
+
+/// Service dispatcher. The connection layer only depends on this abstraction,
+/// which makes it trivial to inject an echo/mock dispatcher in tests.
+pub trait Dispatch: Clone + Send + Sync + 'static {
+    fn handle<'a>(
+        &'a self,
+        service: &'a str,
+        payload: &'a [u8],
+        control: &'a dyn ControlPlane,
+    ) -> ServiceFuture<'a>;
+
+    fn on_connected(&self, _control: Arc<dyn ControlPlane>) {}
+
+    fn on_whoami(&self, _info: &WhoamiInfo) {}
+
+    fn on_disconnected(&self, _control: &Arc<dyn ControlPlane>) {}
 }
 
 /// Handle one inbound sidecar service request.
 pub async fn handle_service_request(
     service: &str,
     payload: &[u8],
-    context: ServiceContext,
+    app: &AppState,
 ) -> Result<Vec<u8>, SidecarError> {
     LogStruct::new(
         LogLevel::Debug,
@@ -31,14 +48,11 @@ pub async fn handle_service_request(
     )
     .emit();
 
-    handle_app_payload(payload, &context)
+    handle_app_payload(payload, app)
 }
 
 /// Decode, dispatch, and encode one application request.
-pub(crate) fn handle_app_payload(
-    payload: &[u8],
-    context: &ServiceContext,
-) -> Result<Vec<u8>, SidecarError> {
+pub(crate) fn handle_app_payload(payload: &[u8], app: &AppState) -> Result<Vec<u8>, SidecarError> {
     let envelope: Envelope<AppRequest> = ciborium::de::from_reader(payload)
         .map_err(|e| SidecarError::new("invalid_request", e.to_string()))?;
 
@@ -48,7 +62,7 @@ pub(crate) fn handle_app_payload(
             format!("unsupported version {}", envelope.v),
         )
     } else {
-        dispatch(envelope.body, context)
+        dispatch(envelope.body, app)
     };
 
     let mut result = Vec::new();
@@ -57,44 +71,49 @@ pub(crate) fn handle_app_payload(
     Ok(result)
 }
 
-fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
-    let Ok(mut state) = context.state.lock() else {
-        return AppResponse::error(ErrorCode::Internal, "state lock poisoned");
-    };
-
+fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
     match request {
         AppRequest::Subscribe {
             consumer,
             toolchain,
             target,
-        } => state.subscribe(consumer, toolchain, target),
-        AppRequest::Unsubscribe { consumer } => state.unsubscribe(&consumer),
+        } => app.provider.subscribe(consumer, toolchain, target),
+        AppRequest::Unsubscribe { consumer } => app.provider.unsubscribe(&consumer),
         AppRequest::CapacityUpdate {
             provider,
             seq,
             free_slots,
             queue_len,
             accepting,
-        } => state.apply_capacity(provider, seq, free_slots, queue_len, accepting),
+        } => app
+            .consumer
+            .apply_capacity(provider, seq, free_slots, queue_len, accepting),
         AppRequest::Reserve {
             consumer,
             task_id,
             slots,
             input_manifest,
         } => {
-            if state.task_entry(&task_id).is_none()
-                && let Some(outputs) = context.cache.cached_outputs(&task_id.0)
+            if app.provider.task_entry(&task_id).is_none()
+                && let Some(outputs) = app.cache.cached_outputs(&task_id.0)
+                && app.cache.pin(&task_id.0)
             {
                 return AppResponse::Cached {
                     task_id,
                     outputs,
-                    lease_id: LeaseId::new(),
+                    lease_id: app.provider.create_lease(task_id),
                 };
             }
-            state.reserve(consumer, task_id, slots, input_manifest)
+            let response = app
+                .provider
+                .reserve(consumer, task_id, slots, input_manifest);
+            if matches!(response, AppResponse::Cached { .. }) {
+                app.cache.pin(&task_id.0);
+            }
+            response
         }
         AppRequest::TaskReady { task_id, lease_id } => {
-            let Some(entry) = state.task_entry(&task_id) else {
+            let Some(entry) = app.provider.task_entry(&task_id) else {
                 return AppResponse::error(ErrorCode::NotFound, "unknown task");
             };
             if entry.lease_id != lease_id {
@@ -103,22 +122,28 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
             if !matches!(entry.state, TaskState::Queued) {
                 return AppResponse::error(ErrorCode::InvalidState, "task is not queued");
             }
-            let response = state.task_ready(task_id, lease_id);
+            let response = app.provider.task_ready(task_id, lease_id);
             if matches!(response, AppResponse::Ack) {
                 let bundle_hash = entry.input_manifest;
-                let state = context.state.clone();
-                let cache = context.cache.clone();
-                let config = context.config.clone();
-                pool::spawn_task(state, cache, config, task_id, bundle_hash);
+                let cache = app.cache.clone();
+                let config = app.config.snapshot();
+                pool::spawn_task(
+                    app.provider.clone(),
+                    cache,
+                    app.workspace.clone(),
+                    config,
+                    task_id,
+                    bundle_hash,
+                );
             }
             response
         }
         AppRequest::Status { task_id } => {
-            let response = state.status(task_id);
+            let response = app.provider.status(task_id);
             if let AppResponse::TaskStatus { .. } = &response {
                 return response;
             }
-            match context.cache.cached_outputs(&task_id.0) {
+            match app.cache.cached_outputs(&task_id.0) {
                 Some(outputs) => AppResponse::TaskStatus {
                     state: TaskState::Done { outputs },
                 },
@@ -126,17 +151,20 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
             }
         }
         AppRequest::Cancel { task_id } => {
-            let response = state.cancel(task_id);
-            context.cache.release(&task_id.0);
-            TaskBlobStore::new(&context.cache).remove_task_dir(&task_id.0);
+            let leases = app.provider.lease_count_for(task_id);
+            let response = app.provider.cancel(task_id);
+            for _ in 0..leases {
+                app.cache.release(&task_id.0);
+            }
+            TaskBlobStore::new(&app.workspace).remove_task_dir(&task_id.0);
             response
         }
         AppRequest::ResultAck { lease_id } => {
-            let Some(task_id) = state.result_ack(lease_id) else {
+            let Some(task_id) = app.provider.result_ack(lease_id) else {
                 return AppResponse::error(ErrorCode::NotFound, "unknown lease");
             };
-            context.cache.release(&task_id.0);
-            TaskBlobStore::new(&context.cache).remove_task_dir(&task_id.0);
+            app.cache.release(&task_id.0);
+            TaskBlobStore::new(&app.workspace).remove_task_dir(&task_id.0);
             AppResponse::Ack
         }
         AppRequest::BlobPut {
@@ -145,25 +173,47 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
             offset,
             data,
         } => {
-            let Some(entry) = state.task_entry(&task_id) else {
+            let Some(entry) = app.provider.task_entry(&task_id) else {
                 return AppResponse::error(ErrorCode::NotFound, "unknown task");
             };
             if entry.input_manifest != hash {
                 return AppResponse::rejected("bundle hash mismatch");
             }
-            drop(state);
 
-            match TaskBlobStore::new(&context.cache).put_chunk(task_id, offset, &data) {
+            match TaskBlobStore::new(&app.workspace).put_chunk(task_id, offset, &data) {
                 Ok(()) => AppResponse::Ack,
                 Err(error) => AppResponse::error(ErrorCode::Internal, error.to_string()),
             }
         }
         AppRequest::BlobGet { hash, offset, len } => {
-            match context.cache.read_chunk(&hash, offset, len as usize) {
+            match app.cache.read_chunk(&hash, offset, len as usize) {
                 Ok(data) => AppResponse::Chunk { hash, offset, data },
                 Err(error) => AppResponse::error(ErrorCode::NotFound, error.to_string()),
             }
         }
+    }
+}
+
+impl Dispatch for AppState {
+    fn handle<'a>(
+        &'a self,
+        service: &'a str,
+        payload: &'a [u8],
+        _control: &'a dyn ControlPlane,
+    ) -> ServiceFuture<'a> {
+        Box::pin(async move { handle_service_request(service, payload, self).await })
+    }
+
+    fn on_connected(&self, control: Arc<dyn ControlPlane>) {
+        self.set_control(Some(control));
+    }
+
+    fn on_whoami(&self, info: &WhoamiInfo) {
+        self.set_provider_id(PeerId::new(info.peer_id.clone()));
+    }
+
+    fn on_disconnected(&self, control: &Arc<dyn ControlPlane>) {
+        crate::control::clear_if(&self.control, control);
     }
 }
 
@@ -180,19 +230,25 @@ impl AppResponse {
 mod tests {
     use super::*;
     use crate::compile_protocol::{Hash32, OutputRef, PeerId, TaskId};
+    use crate::config::ConfigHandle;
+    use crate::control::new_control_handle;
+    use crate::pool::{Consumer, Provider};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn context() -> ServiceContext {
+    fn context() -> AppState {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let cache_dir = std::env::temp_dir().join(format!("nexuscompile-service-{unique}"));
-        ServiceContext {
-            state: Arc::new(Mutex::new(NodeState::placeholder())),
-            cache: Arc::new(ResultCache::open(&cache_dir, 1024 * 1024).unwrap()),
-            config: ServiceConfig::default(),
-        }
+        AppState::new(
+            Arc::new(Provider::placeholder()),
+            Arc::new(Consumer::new()),
+            Arc::new(crate::compile::cache::ResultCache::open(&cache_dir, 1024 * 1024).unwrap()),
+            Arc::new(crate::workspace::Workspace::new(&cache_dir)),
+            ConfigHandle::new(crate::config::ServiceConfig::default()),
+            new_control_handle(),
+        )
     }
 
     fn encode_request(request: AppRequest) -> Vec<u8> {
@@ -265,13 +321,12 @@ mod tests {
         let context = context();
         let task_id = TaskId(Hash32([1; 32]));
         let bundle = context.cache.cas().put_bytes(b"bundle").unwrap();
-        {
-            let mut state = context.state.lock().unwrap();
-            assert!(matches!(
-                state.reserve(PeerId::new("consumer"), task_id, 1, bundle.hash),
-                AppResponse::Granted { .. }
-            ));
-        }
+        assert!(matches!(
+            context
+                .provider
+                .reserve(PeerId::new("consumer"), task_id, 1, bundle.hash),
+            AppResponse::Granted { .. }
+        ));
 
         let request = encode_request(AppRequest::BlobPut {
             task_id,
@@ -311,7 +366,7 @@ mod tests {
         ));
     }
 
-    fn seed_output(context: &ServiceContext, task_id: TaskId, bytes: &[u8]) -> OutputRef {
+    fn seed_output(context: &AppState, task_id: TaskId, bytes: &[u8]) -> OutputRef {
         let blob = context.cache.cas().put_bytes(bytes).unwrap();
         let output = OutputRef {
             path: "libdemo.rlib".into(),
@@ -353,7 +408,7 @@ mod tests {
             }
             other => panic!("expected cached, got {other:?}"),
         }
-        assert!(context.state.lock().unwrap().task_entry(&task_id).is_none());
+        assert!(context.provider.task_entry(&task_id).is_none());
     }
 
     #[test]
@@ -363,14 +418,18 @@ mod tests {
         let output = seed_output(&context, task_id, b"done");
 
         let lease_id = {
-            let mut state = context.state.lock().unwrap();
-            let lease_id = match state.reserve(PeerId::new("consumer"), task_id, 1, Hash32([7; 32]))
-            {
-                AppResponse::Granted { lease_id, .. } => lease_id,
-                other => panic!("expected granted, got {other:?}"),
-            };
+            let lease_id =
+                match context
+                    .provider
+                    .reserve(PeerId::new("consumer"), task_id, 1, Hash32([7; 32]))
+                {
+                    AppResponse::Granted { lease_id, .. } => lease_id,
+                    other => panic!("expected granted, got {other:?}"),
+                };
             assert_eq!(
-                state.complete_task(task_id, vec![output.clone()]),
+                context
+                    .provider
+                    .complete_task(task_id, vec![output.clone()]),
                 AppResponse::Ack
             );
             lease_id
@@ -379,7 +438,7 @@ mod tests {
         let request = encode_request(AppRequest::ResultAck { lease_id });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
         assert_eq!(response.body, AppResponse::Ack);
-        assert!(context.state.lock().unwrap().task_entry(&task_id).is_none());
+        assert!(context.provider.task_entry(&task_id).is_none());
 
         let request = encode_request(AppRequest::Status { task_id });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());

@@ -1,65 +1,93 @@
-//! Typed control-result payloads and CBOR decoding helpers.
+//! Node control plane abstraction.
+//!
+//! Business logic depends on [`ControlPlane`] instead of the concrete
+//! [`crate::connection::BackendClient`], so tests can inject a mock and the
+//! connection layer stays replaceable.
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 
-use crate::sidecar_protocol::SidecarError;
+use async_trait::async_trait;
 
-/// Decode `reply.result` CBOR bytes.
-pub fn decode_result<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, SidecarError> {
-    ciborium::de::from_reader(bytes).map_err(|e| SidecarError::new("decode_error", e.to_string()))
+use crate::compile_protocol::{AppRequest, AppResponse, Envelope, PeerId};
+use crate::protocol::{SidecarError, WhoamiInfo};
+
+/// Domain-level operations this backend needs from the local NexusNet node.
+#[async_trait]
+pub trait ControlPlane: Send + Sync {
+    /// Send one `rustc-pool` application request to a specific peer.
+    async fn service_request_to(
+        &self,
+        service: &str,
+        peer: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, SidecarError>;
+
+    /// Query this node's identity.
+    async fn whoami(&self) -> Result<WhoamiInfo, SidecarError>;
 }
 
-/// `query_public_ip`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublicIpInfo {
-    #[serde(default)]
-    pub ipv4: Option<String>,
-    #[serde(default)]
-    pub ipv6: Option<String>,
+#[async_trait]
+impl ControlPlane for crate::connection::BackendClient {
+    async fn service_request_to(
+        &self,
+        service: &str,
+        peer: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, SidecarError> {
+        crate::connection::BackendClient::service_request_to(self, service, peer, payload).await
+    }
+
+    async fn whoami(&self) -> Result<WhoamiInfo, SidecarError> {
+        crate::connection::BackendClient::whoami(self).await
+    }
 }
 
-/// `query_key`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueryKeyResult {
-    pub key: String,
-    #[serde(default)]
-    pub value: Option<Vec<u8>>,
-    #[serde(default)]
-    pub providers: Vec<String>,
+/// Shared handle to the current node connection.
+pub type ControlHandle = Arc<RwLock<Option<Arc<dyn ControlPlane>>>>;
+
+pub fn new_control_handle() -> ControlHandle {
+    Arc::new(RwLock::new(None))
 }
 
-/// `relay_status`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelayStatusResult {
-    pub need_relay: bool,
-    pub target: u64,
-    #[serde(default)]
-    pub active: Vec<String>,
-    #[serde(default)]
-    pub pending: Vec<String>,
+pub fn current(handle: &ControlHandle) -> Option<Arc<dyn ControlPlane>> {
+    handle.read().ok().and_then(|guard| guard.clone())
 }
 
-/// `pq_status`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PqStatusResult {
-    pub enabled: bool,
-    pub transport: bool,
-    pub identity: bool,
-    pub required: bool,
+pub fn set(handle: &ControlHandle, control: Option<Arc<dyn ControlPlane>>) {
+    if let Ok(mut guard) = handle.write() {
+        *guard = control;
+    }
 }
 
-/// `reconnect_bootstrap` / `reannounce_services` / `reload_config`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SuccessResult {
-    pub success: bool,
-    #[serde(default)]
-    pub error: Option<String>,
+/// Clear the handle only if it still points at `expected`.
+pub fn clear_if(handle: &ControlHandle, expected: &Arc<dyn ControlPlane>) {
+    if let Ok(mut guard) = handle.write()
+        && guard
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        *guard = None;
+    }
 }
 
-/// `add_key`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddKeyResult {
-    pub success: bool,
-    pub key: String,
+/// Send one `rustc-pool` request through the current node connection.
+pub async fn send(
+    handle: &ControlHandle,
+    peer: &PeerId,
+    request: AppRequest,
+) -> Result<AppResponse, SidecarError> {
+    let control = current(handle)
+        .ok_or_else(|| SidecarError::new("not_connected", "NexusNet sidecar is not connected"))?;
+
+    let mut payload = Vec::new();
+    ciborium::ser::into_writer(&Envelope::new(request), &mut payload)
+        .map_err(|e| SidecarError::new("encode_error", e.to_string()))?;
+
+    let response = control
+        .service_request_to("rustc-pool", peer.as_str(), payload)
+        .await?;
+
+    let envelope: Envelope<AppResponse> = ciborium::de::from_reader(response.as_slice())
+        .map_err(|e| SidecarError::new("decode_error", e.to_string()))?;
+    Ok(envelope.body)
 }

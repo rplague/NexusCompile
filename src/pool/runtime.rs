@@ -1,40 +1,34 @@
 //! Background capacity sampling, provider publishing, and consumer targeting.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::sync::watch;
 use tokio::time::{Duration, interval};
 
-use super::PoolOps;
+use super::{Consumer, Provider};
 use crate::capacity::{CapacitySnapshot, CapacitySource, calculate_capacity};
+use crate::compile::cache::ResultCache;
 use crate::compile_protocol::{AppRequest, AppResponse, PeerId};
 use crate::config::{NodeConfig, ServiceConfig, SubscriptionConfig};
+use crate::control::{self, ControlHandle};
 use crate::log::{LogLevel, LogStruct};
-use crate::state::NodeState;
 use crate::util::time::now_ms;
 
 pub async fn publish_due(
-    ops: &dyn PoolOps,
-    state: &Arc<Mutex<NodeState>>,
-    snapshot: CapacitySnapshot,
+    control: &ControlHandle,
+    provider: &Arc<Provider>,
     interval_ms: u64,
 ) -> usize {
-    let due = {
-        let Ok(mut state) = state.lock() else {
-            return 0;
-        };
-        state.due_capacity_updates(now_ms(), snapshot, interval_ms)
-    };
+    let snapshot = provider.capacity_snapshot();
+    let due = provider.due_capacity_updates(now_ms(), snapshot, interval_ms);
 
     let mut sent = 0;
     for (peer, request) in due {
-        match ops.send(&peer, request).await {
+        match control::send(control, &peer, request).await {
             Ok(AppResponse::Ack) => sent += 1,
             Ok(_) | Err(_) => {
-                if let Ok(mut state) = state.lock() {
-                    state.unsubscribe(&peer);
-                }
+                provider.unsubscribe(&peer);
             }
         }
     }
@@ -42,8 +36,9 @@ pub async fn publish_due(
 }
 
 pub async fn ensure_target(
-    ops: &dyn PoolOps,
-    state: &Arc<Mutex<NodeState>>,
+    control: &ControlHandle,
+    provider: &Arc<Provider>,
+    consumer: &Arc<Consumer>,
     node: &NodeConfig,
     subscription: &SubscriptionConfig,
 ) -> usize {
@@ -51,22 +46,13 @@ pub async fn ensure_target(
         return 0;
     }
 
-    let (provider_id, mut visible_capacity, mut known) = {
-        let Ok(state) = state.lock() else {
-            return 0;
-        };
-        let visible = state.max_slots
-            + state
-                .providers
-                .values()
-                .map(|view| view.max_slots)
-                .sum::<u32>();
-        (
-            state.provider_id.clone(),
-            visible,
-            state.providers.keys().cloned().collect::<HashSet<_>>(),
-        )
-    };
+    let provider_id = provider.provider_id();
+    let mut visible_capacity = provider.max_slots() + consumer.visible_max_slots();
+    let mut known: HashSet<PeerId> = consumer
+        .providers()
+        .into_iter()
+        .map(|view| view.provider)
+        .collect();
 
     let mut subscribed = 0;
     for raw_peer in &subscription.static_peers {
@@ -79,9 +65,7 @@ pub async fn ensure_target(
             continue;
         }
 
-        if let Ok(mut state) = state.lock() {
-            state.record_pending(peer.clone(), node.toolchain.clone(), node.target.clone());
-        }
+        consumer.record_pending(peer.clone(), node.toolchain.clone(), node.target.clone());
 
         let request = AppRequest::Subscribe {
             consumer: provider_id.clone(),
@@ -89,76 +73,53 @@ pub async fn ensure_target(
             target: node.target.clone(),
         };
 
-        match ops.send(&peer, request).await {
-            Ok(AppResponse::Subscribed { max_slots, .. }) => {
-                if let Ok(mut state) = state.lock() {
-                    state.record_subscribed(
-                        peer.clone(),
-                        node.toolchain.clone(),
-                        node.target.clone(),
-                        max_slots,
-                    );
-                }
+        match control::send(control, &peer, request).await {
+            Ok(AppResponse::Subscribed {
+                provider: _,
+                toolchain,
+                target,
+                max_slots,
+            }) => {
+                consumer.record_subscribed(peer.clone(), toolchain, target, max_slots);
                 visible_capacity = visible_capacity.saturating_add(max_slots);
                 known.insert(peer);
                 subscribed += 1;
             }
-            Ok(_) | Err(_) => {
-                if let Ok(mut state) = state.lock() {
-                    state.remove_provider(&peer);
-                }
-            }
+            Ok(_) | Err(_) => consumer.remove_provider(&peer),
         }
     }
     subscribed
 }
 
-pub fn expire_providers(state: &Arc<Mutex<NodeState>>, ttl_ms: u64) -> Vec<PeerId> {
-    let Ok(mut state) = state.lock() else {
-        return Vec::new();
-    };
-    state.expire_providers(now_ms(), ttl_ms)
+pub fn expire_providers(consumer: &Arc<Consumer>, ttl_ms: u64) -> Vec<PeerId> {
+    consumer.expire_providers(now_ms(), ttl_ms)
 }
 
 enum SampleError {
     Source(std::io::Error),
-    State,
 }
 
 fn sampled_snapshot(
     source: &mut (dyn CapacitySource + Send),
-    state: &Arc<Mutex<NodeState>>,
+    provider: &Arc<Provider>,
     node: &NodeConfig,
 ) -> Result<CapacitySnapshot, SampleError> {
     let sample = source.sample().map_err(SampleError::Source)?;
-    let (active_slots, queue_len) = {
-        let state = state.lock().map_err(|_| SampleError::State)?;
-        (state.active_slots(), state.queue_len())
-    };
-    Ok(calculate_capacity(&sample, active_slots, queue_len, node))
+    Ok(calculate_capacity(&sample, provider.queue_len(), node))
 }
 
-fn apply_capacity(state: &Arc<Mutex<NodeState>>, snapshot: CapacitySnapshot) {
-    if let Ok(mut state) = state.lock() {
-        state.set_capacity(snapshot.max_slots, snapshot.free_slots, snapshot.accepting);
-    }
+fn apply_capacity(provider: &Arc<Provider>, snapshot: CapacitySnapshot) {
+    provider.set_capacity(snapshot.max_slots, snapshot.free_slots);
 }
 
 async fn publish_capacity_tick(
-    ops: &dyn PoolOps,
-    state: &Arc<Mutex<NodeState>>,
+    control: &ControlHandle,
+    provider: &Arc<Provider>,
     subscription: &SubscriptionConfig,
 ) {
-    let snapshot = {
-        let Ok(state) = state.lock() else {
-            return;
-        };
-        state.capacity_snapshot()
-    };
     let _ = publish_due(
-        ops,
-        state,
-        snapshot,
+        control,
+        provider,
         subscription
             .update_interval_secs
             .max(1)
@@ -168,23 +129,34 @@ async fn publish_capacity_tick(
 }
 
 async fn subscribe_capacity_tick(
-    ops: &dyn PoolOps,
-    state: &Arc<Mutex<NodeState>>,
+    control: &ControlHandle,
+    provider: &Arc<Provider>,
+    consumer: &Arc<Consumer>,
     node: &NodeConfig,
     subscription: &SubscriptionConfig,
 ) {
-    let _ = ensure_target(ops, state, node, subscription).await;
+    let _ = ensure_target(control, provider, consumer, node, subscription).await;
 }
 
-fn expire_capacity_tick(state: &Arc<Mutex<NodeState>>, subscription: &SubscriptionConfig) {
-    for peer in expire_providers(state, subscription.ttl_secs.max(1).saturating_mul(1_000)) {
+fn expire_capacity_tick(consumer: &Arc<Consumer>, subscription: &SubscriptionConfig) {
+    for peer in expire_providers(consumer, subscription.ttl_secs.max(1).saturating_mul(1_000)) {
         LogStruct::new(LogLevel::Debug, "订阅过期", peer.to_string()).emit();
     }
 }
 
+fn expire_leases(provider: &Arc<Provider>, cache: &Arc<ResultCache>) {
+    for (task_id, count) in provider.expire_leases(now_ms()) {
+        for _ in 0..count {
+            cache.release(&task_id.0);
+        }
+    }
+}
+
 pub async fn run_pool(
-    ops: Arc<dyn PoolOps>,
-    state: Arc<Mutex<NodeState>>,
+    control: ControlHandle,
+    provider: Arc<Provider>,
+    consumer: Arc<Consumer>,
+    cache: Arc<ResultCache>,
     config: ServiceConfig,
     mut shutdown: watch::Receiver<bool>,
     mut source: Box<dyn CapacitySource + Send>,
@@ -194,9 +166,8 @@ pub async fn run_pool(
 
     // Seed capacity before the first Subscribe/Subscribed exchange so `max_slots`
     // does not start at the placeholder value.
-    match sampled_snapshot(source.as_mut(), &state, &node) {
-        Ok(snapshot) => apply_capacity(&state, snapshot),
-        Err(SampleError::State) => return,
+    match sampled_snapshot(source.as_mut(), &provider, &node) {
+        Ok(snapshot) => apply_capacity(&provider, snapshot),
         Err(SampleError::Source(_)) => {}
     }
 
@@ -215,22 +186,22 @@ pub async fn run_pool(
                 }
             }
             _ = capacity_tick.tick() => {
-                match sampled_snapshot(source.as_mut(), &state, &node) {
-                    Ok(snapshot) => apply_capacity(&state, snapshot),
-                    Err(SampleError::State) => continue,
+                match sampled_snapshot(source.as_mut(), &provider, &node) {
+                    Ok(snapshot) => apply_capacity(&provider, snapshot),
                     Err(SampleError::Source(e)) => {
                         LogStruct::new(LogLevel::Warning, "容量采样失败", e.to_string()).emit();
                     }
                 }
             }
             _ = provider_tick.tick() => {
-                publish_capacity_tick(ops.as_ref(), &state, &subscription).await;
+                publish_capacity_tick(&control, &provider, &subscription).await;
             }
             _ = consumer_tick.tick() => {
-                subscribe_capacity_tick(ops.as_ref(), &state, &node, &subscription).await;
+                subscribe_capacity_tick(&control, &provider, &consumer, &node, &subscription).await;
             }
             _ = ttl_tick.tick() => {
-                expire_capacity_tick(&state, &subscription);
+                expire_capacity_tick(&consumer, &subscription);
+                expire_leases(&provider, &cache);
             }
         }
     }
@@ -240,19 +211,20 @@ pub async fn run_pool(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
 
-    use crate::capacity::CapacitySnapshot;
-    use crate::compile_protocol::{AppRequest, AppResponse};
-    use crate::sidecar_protocol::SidecarError;
+    use crate::compile_protocol::{AppRequest, AppResponse, Envelope};
+    use crate::control::new_control_handle;
+    use crate::protocol::{SidecarError, WhoamiInfo};
 
-    struct MockOps {
+    struct MockControl {
         sent: Mutex<Vec<(PeerId, AppRequest)>>,
         responses: Mutex<VecDeque<Result<AppResponse, SidecarError>>>,
     }
 
-    impl MockOps {
+    impl MockControl {
         fn new(responses: Vec<Result<AppResponse, SidecarError>>) -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
@@ -266,67 +238,71 @@ mod tests {
     }
 
     #[async_trait]
-    impl PoolOps for MockOps {
-        async fn send(
+    impl crate::control::ControlPlane for MockControl {
+        async fn service_request_to(
             &self,
-            peer: &PeerId,
-            request: AppRequest,
-        ) -> Result<AppResponse, SidecarError> {
-            self.sent.lock().unwrap().push((peer.clone(), request));
-            self.responses
+            _service: &str,
+            peer: &str,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, SidecarError> {
+            let envelope: Envelope<AppRequest> = ciborium::de::from_reader(payload.as_slice())
+                .map_err(|e| SidecarError::new("decode_error", e.to_string()))?;
+            self.sent
+                .lock()
+                .unwrap()
+                .push((PeerId::new(peer), envelope.body));
+            let response = self
+                .responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| Ok(AppResponse::Ack))
+                .unwrap_or(Ok(AppResponse::Ack))?;
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&Envelope::new(response), &mut bytes)
+                .map_err(|e| SidecarError::new("encode_error", e.to_string()))?;
+            Ok(bytes)
+        }
+
+        async fn whoami(&self) -> Result<WhoamiInfo, SidecarError> {
+            Ok(WhoamiInfo {
+                peer_id: "mock".into(),
+                name: String::new(),
+                description: String::new(),
+            })
         }
     }
 
-    fn snapshot(free_slots: u32) -> CapacitySnapshot {
-        CapacitySnapshot {
-            max_slots: 4,
-            free_slots,
-            queue_len: 0,
-            accepting: free_slots > 0,
-        }
+    fn control_with(control: Arc<MockControl>) -> ControlHandle {
+        let handle = new_control_handle();
+        *handle.write().unwrap() = Some(control);
+        handle
     }
 
     #[tokio::test]
     async fn publishes_initial_and_removes_on_failure() {
-        let state = Arc::new(Mutex::new(NodeState::placeholder()));
-        {
-            let mut state = state.lock().unwrap();
-            state.subscribe(PeerId::new("consumer"), String::new(), String::new());
-        }
-        let ops = MockOps::new(vec![Ok(AppResponse::Ack)]);
-        let sent = publish_due(&ops, &state, snapshot(1), 30_000).await;
-        assert_eq!(sent, 1);
-        assert_eq!(ops.sent().len(), 1);
-        assert_eq!(state.lock().unwrap().subscriptions.len(), 1);
+        let provider = Arc::new(Provider::placeholder());
+        provider.set_capacity(4, 1);
+        provider.subscribe(PeerId::new("consumer"), String::new(), String::new());
 
-        {
-            let mut state = state.lock().unwrap();
-            state.subscribe(PeerId::new("consumer-2"), String::new(), String::new());
-        }
-        let ops = MockOps::new(vec![Err(SidecarError::new("io", "down"))]);
-        let sent = publish_due(&ops, &state, snapshot(1), 30_000).await;
+        let control = Arc::new(MockControl::new(vec![Ok(AppResponse::Ack)]));
+        let handle = control_with(control.clone());
+        let sent = publish_due(&handle, &provider, 30_000).await;
+        assert_eq!(sent, 1);
+        assert_eq!(control.sent().len(), 1);
+        assert_eq!(provider.subscription_count(), 1);
+
+        provider.subscribe(PeerId::new("consumer-2"), String::new(), String::new());
+        let control = Arc::new(MockControl::new(vec![Err(SidecarError::new("io", "down"))]));
+        let handle = control_with(control);
+        let sent = publish_due(&handle, &provider, 30_000).await;
         assert_eq!(sent, 0);
-        assert!(
-            !state
-                .lock()
-                .unwrap()
-                .subscriptions
-                .contains_key(&PeerId::new("consumer-2"))
-        );
+        assert!(!provider.has_subscription(&PeerId::new("consumer-2")));
     }
 
     #[tokio::test]
     async fn subscribes_until_target_capacity_is_visible() {
-        let state = Arc::new(Mutex::new(NodeState::new(
-            PeerId::new("self"),
-            1,
-            "rustc",
-            "x86_64",
-        )));
+        let provider = Arc::new(Provider::new(PeerId::new("self"), 1, "rustc", "x86_64"));
+        let consumer = Arc::new(Consumer::new());
         let node = NodeConfig {
             toolchain: "rustc".into(),
             target: "x86_64".into(),
@@ -337,39 +313,47 @@ mod tests {
             static_peers: vec!["a".into(), "b".into(), "c".into()],
             ..SubscriptionConfig::default()
         };
-        let ops = MockOps::new(vec![
+        let control = Arc::new(MockControl::new(vec![
             Ok(AppResponse::Subscribed {
                 provider: PeerId::new("a"),
-                toolchain: "rustc".into(),
-                target: "x86_64".into(),
+                toolchain: "rustc-provider".into(),
+                target: "aarch64".into(),
                 max_slots: 2,
             }),
             Ok(AppResponse::Subscribed {
                 provider: PeerId::new("b"),
-                toolchain: "rustc".into(),
-                target: "x86_64".into(),
+                toolchain: "rustc-provider".into(),
+                target: "aarch64".into(),
                 max_slots: 2,
             }),
-        ]);
+        ]));
+        let handle = control_with(control.clone());
 
-        let subscribed = ensure_target(&ops, &state, &node, &subscription).await;
+        let subscribed = ensure_target(&handle, &provider, &consumer, &node, &subscription).await;
         assert_eq!(subscribed, 2);
-        assert_eq!(ops.sent().len(), 2);
-        assert_eq!(state.lock().unwrap().providers.len(), 2);
+        assert_eq!(control.sent().len(), 2);
+        let views = consumer.providers();
+        assert_eq!(views.len(), 2);
+        assert!(views.iter().all(|view| view.toolchain == "rustc-provider"));
     }
 
     #[tokio::test]
     async fn failed_subscribe_removes_pending_provider() {
-        let state = Arc::new(Mutex::new(NodeState::new(PeerId::new("self"), 0, "", "")));
+        let provider = Arc::new(Provider::new(PeerId::new("self"), 0, "", ""));
+        let consumer = Arc::new(Consumer::new());
         let node = NodeConfig::default();
         let subscription = SubscriptionConfig {
             target_slots: 1,
             static_peers: vec!["a".into()],
             ..SubscriptionConfig::default()
         };
-        let ops = MockOps::new(vec![Err(SidecarError::new("io", "down"))]);
+        let control = Arc::new(MockControl::new(vec![Err(SidecarError::new("io", "down"))]));
+        let handle = control_with(control);
 
-        assert_eq!(ensure_target(&ops, &state, &node, &subscription).await, 0);
-        assert!(state.lock().unwrap().providers.is_empty());
+        assert_eq!(
+            ensure_target(&handle, &provider, &consumer, &node, &subscription).await,
+            0
+        );
+        assert!(consumer.providers().is_empty());
     }
 }

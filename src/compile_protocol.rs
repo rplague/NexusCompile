@@ -34,14 +34,8 @@ impl std::fmt::Display for PeerId {
 }
 
 /// A 32-byte content/action hash. Encoded as CBOR bstr.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hash32(pub [u8; 32]);
-
-impl Default for Hash32 {
-    fn default() -> Self {
-        Self([0; 32])
-    }
-}
 
 impl Serialize for Hash32 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
