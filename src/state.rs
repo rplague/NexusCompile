@@ -1,10 +1,60 @@
 //! In-memory provider/consumer state for the compile pool.
 
+use std::sync::{Arc, Mutex};
+
+use crate::compile::cache::ResultCache;
+use crate::compile_protocol::PeerId;
+use crate::config::{ConfigHandle, ServiceConfig};
+use crate::control::{self, ControlHandle, ControlPlane};
+
 mod model;
 mod provider;
 mod task;
 
 pub use model::{NodeState, ProviderView, Subscription, TaskEntry};
+
+/// Shared application state handed to the connection and local services.
+#[derive(Clone)]
+pub struct AppState {
+    pub state: Arc<Mutex<NodeState>>,
+    pub cache: Arc<ResultCache>,
+    pub config: ConfigHandle,
+    pub control: ControlHandle,
+}
+
+impl AppState {
+    pub fn new(
+        state: Arc<Mutex<NodeState>>,
+        cache: Arc<ResultCache>,
+        config: ConfigHandle,
+        control: ControlHandle,
+    ) -> Self {
+        Self {
+            state,
+            cache,
+            config,
+            control,
+        }
+    }
+
+    pub fn config_snapshot(&self) -> ServiceConfig {
+        self.config.snapshot()
+    }
+
+    pub fn set_control(&self, control: Option<Arc<dyn ControlPlane>>) {
+        crate::control::set(&self.control, control);
+    }
+
+    pub fn current_control(&self) -> Option<Arc<dyn ControlPlane>> {
+        control::current(&self.control)
+    }
+
+    pub fn set_provider_id(&self, peer_id: PeerId) {
+        if let Ok(mut state) = self.state.lock() {
+            state.set_provider_id(peer_id);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,28 +1,45 @@
-use std::sync::{Arc, Mutex};
+//! Inbound sidecar service dispatch (protocol v2 business entry point).
 
-use crate::compile::cache::ResultCache;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use crate::compile_protocol::{
-    APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, LeaseId, TaskState,
+    APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, LeaseId, PeerId, TaskState,
 };
-use crate::config::ServiceConfig;
+use crate::control::ControlPlane;
 use crate::log::{LogLevel, LogStruct};
 use crate::pool;
-use crate::sidecar_protocol::SidecarError;
-use crate::state::NodeState;
+use crate::protocol::{SidecarError, WhoamiInfo};
+use crate::state::AppState;
 use crate::task_blob::TaskBlobStore;
 
-#[derive(Clone)]
-pub struct ServiceContext {
-    pub state: Arc<Mutex<NodeState>>,
-    pub cache: Arc<ResultCache>,
-    pub config: ServiceConfig,
+/// Boxed future so async business logic can be spawned from the connection loop.
+pub type ServiceFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, SidecarError>> + Send + 'a>>;
+
+/// Service dispatcher. The connection layer only depends on this abstraction,
+/// which makes it trivial to inject an echo/mock dispatcher in tests.
+pub trait Dispatch: Clone + Send + Sync + 'static {
+    fn handle<'a>(
+        &'a self,
+        service: &'a str,
+        payload: &'a [u8],
+        control: &'a dyn ControlPlane,
+    ) -> ServiceFuture<'a>;
+
+    fn on_connected(&self, _control: Arc<dyn ControlPlane>) {}
+
+    fn on_whoami(&self, _info: &WhoamiInfo) {}
+
+    fn on_disconnected(&self) {}
 }
 
 /// Handle one inbound sidecar service request.
 pub async fn handle_service_request(
     service: &str,
     payload: &[u8],
-    context: ServiceContext,
+    app: &AppState,
 ) -> Result<Vec<u8>, SidecarError> {
     LogStruct::new(
         LogLevel::Debug,
@@ -31,14 +48,11 @@ pub async fn handle_service_request(
     )
     .emit();
 
-    handle_app_payload(payload, &context)
+    handle_app_payload(payload, app)
 }
 
 /// Decode, dispatch, and encode one application request.
-pub(crate) fn handle_app_payload(
-    payload: &[u8],
-    context: &ServiceContext,
-) -> Result<Vec<u8>, SidecarError> {
+pub(crate) fn handle_app_payload(payload: &[u8], app: &AppState) -> Result<Vec<u8>, SidecarError> {
     let envelope: Envelope<AppRequest> = ciborium::de::from_reader(payload)
         .map_err(|e| SidecarError::new("invalid_request", e.to_string()))?;
 
@@ -48,7 +62,7 @@ pub(crate) fn handle_app_payload(
             format!("unsupported version {}", envelope.v),
         )
     } else {
-        dispatch(envelope.body, context)
+        dispatch(envelope.body, app)
     };
 
     let mut result = Vec::new();
@@ -57,8 +71,8 @@ pub(crate) fn handle_app_payload(
     Ok(result)
 }
 
-fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
-    let Ok(mut state) = context.state.lock() else {
+fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
+    let Ok(mut state) = app.state.lock() else {
         return AppResponse::error(ErrorCode::Internal, "state lock poisoned");
     };
 
@@ -83,7 +97,7 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
             input_manifest,
         } => {
             if state.task_entry(&task_id).is_none()
-                && let Some(outputs) = context.cache.cached_outputs(&task_id.0)
+                && let Some(outputs) = app.cache.cached_outputs(&task_id.0)
             {
                 return AppResponse::Cached {
                     task_id,
@@ -106,9 +120,9 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
             let response = state.task_ready(task_id, lease_id);
             if matches!(response, AppResponse::Ack) {
                 let bundle_hash = entry.input_manifest;
-                let state = context.state.clone();
-                let cache = context.cache.clone();
-                let config = context.config.clone();
+                let state = app.state.clone();
+                let cache = app.cache.clone();
+                let config = app.config.snapshot();
                 pool::spawn_task(state, cache, config, task_id, bundle_hash);
             }
             response
@@ -118,7 +132,7 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
             if let AppResponse::TaskStatus { .. } = &response {
                 return response;
             }
-            match context.cache.cached_outputs(&task_id.0) {
+            match app.cache.cached_outputs(&task_id.0) {
                 Some(outputs) => AppResponse::TaskStatus {
                     state: TaskState::Done { outputs },
                 },
@@ -127,16 +141,16 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
         }
         AppRequest::Cancel { task_id } => {
             let response = state.cancel(task_id);
-            context.cache.release(&task_id.0);
-            TaskBlobStore::new(&context.cache).remove_task_dir(&task_id.0);
+            app.cache.release(&task_id.0);
+            TaskBlobStore::new(&app.cache).remove_task_dir(&task_id.0);
             response
         }
         AppRequest::ResultAck { lease_id } => {
             let Some(task_id) = state.result_ack(lease_id) else {
                 return AppResponse::error(ErrorCode::NotFound, "unknown lease");
             };
-            context.cache.release(&task_id.0);
-            TaskBlobStore::new(&context.cache).remove_task_dir(&task_id.0);
+            app.cache.release(&task_id.0);
+            TaskBlobStore::new(&app.cache).remove_task_dir(&task_id.0);
             AppResponse::Ack
         }
         AppRequest::BlobPut {
@@ -153,17 +167,42 @@ fn dispatch(request: AppRequest, context: &ServiceContext) -> AppResponse {
             }
             drop(state);
 
-            match TaskBlobStore::new(&context.cache).put_chunk(task_id, offset, &data) {
+            match TaskBlobStore::new(&app.cache).put_chunk(task_id, offset, &data) {
                 Ok(()) => AppResponse::Ack,
                 Err(error) => AppResponse::error(ErrorCode::Internal, error.to_string()),
             }
         }
         AppRequest::BlobGet { hash, offset, len } => {
-            match context.cache.read_chunk(&hash, offset, len as usize) {
+            match app.cache.read_chunk(&hash, offset, len as usize) {
                 Ok(data) => AppResponse::Chunk { hash, offset, data },
                 Err(error) => AppResponse::error(ErrorCode::NotFound, error.to_string()),
             }
         }
+    }
+}
+
+impl Dispatch for AppState {
+    fn handle<'a>(
+        &'a self,
+        service: &'a str,
+        payload: &'a [u8],
+        _control: &'a dyn ControlPlane,
+    ) -> ServiceFuture<'a> {
+        Box::pin(async move { handle_service_request(service, payload, self).await })
+    }
+
+    fn on_connected(&self, control: Arc<dyn ControlPlane>) {
+        self.set_control(Some(control));
+    }
+
+    fn on_whoami(&self, info: &WhoamiInfo) {
+        if let Ok(mut state) = self.state.lock() {
+            state.set_provider_id(PeerId::new(info.peer_id.clone()));
+        }
+    }
+
+    fn on_disconnected(&self) {
+        self.set_control(None);
     }
 }
 
@@ -180,19 +219,24 @@ impl AppResponse {
 mod tests {
     use super::*;
     use crate::compile_protocol::{Hash32, OutputRef, PeerId, TaskId};
+    use crate::config::ConfigHandle;
+    use crate::control::new_control_handle;
+    use crate::state::NodeState;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn context() -> ServiceContext {
+    fn context() -> AppState {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let cache_dir = std::env::temp_dir().join(format!("nexuscompile-service-{unique}"));
-        ServiceContext {
-            state: Arc::new(Mutex::new(NodeState::placeholder())),
-            cache: Arc::new(ResultCache::open(&cache_dir, 1024 * 1024).unwrap()),
-            config: ServiceConfig::default(),
-        }
+        AppState::new(
+            Arc::new(Mutex::new(NodeState::placeholder())),
+            Arc::new(crate::compile::cache::ResultCache::open(&cache_dir, 1024 * 1024).unwrap()),
+            ConfigHandle::new(crate::config::ServiceConfig::default()),
+            new_control_handle(),
+        )
     }
 
     fn encode_request(request: AppRequest) -> Vec<u8> {
@@ -311,7 +355,7 @@ mod tests {
         ));
     }
 
-    fn seed_output(context: &ServiceContext, task_id: TaskId, bytes: &[u8]) -> OutputRef {
+    fn seed_output(context: &AppState, task_id: TaskId, bytes: &[u8]) -> OutputRef {
         let blob = context.cache.cas().put_bytes(bytes).unwrap();
         let output = OutputRef {
             path: "libdemo.rlib".into(),

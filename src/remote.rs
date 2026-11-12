@@ -9,8 +9,8 @@ use crate::compile::hash::hash_bytes;
 use crate::compile::manifest::collect_manifest;
 use crate::compile_protocol::{AppRequest, AppResponse, Hash32, TaskId};
 use crate::config::ServiceConfig;
+use crate::control::{self, ControlHandle};
 use crate::local_protocol::{LocalBody, LocalRequest, LocalResponse};
-use crate::pool::PoolOps;
 use crate::state::NodeState;
 use crate::util::args;
 use crate::util::path::resolve_path;
@@ -23,7 +23,7 @@ use transfer::RemoteTransfer;
 pub struct Coordinator {
     state: Arc<Mutex<NodeState>>,
     cache: Arc<ResultCache>,
-    ops: Arc<dyn PoolOps>,
+    control: ControlHandle,
     config: ServiceConfig,
 }
 
@@ -31,13 +31,13 @@ impl Coordinator {
     pub fn new(
         state: Arc<Mutex<NodeState>>,
         cache: Arc<ResultCache>,
-        ops: Arc<dyn PoolOps>,
+        control: ControlHandle,
         config: ServiceConfig,
     ) -> Self {
         Self {
             state,
             cache,
-            ops,
+            control,
             config,
         }
     }
@@ -124,7 +124,7 @@ impl Coordinator {
         };
         let bundle_hash = hash_bytes(&bundle);
         let task_id = TaskId(digest);
-        let transfer = RemoteTransfer::new(self.ops.as_ref(), self.cache.as_ref());
+        let transfer = RemoteTransfer::new(self.control.clone(), self.cache.clone());
 
         let (consumer, providers) = {
             let state = self.state.lock().ok()?;
@@ -145,18 +145,17 @@ impl Coordinator {
         };
 
         for provider in providers {
-            let lease = match self
-                .ops
-                .send(
-                    &provider,
-                    AppRequest::Reserve {
-                        consumer: consumer.clone(),
-                        task_id,
-                        slots: 1,
-                        input_manifest: bundle_hash,
-                    },
-                )
-                .await
+            let lease = match control::send(
+                &self.control,
+                &provider,
+                AppRequest::Reserve {
+                    consumer: consumer.clone(),
+                    task_id,
+                    slots: 1,
+                    input_manifest: bundle_hash,
+                },
+            )
+            .await
             {
                 Ok(AppResponse::Granted { lease_id, .. }) => lease_id,
                 Ok(AppResponse::Cached {
@@ -168,10 +167,9 @@ impl Coordinator {
                     {
                         return Some(LocalResponse::error("result_error", error));
                     }
-                    let _ = self
-                        .ops
-                        .send(&provider, AppRequest::ResultAck { lease_id })
-                        .await;
+                    let _ =
+                        control::send(&self.control, &provider, AppRequest::ResultAck { lease_id })
+                            .await;
                     return Some(success_response(digest));
                 }
                 Ok(AppResponse::Busy { .. }) | Ok(AppResponse::Rejected { .. }) => continue,
@@ -184,17 +182,16 @@ impl Coordinator {
             {
                 return Some(LocalResponse::error("upload_error", error));
             }
-            if self
-                .ops
-                .send(
-                    &provider,
-                    AppRequest::TaskReady {
-                        task_id,
-                        lease_id: lease,
-                    },
-                )
-                .await
-                .is_err()
+            if control::send(
+                &self.control,
+                &provider,
+                AppRequest::TaskReady {
+                    task_id,
+                    lease_id: lease,
+                },
+            )
+            .await
+            .is_err()
             {
                 continue;
             }

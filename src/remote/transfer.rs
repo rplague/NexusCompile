@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::{sleep, timeout};
@@ -8,21 +9,27 @@ use crate::compile::hash::hash_bytes;
 use crate::compile_protocol::{
     AppRequest, AppResponse, ErrorCode, Hash32, LeaseId, OutputRef, PeerId, TaskId, TaskState,
 };
-use crate::pool::PoolOps;
+use crate::control::{self, ControlHandle};
 
 use super::RemoteOutcome;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-pub(super) struct RemoteTransfer<'a> {
-    ops: &'a dyn PoolOps,
-    cache: &'a ResultCache,
+pub(super) struct RemoteTransfer {
+    control: ControlHandle,
+    cache: Arc<ResultCache>,
 }
 
-impl<'a> RemoteTransfer<'a> {
-    pub(super) fn new(ops: &'a dyn PoolOps, cache: &'a ResultCache) -> Self {
-        Self { ops, cache }
+impl RemoteTransfer {
+    pub(super) fn new(control: ControlHandle, cache: Arc<ResultCache>) -> Self {
+        Self { control, cache }
+    }
+
+    async fn send(&self, provider: &PeerId, request: AppRequest) -> Result<AppResponse, String> {
+        control::send(&self.control, provider, request)
+            .await
+            .map_err(|e| e.message)
     }
 
     pub(super) async fn upload_bundle(
@@ -36,7 +43,6 @@ impl<'a> RemoteTransfer<'a> {
         while offset < bundle.len() {
             let end = (offset + CHUNK_SIZE).min(bundle.len());
             let response = self
-                .ops
                 .send(
                     provider,
                     AppRequest::BlobPut {
@@ -46,8 +52,7 @@ impl<'a> RemoteTransfer<'a> {
                         data: bundle[offset..end].to_vec(),
                     },
                 )
-                .await
-                .map_err(|e| e.message)?;
+                .await?;
             if response != AppResponse::Ack {
                 return Err("provider rejected task data".into());
             }
@@ -66,10 +71,7 @@ impl<'a> RemoteTransfer<'a> {
     ) -> RemoteOutcome {
         let poll = async {
             loop {
-                let response = self
-                    .ops
-                    .send(provider, AppRequest::Status { task_id })
-                    .await;
+                let response = self.send(provider, AppRequest::Status { task_id }).await;
                 match response {
                     Ok(AppResponse::TaskStatus { state }) => match state {
                         TaskState::Done { outputs, .. } => {
@@ -80,7 +82,6 @@ impl<'a> RemoteTransfer<'a> {
                                 return RemoteOutcome::CompileError(Vec::new(), error.into_bytes());
                             }
                             let _ = self
-                                .ops
                                 .send(provider, AppRequest::ResultAck { lease_id: lease })
                                 .await;
                             return RemoteOutcome::Success;
@@ -161,7 +162,6 @@ impl<'a> RemoteTransfer<'a> {
         while offset < size {
             let len = ((size - offset) as usize).min(CHUNK_SIZE);
             let response = self
-                .ops
                 .send(
                     provider,
                     AppRequest::BlobGet {
@@ -170,8 +170,7 @@ impl<'a> RemoteTransfer<'a> {
                         len: len as u32,
                     },
                 )
-                .await
-                .map_err(|e| e.message)?;
+                .await?;
             match response {
                 AppResponse::Chunk { data: chunk, .. } if !chunk.is_empty() => {
                     data.extend_from_slice(&chunk);
