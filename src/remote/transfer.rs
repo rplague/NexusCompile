@@ -19,15 +19,24 @@ const TASK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub(super) struct RemoteTransfer {
     control: ControlHandle,
     cache: Arc<ResultCache>,
+    service_name: String,
 }
 
 impl RemoteTransfer {
-    pub(super) fn new(control: ControlHandle, cache: Arc<ResultCache>) -> Self {
-        Self { control, cache }
+    pub(super) fn new(
+        control: ControlHandle,
+        cache: Arc<ResultCache>,
+        service_name: String,
+    ) -> Self {
+        Self {
+            control,
+            cache,
+            service_name,
+        }
     }
 
     async fn send(&self, provider: &PeerId, request: AppRequest) -> Result<AppResponse, String> {
-        control::send(&self.control, provider, request)
+        control::send(&self.control, &self.service_name, provider, request)
             .await
             .map_err(|e| e.message)
     }

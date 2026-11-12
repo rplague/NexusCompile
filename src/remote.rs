@@ -132,7 +132,11 @@ impl Coordinator {
         };
         let bundle_hash = hash_bytes(&bundle);
         let task_id = TaskId(digest);
-        let transfer = RemoteTransfer::new(self.control.clone(), self.cache.clone());
+        let transfer = RemoteTransfer::new(
+            self.control.clone(),
+            self.cache.clone(),
+            self.config.service_name.clone(),
+        );
 
         let (consumer, providers) = {
             let consumer = self.provider.provider_id();
@@ -170,6 +174,7 @@ impl Coordinator {
             .emit();
             let lease = match control::send(
                 &self.control,
+                &self.config.service_name,
                 &provider,
                 AppRequest::Reserve {
                     consumer: consumer.clone(),
@@ -190,9 +195,13 @@ impl Coordinator {
                     {
                         return Some(LocalResponse::error("result_error", error));
                     }
-                    let _ =
-                        control::send(&self.control, &provider, AppRequest::ResultAck { lease_id })
-                            .await;
+                    let _ = control::send(
+                        &self.control,
+                        &self.config.service_name,
+                        &provider,
+                        AppRequest::ResultAck { lease_id },
+                    )
+                    .await;
                     return Some(success_response(digest));
                 }
                 Ok(AppResponse::Busy { .. }) | Ok(AppResponse::Rejected { .. }) => continue,
@@ -207,6 +216,7 @@ impl Coordinator {
             }
             if control::send(
                 &self.control,
+                &self.config.service_name,
                 &provider,
                 AppRequest::TaskReady {
                     task_id,

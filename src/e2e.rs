@@ -60,6 +60,10 @@ impl ControlPlane for MockControl {
             description: String::new(),
         })
     }
+
+    async fn discover_providers(&self, _service: &str) -> Result<Vec<String>, SidecarError> {
+        Ok(Vec::new())
+    }
 }
 
 #[tokio::test]
@@ -73,6 +77,7 @@ async fn control_send_round_trip() {
     let peer = PeerId::new("12D3KooWpeer");
     let response = control::send(
         &handle,
+        "rustc-pool",
         &peer,
         AppRequest::Status {
             task_id: crate::compile_protocol::TaskId(crate::compile_protocol::Hash32([1; 32])),
@@ -92,6 +97,7 @@ async fn control_send_without_connection_is_not_connected() {
     let handle = new_control_handle();
     let error = control::send(
         &handle,
+        "rustc-pool",
         &PeerId::new("peer"),
         AppRequest::Status {
             task_id: crate::compile_protocol::TaskId(crate::compile_protocol::Hash32([2; 32])),

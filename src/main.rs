@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use nexuscompile::capacity::{CapacitySample, CapacitySource, FixedSource, LinuxProcSource};
+use nexuscompile::capacity::{
+    CapacitySample, CapacitySnapshot, CapacitySource, FixedSource, LinuxProcSource,
+    calculate_capacity,
+};
 use nexuscompile::compile::cache::ResultCache;
 use nexuscompile::compile_protocol::PeerId;
 use nexuscompile::config::{ConfigHandle, ServiceConfig};
@@ -23,14 +26,54 @@ async fn main() -> std::io::Result<()> {
     let config_snapshot = config_handle.snapshot();
     let address = format!("127.0.0.1:{}", config_handle.port());
     let listener = TcpListener::bind(&address).await?;
+
+    let mut source: Box<dyn CapacitySource + Send> = match LinuxProcSource::new() {
+        Ok(source) => Box::new(source),
+        Err(error) => {
+            LogStruct::new(
+                LogLevel::Warning,
+                "容量采样初始化失败",
+                format!("{error}; 使用固定回退容量"),
+            )
+            .emit();
+            Box::new(FixedSource::new(CapacitySample {
+                total_cores: 1.0,
+                used_cores: 0.0,
+                mem_total_mb: 1024,
+                mem_available_mb: 512,
+            }))
+        }
+    };
+    let initial = source
+        .sample()
+        .map(|sample| calculate_capacity(&sample, 0, config_snapshot.node.max_usage_percent))
+        .unwrap_or(CapacitySnapshot {
+            max_slots: 0,
+            free_slots: 0,
+            queue_len: 0,
+            accepting: false,
+        });
+
     let provider = Arc::new(Provider::new(
         PeerId::new("local"),
-        1,
+        initial.max_slots,
         config_snapshot.node.toolchain.clone(),
         config_snapshot.node.target.clone(),
     ));
+    provider.set_capacity(initial.max_slots, initial.free_slots);
     let consumer = Arc::new(Consumer::new());
-    LogStruct::new(LogLevel::Important, "服务启动", &address).emit();
+    LogStruct::new(
+        LogLevel::Important,
+        "服务启动",
+        format!(
+            "{address}，service={}，max_slots={}，free_slots={}，percent={}%",
+            config_snapshot.service_name,
+            initial.max_slots,
+            initial.free_slots,
+            config_snapshot.node.max_usage_percent
+        ),
+    )
+    .emit();
 
     let cache = open_cache(&config_snapshot);
     let cache_sweep_task = {
@@ -67,23 +110,6 @@ async fn main() -> std::io::Result<()> {
     ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let source: Box<dyn CapacitySource + Send> = match LinuxProcSource::new() {
-        Ok(source) => Box::new(source),
-        Err(error) => {
-            LogStruct::new(
-                LogLevel::Warning,
-                "容量采样初始化失败",
-                format!("{error}; 使用固定回退容量"),
-            )
-            .emit();
-            Box::new(FixedSource::new(CapacitySample {
-                total_cores: 1.0,
-                used_cores: 0.0,
-                mem_total_mb: 1024,
-                mem_available_mb: 512,
-            }))
-        }
-    };
     let pool_task = tokio::spawn(pool::run_pool(
         control.clone(),
         provider,

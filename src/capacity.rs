@@ -3,7 +3,9 @@
 use std::fs;
 use std::io;
 
-use crate::config::NodeConfig;
+/// Fixed resources consumed by one compile slot.
+pub const CORES_PER_SLOT: f32 = 1.0;
+pub const MEM_PER_SLOT_MB: u64 = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CapacitySample {
@@ -16,7 +18,6 @@ pub struct CapacitySample {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacitySnapshot {
     pub max_slots: u32,
-    /// System-wide slots currently available, before deducting active tasks.
     pub free_slots: u32,
     pub queue_len: u32,
     pub accepting: bool,
@@ -100,39 +101,51 @@ impl CapacitySource for FixedSource {
     }
 }
 
-/// Calculate stable total capacity and current free capacity.
+/// Calculate stable total capacity and current free capacity from a usage cap.
+///
+/// `free_slots` is resource headroom under `max_usage_percent`; it deliberately
+/// does not subtract active tasks because `/proc` usage already includes them.
 pub fn calculate_capacity(
     sample: &CapacitySample,
     queue_len: u32,
-    config: &NodeConfig,
+    max_usage_percent: u8,
 ) -> CapacitySnapshot {
-    let cores_per_slot = config.cores_per_slot.max(0.01);
-    let mem_per_slot = config.mem_per_slot_mb.max(1);
+    let percent = max_usage_percent.min(100) as f32 / 100.0;
     let total_cores = sample.total_cores.max(1.0);
 
-    let total_cpu_slots = ((total_cores - config.reserve_cores).max(0.0) / cores_per_slot)
+    let max_cpu_cores = total_cores * percent;
+    let max_mem_mb = sample.mem_total_mb as f32 * percent;
+    let max_cpu_slots = (max_cpu_cores / CORES_PER_SLOT)
         .floor()
         .min(u32::MAX as f32) as u32;
-    let total_mem_slots = (sample.mem_total_mb.saturating_sub(config.reserve_mem_mb) / mem_per_slot)
-        .min(u32::MAX as u64) as u32;
-    let max_slots = total_cpu_slots.min(total_mem_slots);
+    let max_mem_slots = (max_mem_mb / MEM_PER_SLOT_MB as f32)
+        .floor()
+        .min(u32::MAX as f32) as u32;
+    let max_slots = max_cpu_slots.min(max_mem_slots);
 
-    let free_cpu_slots = ((total_cores - sample.used_cores - config.reserve_cores).max(0.0)
-        / cores_per_slot)
+    if max_slots == 0 {
+        return CapacitySnapshot {
+            max_slots: 0,
+            free_slots: 0,
+            queue_len,
+            accepting: false,
+        };
+    }
+
+    let used_mem_mb = sample.mem_total_mb.saturating_sub(sample.mem_available_mb) as f32;
+    let free_cpu_slots = ((max_cpu_cores - sample.used_cores).max(0.0) / CORES_PER_SLOT)
         .floor()
         .min(u32::MAX as f32) as u32;
-    let free_mem_slots = (sample
-        .mem_available_mb
-        .saturating_sub(config.reserve_mem_mb)
-        / mem_per_slot)
-        .min(u32::MAX as u64) as u32;
-    let available_slots = free_cpu_slots.min(free_mem_slots).min(max_slots);
+    let free_mem_slots = ((max_mem_mb - used_mem_mb).max(0.0) / MEM_PER_SLOT_MB as f32)
+        .floor()
+        .min(u32::MAX as f32) as u32;
+    let free_slots = free_cpu_slots.min(free_mem_slots).min(max_slots);
 
     CapacitySnapshot {
         max_slots,
-        free_slots: available_slots,
+        free_slots,
         queue_len,
-        accepting: available_slots > 0,
+        accepting: free_slots > 0,
     }
 }
 
@@ -201,52 +214,46 @@ fn read_meminfo() -> io::Result<(u64, u64)> {
 mod tests {
     use super::*;
 
-    fn config() -> NodeConfig {
-        NodeConfig {
-            cores_per_slot: 1.0,
-            mem_per_slot_mb: 2048,
-            reserve_cores: 0.5,
-            reserve_mem_mb: 1024,
-            ..NodeConfig::default()
+    fn sample(used_cores: f32, mem_total_mb: u64, mem_available_mb: u64) -> CapacitySample {
+        CapacitySample {
+            total_cores: 4.0,
+            used_cores,
+            mem_total_mb,
+            mem_available_mb,
         }
     }
 
     #[test]
-    fn computes_stable_max_and_dynamic_free() {
-        let sample = CapacitySample {
-            total_cores: 4.0,
-            used_cores: 1.2,
-            mem_total_mb: 8192,
-            mem_available_mb: 4096,
-        };
-        let snapshot = calculate_capacity(&sample, 0, &config());
+    fn computes_capacity_from_usage_percent() {
+        let sample = sample(1.2, 8192, 4096);
+        let snapshot = calculate_capacity(&sample, 0, 80);
         assert_eq!(snapshot.max_slots, 3);
         assert_eq!(snapshot.free_slots, 1);
         assert!(snapshot.accepting);
     }
 
     #[test]
-    fn max_slots_are_stable_without_active_tasks() {
+    fn idle_capacity_equals_max_slots() {
         let sample = CapacitySample {
             total_cores: 16.0,
             used_cores: 0.0,
             mem_total_mb: 16384,
             mem_available_mb: 16384,
         };
-        let snapshot = calculate_capacity(&sample, 0, &config());
-        assert_eq!(snapshot.max_slots, 7);
-        assert_eq!(snapshot.free_slots, 7);
+        let snapshot = calculate_capacity(&sample, 0, 80);
+        assert_eq!(snapshot.max_slots, 6);
+        assert_eq!(snapshot.free_slots, 6);
     }
 
     #[test]
-    fn full_memory_disables_accepting() {
+    fn memory_limit_reduces_free_slots() {
         let sample = CapacitySample {
             total_cores: 8.0,
             used_cores: 0.0,
             mem_total_mb: 8192,
             mem_available_mb: 1024,
         };
-        let snapshot = calculate_capacity(&sample, 0, &config());
+        let snapshot = calculate_capacity(&sample, 0, 80);
         assert_eq!(snapshot.free_slots, 0);
         assert!(!snapshot.accepting);
     }
@@ -259,9 +266,35 @@ mod tests {
             mem_total_mb: 1024,
             mem_available_mb: 0,
         };
-        let snapshot = calculate_capacity(&sample, 0, &config());
+        let snapshot = calculate_capacity(&sample, 0, 80);
         assert_eq!(snapshot.max_slots, 0);
         assert_eq!(snapshot.free_slots, 0);
         assert!(!snapshot.accepting);
+    }
+
+    #[test]
+    fn percent_is_clamped_to_100() {
+        let sample = CapacitySample {
+            total_cores: 4.0,
+            used_cores: 0.0,
+            mem_total_mb: 16384,
+            mem_available_mb: 16384,
+        };
+        let clamped = calculate_capacity(&sample, 0, 120);
+        let full = calculate_capacity(&sample, 0, 100);
+        assert_eq!(clamped, full);
+    }
+
+    #[test]
+    fn fifty_percent_usage_leaves_half_the_slots() {
+        let sample = CapacitySample {
+            total_cores: 8.0,
+            used_cores: 4.0,
+            mem_total_mb: 32768,
+            mem_available_mb: 16384,
+        };
+        let snapshot = calculate_capacity(&sample, 0, 100);
+        assert_eq!(snapshot.max_slots, 8);
+        assert_eq!(snapshot.free_slots, 4);
     }
 }

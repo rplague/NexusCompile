@@ -55,7 +55,7 @@ struct Inner {
     toolchain: String,
     target: String,
     max_slots: u32,
-    available_slots: u32,
+    free_slots: u32,
     subscriptions: HashMap<PeerId, Subscription>,
     tasks: HashMap<TaskId, TaskEntry>,
     leases: HashMap<LeaseId, Lease>,
@@ -81,7 +81,7 @@ impl Provider {
                 toolchain: toolchain.into(),
                 target: target.into(),
                 max_slots,
-                available_slots: max_slots,
+                free_slots: max_slots,
                 subscriptions: HashMap::new(),
                 tasks: HashMap::new(),
                 leases: HashMap::new(),
@@ -125,30 +125,23 @@ impl Provider {
             .unwrap_or(u32::MAX)
     }
 
-    /// Free slots are derived, never bookkept by reserve/complete.
+    /// Free slots come from the latest capacity sample. They are deliberately
+    /// not reduced by active tasks; `/proc` usage already includes them.
     pub fn free_slots(&self) -> u32 {
-        let inner = self.read();
-        inner
-            .max_slots
-            .saturating_sub(active_in(&inner))
-            .min(inner.available_slots)
+        self.read().free_slots
     }
 
-    pub fn set_capacity(&self, max_slots: u32, available_slots: u32) {
+    pub fn set_capacity(&self, max_slots: u32, free_slots: u32) {
         let mut inner = self.write();
         inner.max_slots = max_slots;
-        inner.available_slots = available_slots.min(max_slots);
+        inner.free_slots = free_slots.min(max_slots);
     }
 
     pub fn capacity_snapshot(&self) -> CapacitySnapshot {
         let inner = self.read();
-        let free_slots = inner
-            .max_slots
-            .saturating_sub(active_in(&inner))
-            .min(inner.available_slots);
         CapacitySnapshot {
             max_slots: inner.max_slots,
-            free_slots,
+            free_slots: inner.free_slots,
             queue_len: inner
                 .tasks
                 .values()
@@ -156,7 +149,7 @@ impl Provider {
                 .count()
                 .try_into()
                 .unwrap_or(u32::MAX),
-            accepting: free_slots > 0,
+            accepting: inner.free_slots > 0,
         }
     }
 
@@ -275,11 +268,7 @@ impl Provider {
             }
         }
 
-        let free = inner
-            .max_slots
-            .saturating_sub(active_in(&inner))
-            .min(inner.available_slots);
-        if free == 0 {
+        if inner.free_slots == 0 {
             return AppResponse::Busy {
                 retry_after_ms: 1_000,
             };
@@ -476,16 +465,6 @@ fn new_lease(inner: &mut Inner, task_id: TaskId) -> LeaseId {
         },
     );
     lease_id
-}
-
-fn active_in(inner: &Inner) -> u32 {
-    inner
-        .tasks
-        .values()
-        .filter(|entry| matches!(entry.state, TaskState::Queued | TaskState::Running))
-        .count()
-        .try_into()
-        .unwrap_or(u32::MAX)
 }
 
 pub fn spawn_task(
@@ -810,17 +789,17 @@ mod tests {
     }
 
     #[test]
-    fn reserve_is_idempotent_and_busy_when_full() {
+    fn reserve_is_idempotent_and_busy_when_sampled_full() {
         let provider = Provider::new(peer("local"), 1, "", "");
         let id = task(1);
 
         let first = provider.reserve(peer("consumer"), id, 1, manifest(2));
         assert!(matches!(first, AppResponse::Granted { .. }));
-        assert_eq!(provider.free_slots(), 0);
 
         let second = provider.reserve(peer("consumer"), id, 1, manifest(2));
         assert!(matches!(second, AppResponse::Granted { .. }));
 
+        provider.set_capacity(1, 0);
         let other = provider.reserve(peer("consumer"), task(3), 1, manifest(4));
         assert_eq!(
             other,
@@ -967,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn sampled_available_slots_cap_free_slots() {
+    fn free_slots_follow_the_capacity_sample() {
         let provider = Provider::new(peer("local"), 4, "", "");
         provider.set_capacity(4, 4);
         assert_eq!(provider.free_slots(), 4);
@@ -976,7 +955,7 @@ mod tests {
             provider.reserve(peer("consumer"), task(1), 1, manifest(2)),
             AppResponse::Granted { .. }
         ));
-        assert_eq!(provider.free_slots(), 3);
+        assert_eq!(provider.free_slots(), 4);
 
         provider.set_capacity(4, 1);
         assert_eq!(provider.free_slots(), 1);
