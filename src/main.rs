@@ -6,7 +6,7 @@ use nexuscompile::compile_protocol::PeerId;
 use nexuscompile::config::{ConfigHandle, ServiceConfig};
 use nexuscompile::connection;
 use nexuscompile::control::new_control_handle;
-use nexuscompile::local_server;
+use nexuscompile::local;
 use nexuscompile::log::{LogLevel, LogStruct};
 use nexuscompile::paths;
 use nexuscompile::pool;
@@ -99,7 +99,7 @@ async fn main() -> std::io::Result<()> {
         Option<std::path::PathBuf>,
     ) = {
         let socket = paths::socket_path();
-        match local_server::bind(&socket) {
+        match local::bind(&socket) {
             Ok(listener) => {
                 LogStruct::new(
                     LogLevel::Important,
@@ -108,7 +108,7 @@ async fn main() -> std::io::Result<()> {
                 )
                 .emit();
                 (
-                    Some(tokio::spawn(local_server::run(
+                    Some(tokio::spawn(local::run(
                         listener,
                         coordinator,
                         tokio::runtime::Handle::current(),
