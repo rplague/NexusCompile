@@ -150,10 +150,6 @@ impl ResultCache {
         }
     }
 
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
-
     pub fn cas(&self) -> &Cas {
         &self.cas
     }
@@ -206,9 +202,7 @@ impl ResultCache {
         let outputs = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            let Some(entry) = inner.entries.get_mut(action_digest) else {
-                return None;
-            };
+            let entry = inner.entries.get_mut(action_digest)?;
             if entry.expires_at <= now && entry.pin_count == 0 {
                 self.remove_entry_locked(&mut inner, action_digest);
                 return None;
@@ -241,9 +235,7 @@ impl ResultCache {
         let outputs = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let now = Instant::now();
-            let Some(entry) = inner.entries.get_mut(action_digest) else {
-                return None;
-            };
+            let entry = inner.entries.get_mut(action_digest)?;
             if entry.expires_at <= now && entry.pin_count == 0 {
                 self.remove_entry_locked(&mut inner, action_digest);
                 return None;
