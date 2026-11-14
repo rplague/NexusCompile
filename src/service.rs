@@ -73,11 +73,7 @@ pub(crate) fn handle_app_payload(payload: &[u8], app: &AppState) -> Result<Vec<u
 
 fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
     match request {
-        AppRequest::Subscribe {
-            consumer,
-            toolchain,
-            target,
-        } => app.provider.subscribe(consumer, toolchain, target),
+        AppRequest::Subscribe { consumer, .. } => app.provider.subscribe(consumer),
         AppRequest::Unsubscribe { consumer } => app.provider.unsubscribe(&consumer),
         AppRequest::CapacityUpdate {
             provider,
@@ -93,6 +89,8 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
             task_id,
             slots,
             input_manifest,
+            toolchain_id,
+            target,
         } => {
             if app.provider.task_entry(&task_id).is_none()
                 && let Some(outputs) = app.cache.cached_outputs(&task_id.0)
@@ -103,6 +101,9 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                     outputs,
                     lease_id: app.provider.create_lease(task_id),
                 };
+            }
+            if let Err(message) = validate_reserve(app, &toolchain_id, &target) {
+                return AppResponse::rejected(message);
             }
             let response = app
                 .provider
@@ -215,6 +216,28 @@ impl Dispatch for AppState {
     fn on_disconnected(&self, control: &Arc<dyn ControlPlane>) {
         crate::control::clear_if(&self.control, control);
     }
+}
+
+fn validate_reserve(app: &AppState, toolchain_id: &str, target: &str) -> Result<(), String> {
+    let config = app.config_snapshot();
+    let rustc = std::path::Path::new(&config.node.rustc);
+
+    if !toolchain_id.is_empty() {
+        let expected = crate::compile::manifest::toolchain_id(rustc, target)
+            .map_err(|error| format!("toolchain check failed: {error}"))?;
+        if expected != toolchain_id {
+            return Err("toolchain mismatch".into());
+        }
+    }
+
+    if !target.is_empty()
+        && !crate::compile::manifest::target_installed(rustc, target)
+            .map_err(|error| format!("target check failed: {error}"))?
+    {
+        return Err(format!("target {target} is not installed"));
+    }
+
+    Ok(())
 }
 
 impl AppResponse {
@@ -384,6 +407,68 @@ mod tests {
     }
 
     #[test]
+    fn reserve_accepts_matching_toolchain() {
+        let context = context();
+        let toolchain_id =
+            crate::compile::manifest::toolchain_id(std::path::Path::new("rustc"), "").unwrap();
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id: TaskId(Hash32([14; 32])),
+            slots: 1,
+            input_manifest: Hash32([15; 32]),
+            toolchain_id,
+            target: String::new(),
+        });
+
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(matches!(response.body, AppResponse::Granted { .. }));
+    }
+
+    #[test]
+    fn reserve_rejects_toolchain_mismatch() {
+        let context = context();
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id: TaskId(Hash32([10; 32])),
+            slots: 1,
+            input_manifest: Hash32([11; 32]),
+            toolchain_id: "not-the-local-toolchain".into(),
+            target: String::new(),
+        });
+
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(matches!(
+            response.body,
+            AppResponse::Rejected {
+                code: ErrorCode::Rejected,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reserve_rejects_uninstalled_target() {
+        let context = context();
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id: TaskId(Hash32([12; 32])),
+            slots: 1,
+            input_manifest: Hash32([13; 32]),
+            toolchain_id: String::new(),
+            target: "definitely-not-a-target".into(),
+        });
+
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(matches!(
+            response.body,
+            AppResponse::Rejected {
+                code: ErrorCode::Rejected,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn reserve_uses_cache_when_task_entry_is_missing() {
         let context = context();
         let task_id = TaskId(Hash32([4; 32]));
@@ -394,6 +479,8 @@ mod tests {
             task_id,
             slots: 1,
             input_manifest: Hash32([5; 32]),
+            toolchain_id: String::new(),
+            target: String::new(),
         });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
 

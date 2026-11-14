@@ -53,10 +53,6 @@ pub struct NodeConfig {
     pub sample_interval_secs: u64,
     #[serde(default = "default_rustc")]
     pub rustc: String,
-    #[serde(default)]
-    pub toolchain: String,
-    #[serde(default)]
-    pub target: String,
 }
 
 fn default_rustc() -> String {
@@ -69,8 +65,6 @@ impl Default for NodeConfig {
             max_usage_percent: default_max_usage_percent(),
             sample_interval_secs: default_sample_interval_secs(),
             rustc: default_rustc(),
-            toolchain: String::new(),
-            target: String::new(),
         }
     }
 }
@@ -350,6 +344,8 @@ reserve_cores = 1.0
 reserve_mem_mb = 2048
 sample_interval_secs = 3
 rustc = "rustc-custom"
+toolchain = "old-toolchain"
+target = "old-target"
 
 [subscription]
 target_slots = 12
@@ -380,6 +376,8 @@ result_cache_mb = 128
         assert!(!migrated.contains("reserve_cores"));
         assert!(!migrated.contains("reserve_mem_mb"));
         assert!(!migrated.contains("static_peers"));
+        assert!(!migrated.contains("toolchain ="));
+        assert!(!migrated.contains("target ="));
         assert!(root.join("config.toml.bak").is_file());
 
         fs::remove_dir_all(root).unwrap();

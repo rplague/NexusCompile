@@ -267,10 +267,10 @@ mod local_remote {
         let control = new_control_handle();
         *control.write().unwrap() = Some(mock.clone());
 
-        let provider = Arc::new(Provider::new(PeerId::new("local"), 1, "", ""));
+        let provider = Arc::new(Provider::new(PeerId::new("local"), 1));
         provider.set_capacity(1, 0);
         let consumer = Arc::new(Consumer::new());
-        consumer.record_subscribed(PeerId::new("provider"), "".into(), "".into(), 1);
+        consumer.record_subscribed(PeerId::new("provider"), 1);
         consumer.apply_capacity(PeerId::new("provider"), 1, 1, 0, true);
 
         let coordinator = Coordinator::new(

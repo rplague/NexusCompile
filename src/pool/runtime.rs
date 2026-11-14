@@ -35,11 +35,6 @@ fn discovery_due(state: &DiscoveryState, now: u64, visible: u32) -> bool {
     }
 }
 
-fn compatible(node: &NodeConfig, toolchain: &str, target: &str) -> bool {
-    (node.toolchain.is_empty() || node.toolchain == toolchain)
-        && (node.target.is_empty() || node.target == target)
-}
-
 pub async fn publish_due(
     control: &ControlHandle,
     service_name: &str,
@@ -65,7 +60,7 @@ pub async fn ensure_target(
     control: &ControlHandle,
     provider: &Arc<Provider>,
     consumer: &Arc<Consumer>,
-    node: &NodeConfig,
+    _node: &NodeConfig,
     subscription: &SubscriptionConfig,
     service_name: &str,
     discovery: &mut DiscoveryState,
@@ -75,8 +70,7 @@ pub async fn ensure_target(
     }
 
     let provider_id = provider.provider_id();
-    let mut visible_capacity =
-        provider.max_slots() + consumer.compatible_max_slots(&node.toolchain, &node.target);
+    let mut visible_capacity = provider.max_slots() + consumer.visible_max_slots();
     if visible_capacity >= subscription.target_slots {
         return 0;
     }
@@ -127,37 +121,19 @@ pub async fn ensure_target(
             continue;
         }
 
-        consumer.record_pending(peer.clone(), node.toolchain.clone(), node.target.clone());
+        consumer.record_pending(peer.clone());
 
         let request = AppRequest::Subscribe {
             consumer: provider_id.clone(),
-            toolchain: node.toolchain.clone(),
-            target: node.target.clone(),
+            toolchain: String::new(),
+            target: String::new(),
         };
 
         match control::send(control, service_name, &peer, request).await {
-            Ok(AppResponse::Subscribed {
-                provider: _,
-                toolchain,
-                target,
-                max_slots,
-            }) => {
-                if compatible(node, &toolchain, &target) {
-                    consumer.record_subscribed(peer.clone(), toolchain, target, max_slots);
-                    visible_capacity = visible_capacity.saturating_add(max_slots);
-                    subscribed += 1;
-                } else {
-                    consumer.remove_provider(&peer);
-                    let _ = control::send(
-                        control,
-                        service_name,
-                        &peer,
-                        AppRequest::Unsubscribe {
-                            consumer: provider_id.clone(),
-                        },
-                    )
-                    .await;
-                }
+            Ok(AppResponse::Subscribed { max_slots, .. }) => {
+                consumer.record_subscribed(peer.clone(), max_slots);
+                visible_capacity = visible_capacity.saturating_add(max_slots);
+                subscribed += 1;
             }
             Ok(_) | Err(_) => consumer.remove_provider(&peer),
         }
@@ -429,7 +405,7 @@ mod tests {
     async fn publishes_initial_and_removes_on_failure() {
         let provider = Arc::new(Provider::placeholder());
         provider.set_capacity(4, 1);
-        provider.subscribe(PeerId::new("consumer"), String::new(), String::new());
+        provider.subscribe(PeerId::new("consumer"));
 
         let control = Arc::new(MockControl::new(vec![Ok(AppResponse::Ack)]));
         let handle = control_with(control.clone());
@@ -438,7 +414,7 @@ mod tests {
         assert_eq!(control.sent().len(), 1);
         assert_eq!(provider.subscription_count(), 1);
 
-        provider.subscribe(PeerId::new("consumer-2"), String::new(), String::new());
+        provider.subscribe(PeerId::new("consumer-2"));
         let control = Arc::new(MockControl::new(vec![Err(SidecarError::new("io", "down"))]));
         let handle = control_with(control);
         let sent = publish_due(&handle, "rustc-pool", &provider, 30_000).await;
@@ -448,13 +424,9 @@ mod tests {
 
     #[tokio::test]
     async fn subscribes_until_target_capacity_is_visible() {
-        let provider = Arc::new(Provider::new(PeerId::new("self"), 1, "rustc", "x86_64"));
+        let provider = Arc::new(Provider::new(PeerId::new("self"), 1));
         let consumer = Arc::new(Consumer::new());
-        let node = NodeConfig {
-            toolchain: "rustc".into(),
-            target: "x86_64".into(),
-            ..NodeConfig::default()
-        };
+        let node = NodeConfig::default();
         let subscription = SubscriptionConfig {
             target_slots: 4,
             ..SubscriptionConfig::default()
@@ -500,12 +472,11 @@ mod tests {
         );
         let views = consumer.providers();
         assert_eq!(views.len(), 2);
-        assert!(views.iter().all(|view| view.toolchain == "rustc"));
     }
 
     #[tokio::test]
     async fn failed_subscribe_removes_pending_provider() {
-        let provider = Arc::new(Provider::new(PeerId::new("self"), 0, "", ""));
+        let provider = Arc::new(Provider::new(PeerId::new("self"), 0));
         let consumer = Arc::new(Consumer::new());
         let node = NodeConfig::default();
         let subscription = SubscriptionConfig {
@@ -537,9 +508,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_discovery_clears_views_and_retries_after_30s() {
-        let provider = Arc::new(Provider::new(PeerId::new("self"), 1, "", ""));
+        let provider = Arc::new(Provider::new(PeerId::new("self"), 1));
         let consumer = Arc::new(Consumer::new());
-        consumer.record_subscribed(PeerId::new("old"), "".into(), "".into(), 2);
+        consumer.record_subscribed(PeerId::new("old"), 2);
         let node = NodeConfig::default();
         let subscription = SubscriptionConfig {
             target_slots: 4,
@@ -566,51 +537,6 @@ mod tests {
         assert!(!discovery_due(&discovery, last + 29_999, 1));
         assert!(discovery_due(&discovery, last + 30_000, 1));
         assert!(discovery_due(&discovery, last + 59 * 60_000, 1));
-    }
-
-    #[tokio::test]
-    async fn incompatible_provider_is_not_counted() {
-        let provider = Arc::new(Provider::new(PeerId::new("self"), 0, "rustc", "x86_64"));
-        let consumer = Arc::new(Consumer::new());
-        let node = NodeConfig {
-            toolchain: "rustc".into(),
-            target: "x86_64".into(),
-            ..NodeConfig::default()
-        };
-        let subscription = SubscriptionConfig {
-            target_slots: 4,
-            ..SubscriptionConfig::default()
-        };
-        let control = Arc::new(MockControl::with_discoveries(
-            vec![Ok(AppResponse::Subscribed {
-                provider: PeerId::new("p"),
-                toolchain: "other".into(),
-                target: "aarch64".into(),
-                max_slots: 4,
-            })],
-            vec![Ok(vec!["p".into()])],
-        ));
-        let handle = control_with(control.clone());
-        let mut discovery = DiscoveryState::default();
-
-        let subscribed = ensure_target(
-            &handle,
-            &provider,
-            &consumer,
-            &node,
-            &subscription,
-            "rustc-pool",
-            &mut discovery,
-        )
-        .await;
-        assert_eq!(subscribed, 0);
-        assert!(consumer.providers().is_empty());
-        assert!(
-            control
-                .sent()
-                .iter()
-                .any(|(_, request)| matches!(request, AppRequest::Unsubscribe { .. }))
-        );
     }
 
     #[test]

@@ -172,6 +172,10 @@ pub enum AppRequest {
         task_id: TaskId,
         slots: u32,
         input_manifest: Hash32,
+        #[serde(default)]
+        toolchain_id: String,
+        #[serde(default)]
+        target: String,
     },
     BlobPut {
         task_id: TaskId,
@@ -297,6 +301,8 @@ mod tests {
             task_id,
             slots: 1,
             input_manifest: Hash32([8; 32]),
+            toolchain_id: "toolchain-id".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
         });
         roundtrip_request(AppRequest::BlobPut {
             task_id,

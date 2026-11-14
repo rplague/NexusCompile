@@ -365,7 +365,7 @@ fn normalize_path_token(value: &str, path: &Path, placeholder: &str) -> String {
     value.to_string()
 }
 
-fn toolchain_id(rustc: &Path, target: &str) -> Result<String, ManifestError> {
+pub fn toolchain_id(rustc: &Path, target: &str) -> Result<String, ManifestError> {
     static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     let key = format!("{}|{target}", rustc.display());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -389,6 +389,34 @@ fn toolchain_id(rustc: &Path, target: &str) -> Result<String, ManifestError> {
         cache.insert(key, id.clone());
     }
     Ok(id)
+}
+
+/// Whether the target standard library is installed for this rustc.
+pub fn target_installed(rustc: &Path, target: &str) -> Result<bool, ManifestError> {
+    if target.is_empty() {
+        return Ok(true);
+    }
+
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let key = format!("{}|{target}", rustc.display());
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(value) = cache.lock().ok().and_then(|cache| cache.get(&key).copied()) {
+        return Ok(value);
+    }
+
+    let output = Command::new(rustc)
+        .arg("--print")
+        .arg("target-libdir")
+        .arg("--target")
+        .arg(target)
+        .output()
+        .map_err(|e| ManifestError::new(format!("run rustc --print target-libdir: {e}")))?;
+    let installed = output.status.success()
+        && Path::new(String::from_utf8_lossy(&output.stdout).trim()).is_dir();
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, installed);
+    }
+    Ok(installed)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -498,6 +526,12 @@ mod tests {
         assert_ne!(first, second);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn target_installed_checks_sysroot() {
+        assert!(target_installed(Path::new("rustc"), "").unwrap());
+        assert!(!target_installed(Path::new("rustc"), "definitely-not-a-target").unwrap());
     }
 
     #[test]
