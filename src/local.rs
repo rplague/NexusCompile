@@ -63,14 +63,22 @@ pub async fn run(listener: UnixListener, coordinator: Arc<Coordinator>, handle: 
     }
 }
 
+fn prepare_stream(stream: UnixStream) -> io::Result<std::os::unix::net::UnixStream> {
+    let stream = stream.into_std()?;
+    // Tokio sockets are nonblocking. The blocking request handler must switch
+    // back explicitly, otherwise read_exact/write_all return EAGAIN.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_READ_TIMEOUT))?;
+    Ok(stream)
+}
+
 fn handle_stream(
     stream: UnixStream,
     coordinator: Arc<Coordinator>,
     handle: Handle,
 ) -> io::Result<()> {
-    let mut stream = stream.into_std()?;
-    stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT))?;
-    stream.set_write_timeout(Some(SOCKET_READ_TIMEOUT))?;
+    let mut stream = prepare_stream(stream)?;
 
     let request: LocalRequest = local_protocol::read_message(&mut stream)?;
     let response: LocalResponse = handle.block_on(coordinator.execute(&request));
@@ -80,6 +88,7 @@ fn handle_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
@@ -98,5 +107,23 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, SOCKET_MODE);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_stream_blocks_for_request() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let mut server = prepare_stream(server).unwrap();
+        let mut client = client.into_std().unwrap();
+        client.set_nonblocking(false).unwrap();
+
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            client.write_all(b"x").unwrap();
+        });
+
+        let mut byte = [0u8; 1];
+        server.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0], b'x');
+        writer.join().unwrap();
     }
 }
