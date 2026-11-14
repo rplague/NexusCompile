@@ -1,6 +1,6 @@
 [package]
 name = "NexusCompile"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [lib]
@@ -20,5 +20,6 @@ serde_json = "1.0.149"
 sha2 = "0.10"
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
+toml_edit = "0.22"
 uuid = { version = "1.23.1", features = ["serde", "v4"] }
 walkdir = "2"

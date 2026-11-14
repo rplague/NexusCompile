@@ -1,0 +1,12 @@
+Template: @PKG@/cargo_users
+Type: multiselect
+Choices: ${USERS}
+Description: 需要启用 NexusCompile 编译加速的用户:
+ 选中的用户会被加入 nexusnet 组，并写入该用户的 ~/.cargo/config.toml。
+ 初始选中项来自上一次 NexusCompile 配置；首次安装时来自当前 nexusnet 组成员。
+ 留空表示不修改任何用户的编译设置。
+ Users to enable for NexusCompile acceleration.
+ Selected users are added to the nexusnet group and receive a Cargo config.
+ The initial selection comes from the previous NexusCompile setup, or from
+ the current nexusnet group members on first install.
+ Leave empty to skip user setup.

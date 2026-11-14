@@ -61,23 +61,18 @@ Complete default configuration:
 
 ```toml
 port = 5100
+service_name = "rustc-pool"
 
 [node]
-cores_per_slot = 1.0
-mem_per_slot_mb = 2048
-reserve_cores = 0.5
-reserve_mem_mb = 1024
+max_usage_percent = 80
 sample_interval_secs = 1
 rustc = "rustc"
-toolchain = ""
-target = ""
 
 [subscription]
 target_slots = 8
 update_interval_secs = 30
 ttl_secs = 60
 target_reevaluate_secs = 5
-static_peers = []
 
 [cache]
 dir = ""
@@ -107,12 +102,13 @@ port = 5100
 require_auth = false
 ```
 
-On the consumer, add the provider PeerId to `config.toml`:
+Provider discovery is automatic through NexusNet. Both nodes must use the same
+`service_name`, and NexusNet's `local_services.name` must match it. The consumer
+only needs a target for remote capacity:
 
 ```toml
 [subscription]
 target_slots = 16
-static_peers = ["12D3KooW..."]
 ```
 
 When the consumer exhausts its local slots, `Coordinator` tries to start a remote compile on a subscribed provider and falls back to local execution if the remote path is unavailable.
@@ -126,19 +122,19 @@ When the consumer exhausts its local slots, `Coordinator` tries to start a remot
 | Field | Default | Description |
 |---|---|---|
 | `port` | `5100` | Listen port; the address is always `127.0.0.1`. |
+| `service_name` | `"rustc-pool"` | NexusNet service name used for discovery and peer requests. Must match `local_services.name`. |
 
 ### `[node]`
 
 | Field | Default | Description |
 |---|---|---|
-| `cores_per_slot` | `1.0` | CPU cores consumed by one compile slot. |
-| `mem_per_slot_mb` | `2048` | Memory consumed by one compile slot (MB). |
-| `reserve_cores` | `0.5` | CPU cores reserved for the system and excluded from available capacity. |
-| `reserve_mem_mb` | `1024` | Memory reserved for the system (MB) and excluded from available capacity. |
+| `max_usage_percent` | `80` | Upper bound on CPU and memory used by compile slots, as a percentage of total resources. |
 | `sample_interval_secs` | `1` | Capacity sampling interval (seconds). |
 | `rustc` | `"rustc"` | rustc executable used by the provider side. |
-| `toolchain` | `""` | Toolchain label carried by `Subscribe`; empty means unrestricted. |
-| `target` | `""` | Target label carried by `Subscribe`; empty means unrestricted. |
+
+`cores_per_slot` and `mem_per_slot_mb` are fixed constants: `1.0` core and
+`2048` MB per slot. Toolchain/target are selected automatically from the action
+manifest; there are no manual labels.
 
 ### `[subscription]`
 
@@ -147,8 +143,7 @@ When the consumer exhausts its local slots, `Coordinator` tries to start a remot
 | `target_slots` | `8` | Desired visible total capacity (local `max_slots` plus subscribed providers' `max_slots`). `0` disables active subscription. |
 | `update_interval_secs` | `30` | `CapacityUpdate` keepalive interval; updates are also sent on this period when capacity is unchanged. |
 | `ttl_secs` | `60` | Expiration time for a provider capacity view. |
-| `target_reevaluate_secs` | `5` | How often `static_peers` are re-evaluated. |
-| `static_peers` | `[]` | Static provider list; entries are NexusNet PeerId strings. |
+| `target_reevaluate_secs` | `5` | How often visible capacity is compared with `target_slots`. |
 
 > `target_slots` includes local capacity. If it is not greater than the local `max_slots`, no remote provider will be subscribed.
 
@@ -189,7 +184,9 @@ Priority:
 2. `$XDG_RUNTIME_DIR/nexus-compile.sock`;
 3. `/tmp/nexus-compile-<user>.sock`.
 
-The socket permission is `0600`.
+The socket permission is `0660` (group read/write). Under systemd the socket is
+placed at `/run/<pkg>/nexus.sock` with group `nexusnet`, so users in that group
+can connect without sharing the service account.
 
 ### Cache behavior
 
@@ -237,10 +234,11 @@ The provider side:
 ### Capacity and subscriptions
 
 - On Linux, reads `/proc/stat` and `/proc/meminfo`; CPU usage uses an EWMA (0.3 new value + 0.7 previous value).
-- `max_slots` is derived from total cores/memory after subtracting reserves; `free_slots` is further constrained by currently available CPU/memory and active tasks.
+- `max_slots = floor(total * max_usage_percent)` for CPU and memory, using fixed 1.0 core / 2048 MB slots.
+- `free_slots` is the remaining headroom under the percentage cap; it is not reduced by active tasks because `/proc` usage already includes them.
 - Providers send `CapacityUpdate` to subscribers; `seq` is monotonically increasing and older sequence numbers are ignored.
 - Consumers build provider views through `Subscribe`/`Subscribed` and drop a provider if no update arrives within `ttl_secs`.
-- Only `static_peers` is used for provider discovery; DHT-based automatic discovery is not implemented.
+- Providers are discovered automatically through NexusNet `discover_providers`. Discovery runs only when capacity is insufficient: every 30 seconds when visible capacity is zero or the last discovery failed, otherwise every 1 hour.
 
 ### Cache and CAS
 
@@ -252,7 +250,7 @@ The provider side:
 
 ## NexusNet integration
 
-Register this backend's service name as `rustc-pool` in NexusNet; remote calls use that name unconditionally:
+Register this backend's service name as `rustc-pool` (or the configured `service_name`) in NexusNet; remote calls use that name:
 
 ```toml
 [[services.dispatcher.local_services]]
@@ -262,9 +260,9 @@ port = 5100
 require_auth = false
 ```
 
-- Both nodes must run this backend before they can forward `rustc-pool` requests to each other.
-- The consumer's `[subscription].static_peers` must contain the provider's PeerId.
-- The provider's `[node].toolchain` and `[node].target` are returned in `Subscribed`.
+- Both nodes must run this backend and use the same `service_name`.
+- Providers are discovered automatically; there is no static peer list.
+- Consumers send the action manifest's `toolchain_id` and `target` in `Reserve`; providers reject mismatches and missing target standard libraries.
 - Production deployments should enable NexusNet authentication and allow only trusted peers to reach this service.
 
 ## Protocol
@@ -420,6 +418,33 @@ The current `APP_PROTOCOL_VERSION = 2`. `body` is discriminated by the text fiel
 - The provider verifies the bundle file hash and manifest digest before running rustc.
 - `<TARGET>` is currently used only for digest normalization; the provider substitutes only `<MANIFEST>`, `<OUT>`, and `<EXTERN>` before execution.
 
+## Enabling cargo acceleration on Debian/Ubuntu
+
+The `.deb` postinst uses debconf to ask which users should be accelerated:
+
+- selected users are added to the `nexusnet` group;
+- their `~/.cargo/config.toml` is merged with `rustc-wrapper`, `incremental = false`,
+  `CARGO_INCREMENTAL = "0"`, and `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`;
+- the question is shown again on upgrade and reinstall, and old managed keys are
+  cleared before the new selection is written;
+- noninteractive installs do not modify users unless preseeded.
+
+Preseed example:
+
+```bash
+nexuscompile nexuscompile/cargo_users multiselect alice, bob
+```
+
+Reconfigure later with:
+
+```bash
+sudo dpkg-reconfigure nexuscompile
+```
+
+When the sidecar is unavailable, `nexus-rustc` writes a 30-second backoff marker
+and falls back to the real rustc. Builds still complete; incremental compilation
+remains disabled while the wrapper config is active.
+
 ## Debian deployment
 
 ```bash
@@ -447,9 +472,9 @@ The service runs as NexusNet's dedicated `nexusnet` user; logs go to journald. P
 | `NEXUSCOMPILE_CONFIG` | Configuration file | `/etc/<pkg>/config.toml` |
 | `NEXUSCOMPILE_LOG_PATH` | Log directory | `/var/lib/<pkg>` |
 | `NEXUSCOMPILE_CACHE` | Cache directory | `$NEXUSCOMPILE_HOME/cache` when unset |
-| `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `$XDG_RUNTIME_DIR/nexus-compile.sock` when set, otherwise `/tmp/nexus-compile-<user>.sock` |
+| `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `/run/<pkg>/nexus.sock` under systemd; otherwise `$XDG_RUNTIME_DIR/nexus-compile.sock` or `/tmp/nexus-compile-<user>.sock` |
 
-`deploy/service.service` sets only the first three variables explicitly. The cache defaults to `$NEXUSCOMPILE_HOME/cache`, and the socket defaults to `/tmp/nexus-compile-<user>.sock` (usually `/tmp/nexus-compile-nexusnet.sock` under systemd) with permission `0600`. To run `nexus-rustc` from another account, set `NEXUSCOMPILE_SOCKET` explicitly and adjust permissions.
+`deploy/service.service` sets the first three variables plus `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`. The cache defaults to `$NEXUSCOMPILE_HOME/cache`. The service creates the socket with mode `0660` in a `RuntimeDirectory`; users that need local compile acceleration must be members of the `nexusnet` group. `PrivateTmp=true` is kept, so the socket is never placed in `/tmp` for the systemd deployment.
 
 ```bash
 systemctl status <pkg>
@@ -504,9 +529,9 @@ cargo build --release
 - **Unacked tasks**: task entries whose consumers never send `ResultAck` remain in memory until the same task id is reserved again or the process restarts.
 - **Local builds do not consume slots**: `nexus-rustc` local execution does not go through `Provider::reserve`; concurrency is mainly controlled by cargo/the wrapper. Capacity sampling only reflects load after the fact.
 - **Single-connection assumption**: the server accepts multiple NexusNet connections, but `AppState` holds one control handle; the newest connection wins, and an older disconnect cannot clear it.
-- **Toolchain labels**: the provider does not verify that the submitter's `manifest.toolchain_id` matches its own. The consumer filters on the labels returned by `Subscribed`, so cross-node selection is consistent but not a security boundary.
+- **Toolchain selection**: consumers pass the action manifest's `toolchain_id` and `target` in `Reserve`. Providers reject mismatches and check that the target standard library is installed. This is a local compatibility check, not a security boundary.
 - **Trust boundary**: remote compilation executes the submitter's rustc arguments and externs (including proc-macros), which is equivalent to running code on the provider; the consumer only verifies output hashes and does not independently validate the compile result. Deploy only on trusted networks with NexusNet authentication enabled.
-- **Discovery**: only `static_peers` is supported; there is no DHT-based automatic discovery.
+- **Discovery**: providers are found automatically through NexusNet `discover_providers`; there is no static peer list. An empty/failed discovery result clears the current provider views and retries after 30 seconds; a normal but insufficient result retries after 1 hour.
 - **Cache granularity**: the action digest hashes the entire `CARGO_MANIFEST_DIR` (excluding `target`, `.git`, and `node_modules`), so changes to non-build files also invalidate the cache; full-tree hashing and bundle construction are expensive for large packages.
 
 ## Migration notes
@@ -514,4 +539,4 @@ cargo build --release
 - The old UUID frame protocol (`[uuid_len][uuid][payload_len][payload]`) has been fully replaced by the CBOR v2 contract.
 - The application protocol is now `rustc-pool` v2; NexusNet's `local_services.name` should be set to `rustc-pool` (the old `example` name no longer applies).
 - The local wrapper requires `CARGO_INCREMENTAL=0`; incremental compilation is not supported.
-- Remote compilation requires both nodes to run this backend, and the consumer's `[subscription].static_peers` must contain the provider PeerId.
+- Remote compilation requires both nodes to run this backend and use the same `service_name`; provider discovery is automatic.

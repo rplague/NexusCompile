@@ -72,12 +72,24 @@ Neither `remove` nor `purge` deletes runtime data under `/var/lib/<pkg>/`, and n
 | `NEXUSCOMPILE_CONFIG` | Configuration file | `/etc/<pkg>/config.toml` |
 | `NEXUSCOMPILE_LOG_PATH` | Log directory | `/var/lib/<pkg>` |
 | `NEXUSCOMPILE_CACHE` | Result cache directory | `$NEXUSCOMPILE_HOME/cache` when unset |
-| `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `$XDG_RUNTIME_DIR/nexus-compile.sock` when set, otherwise `/tmp/nexus-compile-<user>.sock` |
+| `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `/run/<pkg>/nexus.sock` under systemd |
 
-`deploy/service.service` sets only the first three variables explicitly. The cache defaults to
-`$NEXUSCOMPILE_HOME/cache`; the socket defaults to `/tmp/nexus-compile-<user>.sock` (usually
-`/tmp/nexus-compile-nexusnet.sock` under systemd) with permission `0600`.
-To run `nexus-rustc` from another account, set `NEXUSCOMPILE_SOCKET` explicitly and adjust permissions.
+`deploy/service.service` sets `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock` and uses
+`RuntimeDirectory=<pkg>` with mode `0770`. The socket itself is `0660` and owned by
+`nexusnet:nexusnet`. Users that should use cargo acceleration must be members of the
+`nexusnet` group. `PrivateTmp=true` is kept; the socket is not placed in `/tmp`.
+
+The postinst runs a debconf multiselect for the users to accelerate. Selected users are
+added to `nexusnet` and receive a managed `~/.cargo/config.toml`. The question is shown
+again on upgrade and reinstall, and managed Cargo keys are cleared before being rewritten.
+Noninteractive installs do not modify users unless preseeded:
+
+```bash
+nexuscompile nexuscompile/cargo_users multiselect alice, bob
+```
+
+Reconfigure later with `sudo dpkg-reconfigure nexuscompile`. Uninstall clears the managed
+Cargo keys but never removes users from the shared `nexusnet` group.
 
 When `JOURNAL_STREAM` is present, logging switches to journald mode automatically (set by systemd);
 `NO_COLOR` or a non-TTY disables colors.
@@ -90,6 +102,7 @@ When `JOURNAL_STREAM` is present, logging switches to journald mode automaticall
 | `service.service` | systemd unit (packaging asset with `@PKG@`/`@BIN@`/`@USER@` placeholders) |
 | `service.tmpfiles.conf` | Pre-creates directories and sets ownership (packaging asset) |
 | `../deb/{postinst,prerm,postrm}` | Debian maintainer scripts (packaging assets) |
+| `../deb/{config,templates}` | debconf user-onboarding wizard for cargo acceleration |
 | `publish-release.sh` | Idempotent manual release helper: upload files from a directory to a Gitea Release |
 
 ## Building the deb manually

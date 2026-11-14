@@ -16,6 +16,7 @@ use crate::log::{LogLevel, LogStruct};
 use crate::remote::Coordinator;
 
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
+const SOCKET_MODE: u32 = 0o660;
 
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
@@ -37,7 +38,7 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     }
 
     let listener = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
     Ok(listener)
 }
 
@@ -74,4 +75,28 @@ fn handle_stream(
     let request: LocalRequest = local_protocol::read_message(&mut stream)?;
     let response: LocalResponse = handle.block_on(coordinator.execute(&request));
     local_protocol::write_message(&mut stream, &response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn socket_is_group_read_write() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nexuscompile-socket-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nexus.sock");
+        let _listener = bind(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, SOCKET_MODE);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

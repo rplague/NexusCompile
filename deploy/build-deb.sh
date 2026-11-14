@@ -83,10 +83,13 @@ chmod 0644 "${STAGE}/lib/systemd/system/${UNIT_NAME}.service" \
            "${STAGE}/usr/lib/tmpfiles.d/${PKG}.conf"
 
 # Maintainer scripts
-render "${PROJECT_DIR}/deb/postinst" > "${STAGE}/DEBIAN/postinst"
-render "${PROJECT_DIR}/deb/prerm"    > "${STAGE}/DEBIAN/prerm"
-render "${PROJECT_DIR}/deb/postrm"   > "${STAGE}/DEBIAN/postrm"
-chmod 0755 "${STAGE}/DEBIAN/postinst" "${STAGE}/DEBIAN/prerm" "${STAGE}/DEBIAN/postrm"
+render "${PROJECT_DIR}/deb/postinst"  > "${STAGE}/DEBIAN/postinst"
+render "${PROJECT_DIR}/deb/prerm"     > "${STAGE}/DEBIAN/prerm"
+render "${PROJECT_DIR}/deb/postrm"    > "${STAGE}/DEBIAN/postrm"
+render "${PROJECT_DIR}/deb/config"    > "${STAGE}/DEBIAN/config"
+render "${PROJECT_DIR}/deb/templates" > "${STAGE}/DEBIAN/templates"
+chmod 0755 "${STAGE}/DEBIAN/postinst" "${STAGE}/DEBIAN/prerm" "${STAGE}/DEBIAN/postrm" "${STAGE}/DEBIAN/config"
+chmod 0644 "${STAGE}/DEBIAN/templates"
 
 # Compute Installed-Size in KB
 INSTALLED_SIZE="$(du -sk --exclude=DEBIAN "${STAGE}" | cut -f1)"
@@ -99,7 +102,7 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: OAHD
-Depends: libc6 (>= 2.31)
+Depends: libc6 (>= 2.31), debconf (>= 0.5) | debconf-2.0
 Installed-Size: ${INSTALLED_SIZE}
 Description: ${NAME} - NexusNet distributed compile node
  Implements the CBOR v2 protocol between NexusNet nodes and sidecars/backends,

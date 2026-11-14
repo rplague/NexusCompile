@@ -22,6 +22,11 @@ use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = nexuscompile::setup::run_cli(&args) {
+        std::process::exit(code);
+    }
+
     let config_handle = ConfigHandle::load_or_create_default();
     let config_snapshot = config_handle.snapshot();
     let address = format!("127.0.0.1:{}", config_handle.port());

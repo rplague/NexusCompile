@@ -3,19 +3,31 @@
 # Arguments:
 #   $1=configure     install or upgrade
 #   $2=old version   empty on first install, replaced version on upgrade
-#
-# The service account is fixed to NexusNet's dedicated `nexusnet` user; create it if missing.
 set -e
+
+. /usr/share/debconf/confmodule
 
 USER_NAME="@USER@"
 UNIT_NAME="@PKG@"
+BIN_NAME="@BIN@"
+PKG="@PKG@"
+STATE="/var/lib/${PKG}/cargo-users"
+SOCKET="/run/${PKG}/nexus.sock"
+CARGO_BIN="/usr/bin/${BIN_NAME}"
 
 create_system_user() {
+    if ! getent group "${USER_NAME}" >/dev/null 2>&1; then
+        groupadd --system "${USER_NAME}" 2>/dev/null || true
+    fi
     if id "${USER_NAME}" >/dev/null 2>&1; then
         return 0
     fi
     if command -v useradd >/dev/null 2>&1; then
-        useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "${USER_NAME}" || true
+        if getent group "${USER_NAME}" >/dev/null 2>&1; then
+            useradd --system --gid "${USER_NAME}" --no-create-home --shell /usr/sbin/nologin "${USER_NAME}" || true
+        else
+            useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "${USER_NAME}" || true
+        fi
     fi
 }
 
@@ -38,15 +50,128 @@ ensure_persistent_journal() {
     fi
 }
 
+normalized_users() {
+    printf '%s' "$1" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d'
+}
+
+user_home() {
+    getent passwd "$1" 2>/dev/null | cut -d: -f6
+}
+
+user_uid() {
+    getent passwd "$1" 2>/dev/null | cut -d: -f3
+}
+
+user_group() {
+    id -gn "$1" 2>/dev/null
+}
+
+manageable_user() {
+    _user="$1"
+    _uid="$(user_uid "${_user}")"
+    _home="$(user_home "${_user}")"
+    [ -n "${_uid}" ] || return 1
+    [ "${_uid}" -ge 1000 ] 2>/dev/null || return 1
+    [ "${_uid}" -lt 60000 ] 2>/dev/null || return 1
+    [ -n "${_home}" ] || return 1
+    [ -d "${_home}" ] || return 1
+    return 0
+}
+
+clear_cargo_for() {
+    _user="$1"
+    manageable_user "${_user}" || return 0
+    _home="$(user_home "${_user}")"
+    _group="$(user_group "${_user}")"
+    _config="${_home}/.cargo/config.toml"
+    if [ ! -f "${_config}" ]; then
+        return 0
+    fi
+    if [ -x "${CARGO_BIN}" ]; then
+        "${CARGO_BIN}" unsetup-user --config "${_config}" >/dev/null 2>&1 || true
+        chown "${_user}:${_group}" "${_config}" "${_config}.nexuscompile.bak" 2>/dev/null || true
+        chmod 0644 "${_config}" 2>/dev/null || true
+    fi
+}
+
+setup_cargo_for() {
+    _user="$1"
+    manageable_user "${_user}" || {
+        echo "NexusCompile: 跳过用户 ${_user}（不是普通用户或 home 不存在）" >&2
+        return 0
+    }
+
+    _home="$(user_home "${_user}")"
+    _group="$(user_group "${_user}")"
+    _config="${_home}/.cargo/config.toml"
+
+    usermod -aG "${USER_NAME}" "${_user}" 2>/dev/null || {
+        echo "NexusCompile: 无法把 ${_user} 加入 ${USER_NAME} 组" >&2
+        return 0
+    }
+
+    install -d -m 0755 -o "${_user}" -g "${_group}" "${_home}/.cargo" 2>/dev/null || true
+    chown "${_user}:${_group}" "${_home}/.cargo" 2>/dev/null || true
+
+    if [ ! -x "${CARGO_BIN}" ]; then
+        echo "NexusCompile: 找不到 ${CARGO_BIN}，跳过 ${_user} 的 Cargo 设置" >&2
+        return 0
+    fi
+
+    if "${CARGO_BIN}" setup-user --config "${_config}" --socket "${SOCKET}" >/dev/null 2>&1; then
+        chown "${_user}:${_group}" "${_config}" "${_config}.nexuscompile.bak" 2>/dev/null || true
+        chmod 0644 "${_config}" 2>/dev/null || true
+    else
+        echo "NexusCompile: 写入 ${_user} 的 Cargo 设置失败" >&2
+    fi
+}
+
+save_state() {
+    _value="$1"
+    mkdir -p "$(dirname "${STATE}")"
+    printf '%s\n' "${_value}" > "${STATE}"
+    chown "${USER_NAME}:${USER_NAME}" "${STATE}" 2>/dev/null || true
+    chmod 0644 "${STATE}" 2>/dev/null || true
+}
+
 case "$1" in
     configure)
         create_system_user
         create_dirs
         ensure_persistent_journal
+
+        db_get "@PKG@/cargo_users" || true
+        SELECTED_RAW="${RET:-}"
+        SELECTED="$(normalized_users "${SELECTED_RAW}" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+
+        if [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ] && [ -z "${SELECTED}" ] && [ -f "${STATE}" ]; then
+            SELECTED="$(cat "${STATE}" 2>/dev/null || true)"
+        fi
+
+        # Always rebuild from a clean state so repeated installs cannot duplicate
+        # managed Cargo keys. Group membership is deliberately never removed.
+        if [ -f "${STATE}" ]; then
+            for old_user in $(normalized_users "$(cat "${STATE}" 2>/dev/null || true)"); do
+                clear_cargo_for "${old_user}"
+            done
+        fi
+
+        if [ -n "${SELECTED}" ]; then
+            for user in ${SELECTED}; do
+                setup_cargo_for "${user}"
+            done
+        fi
+        save_state "${SELECTED}"
+        db_stop 2>/dev/null || true
+
+        if [ -n "${SELECTED}" ]; then
+            echo "NexusCompile: 已启用用户: ${SELECTED}" >&2
+            echo "NexusCompile: 组权限需要重新登录或执行 newgrp ${USER_NAME} 后生效" >&2
+        fi
+
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl enable "${UNIT_NAME}" >/dev/null 2>&1 || true
         if [ -n "${2:-}" ] && systemctl is-active --quiet "${UNIT_NAME}" 2>/dev/null; then
-            # Upgrade/reconfigure while the service was running: restart smoothly
             systemctl try-restart "${UNIT_NAME}" >/dev/null 2>&1 || true
         else
             systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
