@@ -12,6 +12,10 @@ WorkingDirectory=/var/lib/@PKG@
 Environment=NEXUSCOMPILE_HOME=/var/lib/@PKG@
 Environment=NEXUSCOMPILE_CONFIG=/etc/@PKG@/config.toml
 Environment=NEXUSCOMPILE_LOG_PATH=/var/lib/@PKG@
+Environment=NEXUSCOMPILE_SOCKET=/run/@PKG@/nexus.sock
+
+RuntimeDirectory=@PKG@
+RuntimeDirectoryMode=0770
 
 ExecStart=/usr/bin/@BIN@
 
@@ -39,7 +43,7 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 RestrictNamespaces=true
-ReadWritePaths=/etc/@PKG@ /var/lib/@PKG@
+ReadWritePaths=/etc/@PKG@ /var/lib/@PKG@ /run/@PKG@
 
 [Install]
 WantedBy=multi-user.target
