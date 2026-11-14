@@ -53,11 +53,34 @@ Preseed example:
 nexuscompile nexuscompile/cargo_users multiselect alice, bob
 ```
 
+## 1b-2. Private Rust toolchain
+
+```bash
+sudo ls -ld /var/lib/nexuscompile/toolchains
+sudo ls -l /var/lib/nexuscompile/toolchains/rust/current
+sudo cat /var/lib/nexuscompile/toolchains/rust/state
+grep -n 'rustc\|toolchains' /etc/nexuscompile/config.toml
+systemctl status nexuscompile
+```
+
+Expected:
+
+- The default selection is `stable`; an exact version is also accepted.
+- `stable` installs the current stable plus the previous two minor versions;
+  an exact version installs only that version.
+- The toolchain entries are under `/var/lib/nexuscompile/toolchains` and owned
+  by `nexusnet`.
+- `[node].rustc` points to the selected base toolchain, and
+  `[[node.toolchains]]` lists all installed entries.
+- `systemctl status` shows the `doctor --skip-socket` pre-start check succeeded.
+- Removing the package prints the retained toolchain path and does not delete it.
+
 ## 1c. Systemd socket
 
 ```bash
 ls -ld /run/nexuscompile
 ls -l /run/nexuscompile/nexus.sock
+ls -l /run/nexuscompile/task.sock
 ```
 
 Expected:

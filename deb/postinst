@@ -11,10 +11,19 @@ USER_NAME="@USER@"
 UNIT_NAME="@PKG@"
 BIN_NAME="@BIN@"
 PKG="@PKG@"
-STATE="/var/lib/${PKG}/cargo-users"
-MARKER="/var/lib/${PKG}/onboarding-in-progress"
+DATA_DIR="/var/lib/${PKG}"
+CACHE_DIR="${DATA_DIR}/cache"
+STATE="${DATA_DIR}/cargo-users"
+TOOLCHAIN_STATE="${DATA_DIR}/toolchain-selection"
+TOOLCHAIN_ROOT="${DATA_DIR}/toolchains"
+TOOLCHAIN_REGISTRY="${TOOLCHAIN_ROOT}/rust/state"
+TOOLCHAIN_HELPER="/usr/lib/${PKG}/install-toolchain"
+TOOLCHAIN_CONFIG="/etc/${PKG}/config.toml"
+MARKER="${DATA_DIR}/onboarding-in-progress"
 SOCKET="/run/${PKG}/nexus.sock"
 CARGO_BIN="/usr/bin/${BIN_NAME}"
+RUNUSER_BIN="$(command -v runuser 2>/dev/null || true)"
+[ -n "${RUNUSER_BIN}" ] || RUNUSER_BIN=/usr/sbin/runuser
 
 create_system_user() {
     if ! getent group "${USER_NAME}" >/dev/null 2>&1; then
@@ -36,9 +45,9 @@ create_dirs() {
     if command -v systemd-tmpfiles >/dev/null 2>&1; then
         systemd-tmpfiles --create /usr/lib/tmpfiles.d/@PKG@.conf >/dev/null 2>&1 || true
     else
-        mkdir -p /etc/@PKG@ /var/lib/@PKG@
-        chown "${USER_NAME}:${USER_NAME}" /etc/@PKG@ /var/lib/@PKG@ || true
-        chmod 0755 /etc/@PKG@; chmod 0700 /var/lib/@PKG@
+        mkdir -p "/etc/${PKG}" "${DATA_DIR}"
+        chown "${USER_NAME}:${USER_NAME}" "/etc/${PKG}" "${DATA_DIR}" || true
+        chmod 0755 "/etc/${PKG}"; chmod 0700 "${DATA_DIR}"
     fi
 }
 
@@ -127,6 +136,57 @@ setup_cargo_for() {
     fi
 }
 
+install_toolchain() {
+    _channel="$1"
+    [ -n "${_channel}" ] || _channel=stable
+    case "${_channel}" in
+        *[!A-Za-z0-9._-]*)
+            echo "NexusCompile: 非法 Rust 版本: ${_channel}" >&2
+            return 1
+            ;;
+    esac
+
+    if [ ! -x "${TOOLCHAIN_HELPER}" ]; then
+        echo "NexusCompile: 缺少工具链安装脚本 ${TOOLCHAIN_HELPER}" >&2
+        return 1
+    fi
+    if [ ! -x "${RUNUSER_BIN}" ]; then
+        echo "NexusCompile: 找不到 runuser" >&2
+        return 1
+    fi
+
+    install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "${TOOLCHAIN_ROOT}"
+    "${TOOLCHAIN_HELPER}" --user "${USER_NAME}" --root "${TOOLCHAIN_ROOT}" --channel "${_channel}" || {
+        echo "NexusCompile: Rust 工具链下载或安装失败" >&2
+        return 1
+    }
+
+    if ! "${CARGO_BIN}" configure-toolchains --config "${TOOLCHAIN_CONFIG}" --state "${TOOLCHAIN_REGISTRY}" >/dev/null; then
+        echo "NexusCompile: 写入 ${TOOLCHAIN_CONFIG} 失败" >&2
+        return 1
+    fi
+    chown "${USER_NAME}:${USER_NAME}" "${TOOLCHAIN_CONFIG}" 2>/dev/null || true
+    chmod 0644 "${TOOLCHAIN_CONFIG}" 2>/dev/null || true
+
+    mkdir -p "$(dirname "${TOOLCHAIN_STATE}")"
+    printf 'channel=%s\ntarget=\n' "${_channel}" > "${TOOLCHAIN_STATE}"
+    chown "${USER_NAME}:${USER_NAME}" "${TOOLCHAIN_STATE}" 2>/dev/null || true
+    chmod 0644 "${TOOLCHAIN_STATE}" 2>/dev/null || true
+
+    (
+        cd "${DATA_DIR}" || exit 1
+        "${RUNUSER_BIN}" -u "${USER_NAME}" -- env \
+            NEXUSCOMPILE_HOME="${DATA_DIR}" \
+            NEXUSCOMPILE_CONFIG="${TOOLCHAIN_CONFIG}" \
+            NEXUSCOMPILE_CACHE="${CACHE_DIR}" \
+            NEXUSCOMPILE_SOCKET="${SOCKET}" \
+            "${CARGO_BIN}" doctor --skip-socket
+    ) || {
+        echo "NexusCompile: Rust 工具链自检失败" >&2
+        return 1
+    }
+}
+
 save_state() {
     _value="$1"
     mkdir -p "$(dirname "${STATE}")"
@@ -149,6 +209,18 @@ case "$1" in
             SELECTED="$(cat "${STATE}" 2>/dev/null || true)"
         fi
 
+        db_get "@PKG@/rust_toolchain" || true
+        TOOLCHAIN_CHANNEL="${RET:-stable}"
+        TOOLCHAIN_CHANNEL="$(printf '%s' "${TOOLCHAIN_CHANNEL}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -n "${TOOLCHAIN_CHANNEL}" ] || TOOLCHAIN_CHANNEL=stable
+        db_stop 2>/dev/null || true
+
+        if ! install_toolchain "${TOOLCHAIN_CHANNEL}"; then
+            rm -f "${MARKER}"
+            echo "NexusCompile: 工具链安装失败；修复后运行 sudo dpkg --configure -a" >&2
+            exit 1
+        fi
+
         # User-level onboarding must not leave the package half-configured.
         set +e
 
@@ -168,7 +240,6 @@ case "$1" in
         save_state "${SELECTED}" || \
             echo "NexusCompile: 写入 ${STATE} 失败" >&2
         set -e
-        db_stop 2>/dev/null || true
 
         if [ -n "${SELECTED}" ]; then
             echo "NexusCompile: 已启用用户: ${SELECTED}" >&2

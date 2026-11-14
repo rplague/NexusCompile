@@ -70,12 +70,14 @@ render() {
 rm -rf "${STAGE}"
 mkdir -p "${STAGE}/DEBIAN" \
          "${STAGE}/usr/bin" \
+         "${STAGE}/usr/lib/${PKG}" \
          "${STAGE}/lib/systemd/system" \
          "${STAGE}/usr/lib/tmpfiles.d"
 
 # Binaries
 install -m 0755 "${BINARY}" "${STAGE}/usr/bin/${BIN}"
 install -m 0755 "${WRAPPER}" "${STAGE}/usr/bin/nexus-rustc"
+install -m 0755 "${SCRIPT_DIR}/install-toolchain" "${STAGE}/usr/lib/${PKG}/install-toolchain"
 
 # Packaging assets
 render "${SCRIPT_DIR}/service.service"       > "${STAGE}/lib/systemd/system/${UNIT_NAME}.service"
@@ -103,12 +105,13 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: OAHD
-Depends: libc6 (>= 2.31), debconf (>= 0.5) | debconf-2.0
+Depends: libc6 (>= 2.31), debconf (>= 0.5) | debconf-2.0, curl, ca-certificates, gcc, binutils, libc6-dev, util-linux
 Installed-Size: ${INSTALLED_SIZE}
 Description: ${NAME} - NexusNet distributed compile node
  Implements the CBOR v2 protocol between NexusNet nodes and sidecars/backends,
  and provides the nexus-rustc local wrapper.
  Runs as the dedicated NexusNet user nexusnet; logs are managed by journald.
+ The Debian package can install a private Rust toolchain for the sidecar.
 EOF
 
 # Package (root-owner-group makes files owned by root, no fakeroot needed)

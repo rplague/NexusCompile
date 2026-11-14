@@ -18,7 +18,7 @@ use crate::util::fs::file_mode;
 use crate::util::path::{safe_join, safe_relative};
 
 pub const RESULT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-pub const CACHE_SCHEMA: u16 = 1;
+pub const CACHE_SCHEMA: u16 = 2;
 
 pub use crate::compile_protocol::OutputRef as OutputFile;
 

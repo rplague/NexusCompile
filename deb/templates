@@ -9,4 +9,17 @@ Description: 需要启用 NexusCompile 编译加速的用户:
  Selected users are added to the nexusnet group and receive a Cargo config.
  The initial selection comes from the previous NexusCompile setup, or from
  the current nexusnet group members on first install.
- Leave empty to skip user setup.
+  Leave empty to skip user setup.
+
+Template: @PKG@/rust_toolchain
+Type: string
+Default: stable
+Description: 要由 nexusnet 下载的 Rust 编译链:
+ 输入 stable，或精确版本（例如 1.99.0）。
+ stable 会额外安装前两个 minor 版本；精确版本只安装该版本。
+ 工具链会下载到 /var/lib/@PKG@/toolchains，并以 @USER@ 用户身份安装。
+ Rust toolchain to download for the sidecar:
+ Enter stable or an exact version such as 1.99.0.
+ stable also installs the previous two minor releases; an exact version
+ installs only that version.
+ Toolchains are downloaded to /var/lib/@PKG@/toolchains as @USER@.

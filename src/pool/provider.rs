@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -10,13 +9,13 @@ use crate::capacity::CapacitySnapshot;
 use crate::compile::bundle::{decode_bundle, materialize_bundle};
 use crate::compile::cache::ResultCache;
 use crate::compile::hash::{hash_file, hex_hash};
-use crate::compile::manifest::{target_installed, toolchain_id};
 use crate::compile_protocol::{
     AppRequest, AppResponse, ErrorCode, Hash32, LeaseId, OutputRef, PeerId, TaskId, TaskState,
 };
 use crate::config::ServiceConfig;
 use crate::local_protocol::truncate_diagnostic;
 use crate::log::{LogLevel, LogStruct};
+use crate::toolchain::resolve_rustc;
 use crate::util::process;
 use crate::util::time::now_ms;
 use crate::workspace::Workspace;
@@ -570,19 +569,12 @@ fn run_task_blocking(
         return;
     }
 
-    let rustc = Path::new(&config.node.rustc);
-    match toolchain_id(rustc, &bundle.manifest.target) {
-        Ok(expected) if expected == bundle.manifest.toolchain_id => {}
-        Ok(_) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                "toolchain does not match manifest".into(),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
+    let rustc = match resolve_rustc(
+        &config,
+        &bundle.manifest.toolchain_id,
+        &bundle.manifest.target,
+    ) {
+        Ok(rustc) => rustc,
         Err(error) => {
             fail(
                 &provider,
@@ -593,20 +585,9 @@ fn run_task_blocking(
             );
             return;
         }
-    }
-    if !target_installed(rustc, &bundle.manifest.target).unwrap_or(false) {
-        fail(
-            &provider,
-            ErrorCode::Internal,
-            "target standard library is not installed".into(),
-            Vec::new(),
-            Vec::new(),
-        );
-        return;
-    }
+    };
 
     let work = task_dir.join("work");
-    let work_pkg = work.join("pkg");
     let work_out = work.join("out");
     let work_extern = work.join("extern");
     if let Err(error) = fs::create_dir_all(&work)
@@ -625,32 +606,23 @@ fn run_task_blocking(
         return;
     }
 
-    let cwd = substitute(&bundle.manifest.cwd, &work);
-    let cwd = if Path::new(&cwd).starts_with(&work) {
-        PathBuf::from(cwd)
-    } else {
-        work_pkg.clone()
+    let prepared = match crate::compile::bundle::prepare_task(&bundle, &work) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            fail(
+                &provider,
+                ErrorCode::Internal,
+                format!("prepare task: {error}"),
+                Vec::new(),
+                Vec::new(),
+            );
+            return;
+        }
     };
-    let args: Vec<String> = bundle
-        .manifest
-        .args
-        .iter()
-        .map(|arg| substitute(arg, &work))
-        .collect();
-    let mut env: HashMap<String, String> = bundle
-        .manifest
-        .env
-        .iter()
-        .map(|(key, value)| (key.clone(), substitute(value, &work)))
-        .collect();
-    env.insert("CARGO_MANIFEST_DIR".into(), work_pkg.display().to_string());
-    env.insert("OUT_DIR".into(), work_out.display().to_string());
-    env.insert("CARGO_TARGET_DIR".into(), work.display().to_string());
-
-    let output = Command::new(&config.node.rustc)
-        .args(&args)
-        .current_dir(&cwd)
-        .envs(&env)
+    let output = Command::new(&rustc)
+        .args(&prepared.args)
+        .current_dir(&prepared.cwd)
+        .envs(&prepared.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -718,18 +690,11 @@ fn run_task_blocking(
     provider.complete_task(task_id, outputs);
 }
 
-fn substitute(value: &str, work: &Path) -> String {
-    value
-        .replace("<MANIFEST>", &work.join("pkg").display().to_string())
-        .replace("<OUT>", &work.join("out").display().to_string())
-        .replace("<EXTERN>", &work.join("extern").display().to_string())
-        .replace("<TARGET>", &work.join("target").display().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capacity::CapacitySnapshot;
+    use std::path::Path;
 
     fn peer(value: &str) -> PeerId {
         PeerId::new(value)
@@ -990,13 +955,19 @@ mod tests {
     fn substitutes_placeholders() {
         let work = Path::new("/work");
         assert_eq!(
-            substitute("<MANIFEST>/src/lib.rs", work),
+            crate::compile::bundle::substitute("<MANIFEST>/src/lib.rs", work),
             "/work/pkg/src/lib.rs"
         );
-        assert_eq!(substitute("--out-dir=<OUT>", work), "--out-dir=/work/out");
-        assert_eq!(substitute("<EXTERN>/dep", work), "/work/extern/dep");
         assert_eq!(
-            substitute("--target-dir=<TARGET>", work),
+            crate::compile::bundle::substitute("--out-dir=<OUT>", work),
+            "--out-dir=/work/out"
+        );
+        assert_eq!(
+            crate::compile::bundle::substitute("<EXTERN>/dep", work),
+            "/work/extern/dep"
+        );
+        assert_eq!(
+            crate::compile::bundle::substitute("--target-dir=<TARGET>", work),
             "--target-dir=/work/target"
         );
     }

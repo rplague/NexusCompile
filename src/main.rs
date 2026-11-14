@@ -10,6 +10,7 @@ use nexuscompile::config::{ConfigHandle, ServiceConfig};
 use nexuscompile::connection;
 use nexuscompile::control::new_control_handle;
 use nexuscompile::local;
+use nexuscompile::local_task;
 use nexuscompile::log::{LogLevel, LogStruct};
 use nexuscompile::paths;
 use nexuscompile::pool;
@@ -24,6 +25,9 @@ use tokio::sync::watch;
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = nexuscompile::setup::run_cli(&args) {
+        std::process::exit(code);
+    }
+    if let Some(code) = nexuscompile::toolchain::run_cli(&args) {
         std::process::exit(code);
     }
 
@@ -136,7 +140,7 @@ async fn main() -> std::io::Result<()> {
                 (
                     Some(tokio::spawn(local::run(
                         listener,
-                        coordinator,
+                        coordinator.clone(),
                         tokio::runtime::Handle::current(),
                     ))),
                     Some(socket),
@@ -146,6 +150,43 @@ async fn main() -> std::io::Result<()> {
                 LogStruct::new(
                     LogLevel::Warning,
                     "本地编译 socket 失败",
+                    format!("{}: {error}", socket.display()),
+                )
+                .emit();
+                (None, None)
+            }
+        }
+    };
+
+    let (task_service, task_socket): (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<std::path::PathBuf>,
+    ) = {
+        let socket = paths::task_socket_path();
+        match local_task::bind(&socket) {
+            Ok(listener) => {
+                LogStruct::new(
+                    LogLevel::Important,
+                    "本地任务 socket",
+                    socket.display().to_string(),
+                )
+                .emit();
+                (
+                    Some(tokio::spawn(local_task::run(
+                        listener,
+                        coordinator,
+                        cache.clone(),
+                        workspace.clone(),
+                        config_handle.clone(),
+                        tokio::runtime::Handle::current(),
+                    ))),
+                    Some(socket),
+                )
+            }
+            Err(error) => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "本地任务 socket 失败",
                     format!("{}: {error}", socket.display()),
                 )
                 .emit();
@@ -185,6 +226,12 @@ async fn main() -> std::io::Result<()> {
         task.abort();
     }
     if let Some(path) = local_socket {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(task) = task_service {
+        task.abort();
+    }
+    if let Some(path) = task_socket {
         let _ = std::fs::remove_file(path);
     }
 

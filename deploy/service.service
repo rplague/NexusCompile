@@ -3,6 +3,8 @@ Description=@BIN@ backend (NexusNet sidecar protocol v2)
 Documentation=file:/etc/@PKG@/README.md
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,13 +15,18 @@ Environment=NEXUSCOMPILE_HOME=/var/lib/@PKG@
 Environment=NEXUSCOMPILE_CONFIG=/etc/@PKG@/config.toml
 Environment=NEXUSCOMPILE_LOG_PATH=/var/lib/@PKG@
 Environment=NEXUSCOMPILE_SOCKET=/run/@PKG@/nexus.sock
+Environment=NEXUSCOMPILE_TASK_SOCKET=/run/@PKG@/task.sock
+Environment=RUSTUP_HOME=/var/lib/@PKG@/toolchains/rustup
+Environment=CARGO_HOME=/var/lib/@PKG@/toolchains/cargo
 
 RuntimeDirectory=@PKG@
 RuntimeDirectoryMode=0770
 
+ExecStartPre=/usr/bin/@BIN@ doctor --skip-socket
 ExecStart=/usr/bin/@BIN@
 
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=5
 TimeoutStopSec=15
 LimitNOFILE=65536

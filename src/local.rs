@@ -63,7 +63,7 @@ pub async fn run(listener: UnixListener, coordinator: Arc<Coordinator>, handle: 
     }
 }
 
-fn prepare_stream(stream: UnixStream) -> io::Result<std::os::unix::net::UnixStream> {
+pub(crate) fn prepare_stream(stream: UnixStream) -> io::Result<std::os::unix::net::UnixStream> {
     let stream = stream.into_std()?;
     // Tokio sockets are nonblocking. The blocking request handler must switch
     // back explicitly, otherwise read_exact/write_all return EAGAIN.

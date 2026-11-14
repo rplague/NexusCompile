@@ -6,6 +6,7 @@ set -e
 PKG="@PKG@"
 USER_NAME="@USER@"
 STATE="/var/lib/${PKG}/cargo-users"
+TOOLCHAIN_STATE="/var/lib/${PKG}/toolchain-selection"
 MARKER="/var/lib/${PKG}/onboarding-in-progress"
 VERSION="@VERSION@"
 
@@ -50,12 +51,6 @@ filter_known() {
 }
 
 USERS_LIST="$(human_users)"
-if [ -z "${USERS_LIST}" ]; then
-    db_set "@PKG@/cargo_users" ""
-    db_stop 2>/dev/null || true
-    exit 0
-fi
-
 USERS_SPACE="$(printf '%s\n' "${USERS_LIST}" | tr '\n' ' ')"
 USERS_CSV="$(printf '%s\n' "${USERS_LIST}" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 
@@ -66,10 +61,23 @@ else
 fi
 INITIAL="$(filter_known "${USERS_SPACE}" "${INITIAL}")"
 
+DEFAULT_CHANNEL=stable
+if [ -f "${TOOLCHAIN_STATE}" ]; then
+    _saved_channel="$(sed -n 's/^channel=//p' "${TOOLCHAIN_STATE}" | head -n 1)"
+    if [ -n "${_saved_channel}" ]; then
+        DEFAULT_CHANNEL="${_saved_channel}"
+    fi
+fi
+
 if [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ]; then
     db_get "@PKG@/cargo_users" || true
     if [ -z "${RET:-}" ] && [ -f "${STATE}" ]; then
         db_set "@PKG@/cargo_users" "$(cat "${STATE}" 2>/dev/null || true)"
+    fi
+
+    db_get "@PKG@/rust_toolchain" || true
+    if [ -z "${RET:-}" ]; then
+        db_set "@PKG@/rust_toolchain" "${DEFAULT_CHANNEL}"
     fi
     db_stop 2>/dev/null || true
     exit 0
@@ -80,20 +88,36 @@ fi
 if [ "${DEBCONF_RECONFIGURE:-}" != "1" ] \
     && [ -f "${MARKER}" ] \
     && [ "$(cat "${MARKER}" 2>/dev/null)" = "${VERSION}" ] \
-    && db_seen "@PKG@/cargo_users"; then
+    && db_seen "@PKG@/cargo_users" \
+    && db_seen "@PKG@/rust_toolchain"; then
     db_stop 2>/dev/null || true
     exit 0
 fi
 
 rm -f "${MARKER}"
 
-db_subst "@PKG@/cargo_users" USERS "${USERS_CSV}"
-db_set "@PKG@/cargo_users" "${INITIAL}"
-db_input high "@PKG@/cargo_users" || true
-if db_go; then
+if [ -n "${USERS_LIST}" ]; then
+    db_subst "@PKG@/cargo_users" USERS "${USERS_CSV}"
+    db_set "@PKG@/cargo_users" "${INITIAL}"
+    db_input high "@PKG@/cargo_users" || true
+    if db_go; then
+        db_fset "@PKG@/cargo_users" seen true || true
+    fi
+else
+    db_set "@PKG@/cargo_users" ""
     db_fset "@PKG@/cargo_users" seen true || true
-    mkdir -p "$(dirname "${MARKER}")"
-    printf '%s\n' "${VERSION}" > "${MARKER}"
-    chmod 0600 "${MARKER}" 2>/dev/null || true
 fi
+
+db_get "@PKG@/rust_toolchain" || true
+if [ -z "${RET:-}" ]; then
+    db_set "@PKG@/rust_toolchain" "${DEFAULT_CHANNEL}"
+fi
+db_input high "@PKG@/rust_toolchain" || true
+if db_go; then
+    db_fset "@PKG@/rust_toolchain" seen true || true
+fi
+
+mkdir -p "$(dirname "${MARKER}")"
+printf '%s\n' "${VERSION}" > "${MARKER}"
+chmod 0600 "${MARKER}" 2>/dev/null || true
 db_stop 2>/dev/null || true
