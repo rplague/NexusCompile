@@ -62,7 +62,8 @@ echo "[build-deb] 包名=${PKG} 二进制=${BIN} 版本=${VERSION} 架构=${ARCH
 render() {
     sed -e "s/@PKG@/${PKG}/g" \
         -e "s/@BIN@/${BIN}/g" \
-        -e "s/@USER@/${SERVICE_USER}/g" "$1"
+        -e "s/@USER@/${SERVICE_USER}/g" \
+        -e "s/@VERSION@/${VERSION}/g" "$1"
 }
 
 # Clean and prepare the staging directory
