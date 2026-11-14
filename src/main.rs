@@ -54,12 +54,7 @@ async fn main() -> std::io::Result<()> {
             accepting: false,
         });
 
-    let provider = Arc::new(Provider::new(
-        PeerId::new("local"),
-        initial.max_slots,
-        config_snapshot.node.toolchain.clone(),
-        config_snapshot.node.target.clone(),
-    ));
+    let provider = Arc::new(Provider::new(PeerId::new("local"), initial.max_slots));
     provider.set_capacity(initial.max_slots, initial.free_slots);
     let consumer = Arc::new(Consumer::new());
     LogStruct::new(

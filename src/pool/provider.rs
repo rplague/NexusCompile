@@ -10,6 +10,7 @@ use crate::capacity::CapacitySnapshot;
 use crate::compile::bundle::{decode_bundle, materialize_bundle};
 use crate::compile::cache::ResultCache;
 use crate::compile::hash::{hash_file, hex_hash};
+use crate::compile::manifest::{target_installed, toolchain_id};
 use crate::compile_protocol::{
     AppRequest, AppResponse, ErrorCode, Hash32, LeaseId, OutputRef, PeerId, TaskId, TaskState,
 };
@@ -23,8 +24,6 @@ use crate::workspace::Workspace;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscription {
     pub consumer: PeerId,
-    pub toolchain: String,
-    pub target: String,
     pub seq: u64,
     pub last_sent_ms: u64,
     pub last_sent_free: u32,
@@ -52,8 +51,6 @@ pub struct TaskEntry {
 #[derive(Debug)]
 struct Inner {
     provider_id: PeerId,
-    toolchain: String,
-    target: String,
     max_slots: u32,
     free_slots: u32,
     subscriptions: HashMap<PeerId, Subscription>,
@@ -69,17 +66,10 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn new(
-        provider_id: PeerId,
-        max_slots: u32,
-        toolchain: impl Into<String>,
-        target: impl Into<String>,
-    ) -> Self {
+    pub fn new(provider_id: PeerId, max_slots: u32) -> Self {
         Self {
             inner: RwLock::new(Inner {
                 provider_id,
-                toolchain: toolchain.into(),
-                target: target.into(),
                 max_slots,
                 free_slots: max_slots,
                 subscriptions: HashMap::new(),
@@ -90,7 +80,7 @@ impl Provider {
     }
 
     pub fn placeholder() -> Self {
-        Self::new(PeerId::new("local"), 1, "", "")
+        Self::new(PeerId::new("local"), 1)
     }
 
     pub fn set_provider_id(&self, provider_id: PeerId) {
@@ -153,14 +143,12 @@ impl Provider {
         }
     }
 
-    pub fn subscribe(&self, consumer: PeerId, toolchain: String, target: String) -> AppResponse {
+    pub fn subscribe(&self, consumer: PeerId) -> AppResponse {
         let mut inner = self.write();
         inner.subscriptions.insert(
             consumer.clone(),
             Subscription {
                 consumer,
-                toolchain,
-                target,
                 seq: 0,
                 last_sent_ms: 0,
                 last_sent_free: 0,
@@ -170,8 +158,8 @@ impl Provider {
         );
         AppResponse::Subscribed {
             provider: inner.provider_id.clone(),
-            toolchain: inner.toolchain.clone(),
-            target: inner.target.clone(),
+            toolchain: String::new(),
+            target: String::new(),
             max_slots: inner.max_slots,
         }
     }
@@ -582,6 +570,41 @@ fn run_task_blocking(
         return;
     }
 
+    let rustc = Path::new(&config.node.rustc);
+    match toolchain_id(rustc, &bundle.manifest.target) {
+        Ok(expected) if expected == bundle.manifest.toolchain_id => {}
+        Ok(_) => {
+            fail(
+                &provider,
+                ErrorCode::Internal,
+                "toolchain does not match manifest".into(),
+                Vec::new(),
+                Vec::new(),
+            );
+            return;
+        }
+        Err(error) => {
+            fail(
+                &provider,
+                ErrorCode::Internal,
+                format!("toolchain check failed: {error}"),
+                Vec::new(),
+                Vec::new(),
+            );
+            return;
+        }
+    }
+    if !target_installed(rustc, &bundle.manifest.target).unwrap_or(false) {
+        fail(
+            &provider,
+            ErrorCode::Internal,
+            "target standard library is not installed".into(),
+            Vec::new(),
+            Vec::new(),
+        );
+        return;
+    }
+
     let work = task_dir.join("work");
     let work_pkg = work.join("pkg");
     let work_out = work.join("out");
@@ -738,16 +761,16 @@ mod tests {
 
     #[test]
     fn subscribe_is_keyed_by_peer_id_and_replaces() {
-        let provider = Provider::new(peer("provider"), 2, "rustc", "x86_64");
-        let first = provider.subscribe(peer("consumer"), "rustc".into(), "x86_64".into());
-        let second = provider.subscribe(peer("consumer"), "rustc-2".into(), "aarch64".into());
+        let provider = Provider::new(peer("provider"), 2);
+        let first = provider.subscribe(peer("consumer"));
+        let second = provider.subscribe(peer("consumer"));
 
         assert_eq!(
             first,
             AppResponse::Subscribed {
                 provider: peer("provider"),
-                toolchain: "rustc".into(),
-                target: "x86_64".into(),
+                toolchain: String::new(),
+                target: String::new(),
                 max_slots: 2,
             }
         );
@@ -755,22 +778,21 @@ mod tests {
             second,
             AppResponse::Subscribed {
                 provider: peer("provider"),
-                toolchain: "rustc".into(),
-                target: "x86_64".into(),
+                toolchain: String::new(),
+                target: String::new(),
                 max_slots: 2,
             }
         );
         assert_eq!(provider.read().subscriptions.len(), 1);
         let sub = &provider.read().subscriptions[&peer("consumer")];
-        assert_eq!(sub.toolchain, "rustc-2");
         assert_eq!(sub.seq, 0);
     }
 
     #[test]
     fn due_updates_include_initial_change_and_keepalive() {
-        let provider = Provider::new(peer("local"), 4, "", "");
+        let provider = Provider::new(peer("local"), 4);
         provider.set_capacity(4, 2);
-        provider.subscribe(peer("consumer"), String::new(), String::new());
+        provider.subscribe(peer("consumer"));
 
         let initial = provider.due_capacity_updates(1_000, snapshot(2, 0, true), 30_000);
         assert_eq!(initial.len(), 1);
@@ -790,7 +812,7 @@ mod tests {
 
     #[test]
     fn reserve_is_idempotent_and_busy_when_sampled_full() {
-        let provider = Provider::new(peer("local"), 1, "", "");
+        let provider = Provider::new(peer("local"), 1);
         let id = task(1);
 
         let first = provider.reserve(peer("consumer"), id, 1, manifest(2));
@@ -811,7 +833,7 @@ mod tests {
 
     #[test]
     fn one_task_requires_exactly_one_slot() {
-        let provider = Provider::new(peer("local"), 1, "", "");
+        let provider = Provider::new(peer("local"), 1);
         let response = provider.reserve(peer("consumer"), task(1), 2, manifest(2));
         assert!(matches!(
             response,
@@ -824,7 +846,7 @@ mod tests {
 
     #[test]
     fn task_lifecycle_and_cache_hit() {
-        let provider = Provider::new(peer("local"), 1, "", "");
+        let provider = Provider::new(peer("local"), 1);
         let id = task(1);
 
         let granted = provider.reserve(peer("consumer"), id, 1, manifest(2));
@@ -867,7 +889,7 @@ mod tests {
 
     #[test]
     fn cancel_and_fail_free_the_slot() {
-        let provider = Provider::new(peer("local"), 1, "", "");
+        let provider = Provider::new(peer("local"), 1);
         let id = task(1);
         assert!(matches!(
             provider.reserve(peer("consumer"), id, 1, manifest(2)),
@@ -896,7 +918,7 @@ mod tests {
 
     #[test]
     fn shared_done_task_needs_all_lease_acks() {
-        let provider = Provider::new(peer("local"), 1, "", "");
+        let provider = Provider::new(peer("local"), 1);
         let id = task(1);
         let lease_one = match provider.reserve(peer("a"), id, 1, manifest(2)) {
             AppResponse::Granted { lease_id, .. } => lease_id,
@@ -926,7 +948,7 @@ mod tests {
 
     #[test]
     fn expired_leases_are_returned_for_pin_release() {
-        let provider = Provider::new(peer("local"), 1, "", "");
+        let provider = Provider::new(peer("local"), 1);
         let id = task(1);
         let _lease = provider.create_lease(id);
         let affected = provider.expire_leases(now_ms().saturating_add(LEASE_TTL_MS + 1));
@@ -935,7 +957,7 @@ mod tests {
 
     #[test]
     fn unknown_task_returns_not_found() {
-        let provider = Provider::new(peer("local"), 1, "", "");
+        let provider = Provider::new(peer("local"), 1);
         assert!(matches!(
             provider.status(task(1)),
             AppResponse::Error {
@@ -947,7 +969,7 @@ mod tests {
 
     #[test]
     fn free_slots_follow_the_capacity_sample() {
-        let provider = Provider::new(peer("local"), 4, "", "");
+        let provider = Provider::new(peer("local"), 4);
         provider.set_capacity(4, 4);
         assert_eq!(provider.free_slots(), 4);
 

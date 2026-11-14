@@ -144,14 +144,7 @@ impl Coordinator {
                 .consumer
                 .providers()
                 .into_iter()
-                .filter(|view| {
-                    view.accepting
-                        && view.free_slots > 0
-                        && (self.config.node.toolchain.is_empty()
-                            || view.toolchain == self.config.node.toolchain)
-                        && (self.config.node.target.is_empty()
-                            || view.target == self.config.node.target)
-                })
+                .filter(|view| view.accepting && view.free_slots > 0)
                 .map(|view| view.provider)
                 .collect();
             (consumer, providers)
@@ -181,6 +174,8 @@ impl Coordinator {
                     task_id,
                     slots: 1,
                     input_manifest: bundle_hash,
+                    toolchain_id: manifest.toolchain_id.clone(),
+                    target: manifest.target.clone(),
                 },
             )
             .await

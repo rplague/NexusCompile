@@ -9,8 +9,6 @@ use crate::util::time::now_ms;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderView {
     pub provider: PeerId,
-    pub toolchain: String,
-    pub target: String,
     pub max_slots: u32,
     pub free_slots: u32,
     pub queue_len: u32,
@@ -36,13 +34,11 @@ impl Consumer {
     }
 
     /// Record a pending subscription before sending `Subscribe`.
-    pub fn record_pending(&self, provider: PeerId, toolchain: String, target: String) {
+    pub fn record_pending(&self, provider: PeerId) {
         self.write().providers.insert(
             provider.clone(),
             ProviderView {
                 provider,
-                toolchain,
-                target,
                 max_slots: 0,
                 free_slots: 0,
                 queue_len: 0,
@@ -53,22 +49,14 @@ impl Consumer {
         );
     }
 
-    /// Record the provider's labels from the `Subscribed` reply, not local config.
-    pub fn record_subscribed(
-        &self,
-        provider: PeerId,
-        toolchain: String,
-        target: String,
-        max_slots: u32,
-    ) {
+    /// Record the provider's advertised slot count from `Subscribed`.
+    pub fn record_subscribed(&self, provider: PeerId, max_slots: u32) {
         let mut inner = self.write();
         let view = inner
             .providers
             .entry(provider.clone())
             .or_insert_with(|| ProviderView {
                 provider,
-                toolchain: toolchain.clone(),
-                target: target.clone(),
                 max_slots,
                 free_slots: 0,
                 queue_len: 0,
@@ -76,8 +64,6 @@ impl Consumer {
                 last_seq: 0,
                 last_seen_ms: now_ms(),
             });
-        view.toolchain = toolchain;
-        view.target = target;
         view.max_slots = max_slots;
         view.last_seen_ms = now_ms();
     }
@@ -142,18 +128,6 @@ impl Consumer {
             .sum()
     }
 
-    pub fn compatible_max_slots(&self, toolchain: &str, target: &str) -> u32 {
-        self.read()
-            .providers
-            .values()
-            .filter(|view| {
-                (toolchain.is_empty() || view.toolchain == toolchain)
-                    && (target.is_empty() || view.target == target)
-            })
-            .map(|view| view.max_slots)
-            .sum()
-    }
-
     /// Remove all views and return the peers that were dropped.
     pub fn clear(&self) -> Vec<PeerId> {
         let mut inner = self.write();
@@ -180,19 +154,17 @@ mod tests {
     }
 
     #[test]
-    fn subscribed_uses_provider_labels() {
+    fn record_subscribed_sets_slots() {
         let consumer = Consumer::new();
-        consumer.record_subscribed(peer("p"), "rustc-p".into(), "aarch64".into(), 4);
+        consumer.record_subscribed(peer("p"), 4);
         let view = &consumer.providers()[0];
-        assert_eq!(view.toolchain, "rustc-p");
-        assert_eq!(view.target, "aarch64");
         assert_eq!(view.max_slots, 4);
     }
 
     #[test]
     fn capacity_updates_respect_sequence() {
         let consumer = Consumer::new();
-        consumer.record_subscribed(peer("provider"), "rustc".into(), "x86_64".into(), 4);
+        consumer.record_subscribed(peer("provider"), 4);
 
         assert_eq!(
             consumer.apply_capacity(peer("provider"), 2, 3, 0, true),
@@ -212,7 +184,7 @@ mod tests {
     #[test]
     fn providers_expire_after_ttl() {
         let consumer = Consumer::new();
-        consumer.record_pending(peer("provider"), String::new(), String::new());
+        consumer.record_pending(peer("provider"));
         let expired = consumer.expire_providers(now_ms().saturating_add(61_000), 60_000);
         assert_eq!(expired, vec![peer("provider")]);
         assert!(consumer.providers().is_empty());
