@@ -18,7 +18,11 @@ fn main() {
     let args: Vec<String> = raw_args
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let env_map: HashMap<String, String> = env::vars().collect();
+    let mut env_map: HashMap<String, String> = env::vars().collect();
+    // Cargo's jobserver fds are not inherited by the sidecar, and passing the
+    // stale handles makes rustc warn and disable its jobserver. The digest
+    // already ignores CARGO_MAKEFLAGS.
+    env_map.remove("CARGO_MAKEFLAGS");
 
     if executor::is_supported(&args, &env_map).is_ok() && !backoff_active() {
         match try_local(&rustc, &args, &env_map) {
