@@ -1,0 +1,76 @@
+#!/bin/sh
+set -e
+
+. /usr/share/debconf/confmodule
+
+PKG="@PKG@"
+USER_NAME="@USER@"
+STATE="/var/lib/${PKG}/cargo-users"
+
+db_version 2.0 || true
+
+human_users() {
+    getent passwd 2>/dev/null | awk -F: '
+        $3 >= 1000 && $3 < 60000 && $7 !~ /(nologin|false)$/ { print $1 }
+    ' | sort -u
+}
+
+group_members() {
+    getent group "${USER_NAME}" 2>/dev/null \
+        | cut -d: -f4 \
+        | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | sed '/^$/d'
+}
+
+filter_known() {
+    _known=" $1 "
+    _input="$2"
+    _out=""
+    _oldifs="$IFS"
+    IFS=', '
+    for _item in $_input; do
+        if echo "$_known" | grep -q " $_item "; then
+            if [ -z "$_out" ]; then
+                _out="$_item"
+            else
+                _out="$_out, $_item"
+            fi
+        fi
+    done
+    IFS="$_oldifs"
+    printf '%s' "$_out"
+}
+
+USERS_LIST="$(human_users)"
+if [ -z "${USERS_LIST}" ]; then
+    db_set "@PKG@/cargo_users" ""
+    db_stop 2>/dev/null || true
+    exit 0
+fi
+
+USERS_SPACE="$(printf '%s\n' "${USERS_LIST}" | tr '\n' ' ')"
+USERS_CSV="$(printf '%s\n' "${USERS_LIST}" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
+
+if [ -f "${STATE}" ]; then
+    INITIAL="$(cat "${STATE}" 2>/dev/null || true)"
+else
+    INITIAL="$(group_members | tr '\n' ',' | sed 's/,$//')"
+fi
+INITIAL="$(filter_known "${USERS_SPACE}" "${INITIAL}")"
+
+if [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ]; then
+    db_get "@PKG@/cargo_users" || true
+    if [ -z "${RET:-}" ] && [ -f "${STATE}" ]; then
+        db_set "@PKG@/cargo_users" "$(cat "${STATE}" 2>/dev/null || true)"
+    fi
+    db_stop 2>/dev/null || true
+    exit 0
+fi
+
+db_subst "@PKG@/cargo_users" USERS "${USERS_CSV}"
+db_fset "@PKG@/cargo_users" seen false || true
+db_set "@PKG@/cargo_users" "${INITIAL}"
+db_input high "@PKG@/cargo_users" || true
+db_go || true
+db_stop 2>/dev/null || true

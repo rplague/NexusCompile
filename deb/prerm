@@ -1,18 +1,48 @@
 #!/bin/sh
-# @BIN@ deb package prerm (before removal)
-# Arguments:
-#   remove       removal
-#   upgrade      upgrade
+# @BIN@ deb package prerm (before removal/upgrade)
 set -e
 
-UNIT_NAME="@PKG@"
+PKG="@PKG@"
+BIN_NAME="@BIN@"
+STATE="/var/lib/${PKG}/cargo-users"
+CARGO_BIN="/usr/bin/${BIN_NAME}"
+
+clear_cargo_for() {
+    _user="$1"
+    _uid="$(getent passwd "${_user}" 2>/dev/null | cut -d: -f3)"
+    _home="$(getent passwd "${_user}" 2>/dev/null | cut -d: -f6)"
+    _group="$(id -gn "${_user}" 2>/dev/null)"
+    [ -n "${_uid}" ] || return 0
+    [ "${_uid}" -ge 1000 ] 2>/dev/null || return 0
+    [ "${_uid}" -lt 60000 ] 2>/dev/null || return 0
+    [ -n "${_home}" ] && [ -d "${_home}" ] || return 0
+    [ -x "${CARGO_BIN}" ] || return 0
+    _config="${_home}/.cargo/config.toml"
+    [ -f "${_config}" ] || return 0
+    "${CARGO_BIN}" unsetup-user --config "${_config}" >/dev/null 2>&1 || true
+    chown "${_user}:${_group}" "${_config}" "${_config}.nexuscompile.bak" 2>/dev/null || true
+    chmod 0644 "${_config}" 2>/dev/null || true
+}
+
+clear_all_cargo_settings() {
+    [ -f "${STATE}" ] || return 0
+    for user in $(cat "${STATE}" 2>/dev/null | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed '/^$/d'); do
+        clear_cargo_for "${user}"
+    done
+}
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        clear_all_cargo_settings
+        ;;
+esac
 
 case "$1" in
     remove)
-        systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+        systemctl disable --now "@PKG@" >/dev/null 2>&1 || true
         ;;
     upgrade|deconfigure)
-        systemctl stop "${UNIT_NAME}" >/dev/null 2>&1 || true
+        systemctl stop "@PKG@" >/dev/null 2>&1 || true
         ;;
 esac
 
