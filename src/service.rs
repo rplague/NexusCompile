@@ -220,24 +220,9 @@ impl Dispatch for AppState {
 
 fn validate_reserve(app: &AppState, toolchain_id: &str, target: &str) -> Result<(), String> {
     let config = app.config_snapshot();
-    let rustc = std::path::Path::new(&config.node.rustc);
-
-    if !toolchain_id.is_empty() {
-        let expected = crate::compile::manifest::toolchain_id(rustc, target)
-            .map_err(|error| format!("toolchain check failed: {error}"))?;
-        if expected != toolchain_id {
-            return Err("toolchain mismatch".into());
-        }
-    }
-
-    if !target.is_empty()
-        && !crate::compile::manifest::target_installed(rustc, target)
-            .map_err(|error| format!("target check failed: {error}"))?
-    {
-        return Err(format!("target {target} is not installed"));
-    }
-
-    Ok(())
+    crate::toolchain::resolve_rustc(&config, toolchain_id, target)
+        .map(|_| ())
+        .map_err(|error| format!("toolchain check failed: {error}"))
 }
 
 impl AppResponse {

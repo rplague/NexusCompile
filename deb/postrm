@@ -10,11 +10,18 @@ set -e
 
 UNIT_NAME="@PKG@"
 MARKER="/var/lib/@PKG@/onboarding-in-progress"
+TOOLCHAIN_DIR="/var/lib/@PKG@/toolchains"
 
 case "$1" in
     remove|purge)
         rm -f "${MARKER}"
         systemctl daemon-reload >/dev/null 2>&1 || true
+        if [ -d "${TOOLCHAIN_DIR}" ]; then
+            echo "NexusCompile: Rust 编译链仍保留在:" >&2
+            echo "  ${TOOLCHAIN_DIR}" >&2
+            echo "NexusCompile: 如不再需要，请手动删除:" >&2
+            echo "  sudo rm -rf ${TOOLCHAIN_DIR}" >&2
+        fi
         ;;
     upgrade|abort-install|abort-upgrade|disappear)
         systemctl daemon-reload >/dev/null 2>&1 || true

@@ -1,0 +1,273 @@
+#!/bin/sh
+set -eu
+
+USER_NAME=nexusnet
+ROOT=/var/lib/nexuscompile/toolchains
+CHANNEL=stable
+TARGET=
+DRY_RUN=0
+TMP=
+STATE_TMP=
+
+die() {
+    echo "install-toolchain: $*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$TMP" ]; then
+        rm -rf "$TMP"
+    fi
+    if [ -n "$STATE_TMP" ]; then
+        rm -f "$STATE_TMP"
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --user)
+            [ $# -ge 2 ] || die "--user requires a value"
+            USER_NAME=$2
+            shift 2
+            ;;
+        --root)
+            [ $# -ge 2 ] || die "--root requires a value"
+            ROOT=$2
+            shift 2
+            ;;
+        --channel)
+            [ $# -ge 2 ] || die "--channel requires a value"
+            CHANNEL=$2
+            shift 2
+            ;;
+        --target)
+            [ $# -ge 2 ] || die "--target requires a value"
+            TARGET=$2
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+id "$USER_NAME" >/dev/null 2>&1 || die "unknown user: $USER_NAME"
+case "$ROOT" in
+    /*) ;;
+    *) die "--root must be absolute" ;;
+esac
+case "$CHANNEL" in
+    ""|*[!A-Za-z0-9._-]*) die "invalid channel: $CHANNEL" ;;
+esac
+if [ -n "$TARGET" ]; then
+    case "$TARGET" in
+        *[!A-Za-z0-9._-]*) die "invalid target: $TARGET" ;;
+    esac
+fi
+
+ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+case "$ARCH" in
+    amd64|x86_64) RUSTUP_ARCH=x86_64-unknown-linux-gnu ;;
+    arm64|aarch64) RUSTUP_ARCH=aarch64-unknown-linux-gnu ;;
+    armhf|armv7l) RUSTUP_ARCH=armv7-unknown-linux-gnueabihf ;;
+    i386|i686) RUSTUP_ARCH=i686-unknown-linux-gnu ;;
+    *) die "unsupported architecture: $ARCH" ;;
+esac
+
+CURL=$(command -v curl || true)
+SHA256=$(command -v sha256sum || true)
+RUNUSER=$(command -v runuser || true)
+TIMEOUT=$(command -v timeout || true)
+[ -n "$RUNUSER" ] || RUNUSER=/usr/sbin/runuser
+[ -n "$CURL" ] || die "curl is not installed"
+[ -n "$SHA256" ] || die "sha256sum is not installed"
+[ -x "$RUNUSER" ] || die "runuser is not installed"
+[ -n "$TIMEOUT" ] || die "timeout is not installed"
+
+RUSTUP_HOME="$ROOT/rustup"
+CARGO_HOME="$ROOT/cargo"
+RUST_ROOT="$ROOT/rust"
+STATE="$RUST_ROOT/state"
+RUSTC="$RUST_ROOT/current/bin/rustc"
+RUSTUP_BIN="$CARGO_HOME/bin/rustup"
+URL="https://static.rust-lang.org/rustup/dist/$RUSTUP_ARCH/rustup-init"
+RUSTUP_TIMEOUT=${NEXUSCOMPILE_RUSTUP_TIMEOUT:-900}
+USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+if [ -z "$USER_HOME" ] || [ ! -d "$USER_HOME" ]; then
+    USER_HOME="$ROOT"
+fi
+
+as_user() {
+    "$RUNUSER" -u "$USER_NAME" -- env \
+        HOME="$USER_HOME" \
+        RUSTUP_HOME="$RUSTUP_HOME" \
+        CARGO_HOME="$CARGO_HOME" \
+        "$@"
+}
+
+as_user_timeout() {
+    _limit=$1
+    shift
+    "$TIMEOUT" "$_limit" "$RUNUSER" -u "$USER_NAME" -- env \
+        HOME="$USER_HOME" \
+        RUSTUP_HOME="$RUSTUP_HOME" \
+        CARGO_HOME="$CARGO_HOME" \
+        "$@"
+}
+
+toolchain_installed() {
+    _name=$1
+    as_user "$RUSTUP_BIN" toolchain list 2>/dev/null \
+        | awk -v name="$_name" '
+            $1 == name || substr($1, 1, length(name) + 1) == name "-" { found = 1 }
+            END { exit !found }
+        '
+}
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "user=$USER_NAME"
+    echo "home=$USER_HOME"
+    echo "root=$ROOT"
+    echo "channel=$CHANNEL"
+    echo "target=$TARGET"
+    echo "arch=$RUSTUP_ARCH"
+    echo "rustup_home=$RUSTUP_HOME"
+    echo "cargo_home=$CARGO_HOME"
+    echo "url=$URL"
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+
+install -d -m 0700 -o "$USER_NAME" -g "$USER_NAME" \
+    "$ROOT" "$RUSTUP_HOME" "$CARGO_HOME" "$RUST_ROOT"
+
+if [ ! -x "$RUSTUP_BIN" ]; then
+    TMP=$(mktemp -d "$ROOT/.install.XXXXXX")
+    chown "$USER_NAME:$USER_NAME" "$TMP"
+
+    echo "install-toolchain: 下载 rustup-init..." >&2
+    as_user_timeout 1800 "$CURL" --fail --location --retry 3 --connect-timeout 20 \
+        --max-time 1800 --output "$TMP/rustup-init" "$URL"
+    as_user_timeout 120 "$CURL" --fail --location --retry 3 --connect-timeout 20 \
+        --max-time 120 --output "$TMP/rustup-init.sha256" "$URL.sha256"
+
+    expected=$("$SHA256" "$TMP/rustup-init" | awk '{print $1}')
+    published=$(sed -n '1s/^[[:space:]]*//;s/[[:space:]].*$//p' "$TMP/rustup-init.sha256")
+    case "$published" in
+        *[!0-9a-fA-F]*) die "invalid rustup-init checksum" ;;
+    esac
+    [ "${#published}" -eq 64 ] || die "invalid rustup-init checksum length"
+    [ "$expected" = "$published" ] || die "rustup-init checksum mismatch"
+
+    chmod 0755 "$TMP/rustup-init"
+    echo "install-toolchain: 安装基础工具链 $CHANNEL..." >&2
+    if [ -n "$TARGET" ]; then
+        as_user_timeout 1800 "$TMP/rustup-init" -y --no-modify-path --profile minimal \
+            --default-toolchain "$CHANNEL" --target "$TARGET"
+    else
+        as_user_timeout 1800 "$TMP/rustup-init" -y --no-modify-path --profile minimal \
+            --default-toolchain "$CHANNEL"
+    fi
+fi
+
+[ -x "$RUSTUP_BIN" ] || die "rustup was not installed"
+
+if ! toolchain_installed "$CHANNEL"; then
+    echo "install-toolchain: 安装基础工具链 $CHANNEL..." >&2
+    as_user_timeout "$RUSTUP_TIMEOUT" "$RUSTUP_BIN" toolchain install "$CHANNEL" --profile minimal \
+        || die "unable to install $CHANNEL"
+fi
+if [ -n "$TARGET" ]; then
+    echo "install-toolchain: 添加 target $TARGET..." >&2
+    as_user_timeout "$RUSTUP_TIMEOUT" "$RUSTUP_BIN" target add --toolchain "$CHANNEL" "$TARGET" \
+        || die "unable to install target $TARGET"
+fi
+
+STATE_TMP="$RUST_ROOT/.state.$$"
+: > "$STATE_TMP"
+
+append_toolchain() {
+    _tool="$1"
+    _rustc=$(as_user "$RUSTUP_BIN" which rustc --toolchain "$_tool") || return 1
+    case "$_rustc" in
+        "$RUSTUP_HOME"/toolchains/*) ;;
+        *) return 1 ;;
+    esac
+    [ -x "$_rustc" ] || return 1
+    as_user "$_rustc" -vV >/dev/null 2>&1 || return 1
+    if [ -n "$TARGET" ]; then
+        as_user "$_rustc" --print target-libdir --target "$TARGET" >/dev/null 2>&1 || return 1
+    else
+        as_user "$_rustc" --print target-libdir >/dev/null 2>&1 || return 1
+    fi
+    _dir=$(dirname "$(dirname "$_rustc")")
+    printf '%s|%s|%s\n' "$_tool" "$_dir/bin/rustc" "$TARGET" >> "$STATE_TMP"
+}
+
+append_toolchain "$CHANNEL" || die "selected toolchain is not usable"
+base_rustc=$(as_user "$RUSTUP_BIN" which rustc --toolchain "$CHANNEL")
+base_dir=$(dirname "$(dirname "$base_rustc")")
+case "$base_dir" in
+    "$RUSTUP_HOME"/toolchains/*) ;;
+    *) die "unexpected toolchain path: $base_dir" ;;
+esac
+
+if [ "$CHANNEL" = "stable" ]; then
+    stable_version=$(as_user "$base_rustc" --version | awk '{print $2}')
+    case "$stable_version" in
+        *[!0-9.]*|.*|*.)
+            echo "install-toolchain: 无法解析 stable 版本: $stable_version" >&2
+            ;;
+        *)
+            major=${stable_version%%.*}
+            rest=${stable_version#*.}
+            minor=${rest%%.*}
+            case "$major$minor" in
+                *[!0-9]*) die "invalid stable version: $stable_version" ;;
+            esac
+            for offset in 1 2; do
+                [ "$minor" -gt "$offset" ] || continue
+                candidate="$major.$((minor - offset)).0"
+                if ! toolchain_installed "$candidate"; then
+                    echo "install-toolchain: 安装历史版本 $candidate..." >&2
+                    if ! as_user_timeout "$RUSTUP_TIMEOUT" "$RUSTUP_BIN" toolchain install "$candidate" --profile minimal; then
+                        echo "install-toolchain: 跳过不可安装的 $candidate" >&2
+                        continue
+                    fi
+                fi
+                if [ -n "$TARGET" ]; then
+                    echo "install-toolchain: 为 $candidate 添加 target $TARGET..." >&2
+                    if ! as_user_timeout "$RUSTUP_TIMEOUT" "$RUSTUP_BIN" target add --toolchain "$candidate" "$TARGET"; then
+                        echo "install-toolchain: 跳过缺少 target 的 $candidate" >&2
+                        continue
+                    fi
+                fi
+                if ! append_toolchain "$candidate"; then
+                    echo "install-toolchain: 跳过不可用的 $candidate" >&2
+                fi
+            done
+            ;;
+    esac
+fi
+
+as_user "$RUSTUP_BIN" default "$CHANNEL" >/dev/null
+ln -sfn "$base_dir" "$RUST_ROOT/.current.new"
+mv -Tf "$RUST_ROOT/.current.new" "$RUST_ROOT/current"
+chown -h "$USER_NAME:$USER_NAME" "$RUST_ROOT/current"
+
+mv "$STATE_TMP" "$STATE"
+STATE_TMP=
+chown "$USER_NAME:$USER_NAME" "$STATE"
+chmod 0600 "$STATE"
+
+as_user "$RUSTC" -vV >/dev/null
+as_user "$RUSTC" --print target-libdir >/dev/null
+
+echo "RUSTC=$RUSTC"

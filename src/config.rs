@@ -45,6 +45,15 @@ fn default_result_cache_mb() -> u64 {
     512
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ToolchainEntry {
+    #[serde(default)]
+    pub channel: String,
+    pub rustc: String,
+    #[serde(default)]
+    pub target: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NodeConfig {
     #[serde(default = "default_max_usage_percent")]
@@ -53,6 +62,8 @@ pub struct NodeConfig {
     pub sample_interval_secs: u64,
     #[serde(default = "default_rustc")]
     pub rustc: String,
+    #[serde(default)]
+    pub toolchains: Vec<ToolchainEntry>,
 }
 
 fn default_rustc() -> String {
@@ -65,6 +76,7 @@ impl Default for NodeConfig {
             max_usage_percent: default_max_usage_percent(),
             sample_interval_secs: default_sample_interval_secs(),
             rustc: default_rustc(),
+            toolchains: Vec::new(),
         }
     }
 }
@@ -381,5 +393,26 @@ result_cache_mb = 128
         assert!(root.join("config.toml.bak").is_file());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn toolchain_list_roundtrips() {
+        let mut config = ServiceConfig::default();
+        config.node.toolchains = vec![
+            ToolchainEntry {
+                channel: "stable".into(),
+                rustc: "/opt/stable/bin/rustc".into(),
+                target: "x86_64-unknown-linux-gnu".into(),
+            },
+            ToolchainEntry {
+                channel: "1.99.0".into(),
+                rustc: "/opt/199/bin/rustc".into(),
+                target: String::new(),
+            },
+        ];
+
+        let text = toml::to_string_pretty(&config).unwrap();
+        let parsed: ServiceConfig = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.node.toolchains, config.node.toolchains);
     }
 }

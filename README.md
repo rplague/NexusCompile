@@ -43,7 +43,8 @@ graph LR
     P --- CA2["ResultCache / CAS"]
 ```
 
-- **Local path**: cargo -> `nexus-rustc` -> Unix socket -> `local` -> `Coordinator::execute` -> cache or local rustc.
+- **Local path**: cargo -> `nexus-rustc` -> task socket -> bundle materialization -> `Coordinator::execute` -> cache, local rustc, or remote provider.
+- **Legacy local path**: cargo -> `nexus-rustc` -> local socket -> `Coordinator::execute` -> cache or local rustc (used as fallback).
 - **Remote path**: consumer -> NexusNet -> provider's `rustc-pool` service -> provider rustc -> outputs transferred back by SHA-256.
 - **Scheduling path**: `pool/runtime.rs` samples capacity; providers broadcast `CapacityUpdate`; consumers maintain provider views through `Subscribe`/`Subscribed`.
 
@@ -130,7 +131,8 @@ When the consumer exhausts its local slots, `Coordinator` tries to start a remot
 |---|---|---|
 | `max_usage_percent` | `80` | Upper bound on CPU and memory used by compile slots, as a percentage of total resources. |
 | `sample_interval_secs` | `1` | Capacity sampling interval (seconds). |
-| `rustc` | `"rustc"` | rustc executable used by the provider side. |
+| `rustc` | `"rustc"` | Fallback/default rustc executable used by the provider side. The Debian package points this at the base private toolchain. |
+| `toolchains` | `[]` | Optional list of `{ channel, rustc, target }` entries. When non-empty, the provider selects the matching entry by `toolchain_id`. |
 
 `cores_per_slot` and `mem_per_slot_mb` are fixed constants: `1.0` core and
 `2048` MB per slot. Toolchain/target are selected automatically from the action
@@ -420,8 +422,10 @@ The current `APP_PROTOCOL_VERSION = 2`. `body` is discriminated by the text fiel
 
 ## Enabling cargo acceleration on Debian/Ubuntu
 
-The `.deb` postinst uses debconf to ask which users should be accelerated:
+The `.deb` postinst uses debconf to ask for a Rust toolchain and which users
+should be accelerated:
 
+- the Rust channel defaults to `stable` and is downloaded as `nexusnet`;
 - selected users are added to the `nexusnet` group;
 - their `~/.cargo/config.toml` is merged with `rustc-wrapper`, `incremental = false`,
   `CARGO_INCREMENTAL = "0"`, and `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`;
@@ -431,12 +435,14 @@ The `.deb` postinst uses debconf to ask which users should be accelerated:
   `/var/lib/<pkg>/onboarding-in-progress`, so the wizard appears only once;
 - postinst removes that marker only after configuration succeeds, so a failed
   install can be retried without re-asking; `dpkg-reconfigure` always asks;
-- noninteractive installs do not modify users unless preseeded.
+- noninteractive installs do not modify users unless preseeded; the toolchain
+  channel defaults to `stable` unless preseeded.
 
 Preseed example:
 
 ```bash
 nexuscompile nexuscompile/cargo_users multiselect alice, bob
+nexuscompile nexuscompile/rust_toolchain string stable
 ```
 
 Reconfigure later with:
@@ -444,6 +450,41 @@ Reconfigure later with:
 ```bash
 sudo dpkg-reconfigure nexuscompile
 ```
+
+### Private Rust toolchain
+
+The installer asks for a Rust channel or exact version and defaults to `stable`.
+It does not look for a system rustc. During `postinst`, the selected toolchain is
+downloaded and installed as the `nexusnet` user under:
+
+```text
+/var/lib/<pkg>/toolchains/
+  rustup/       RUSTUP_HOME
+  cargo/        CARGO_HOME
+  rust/current  symlink to the selected base toolchain
+  rust/state    installed toolchain registry
+```
+
+When the selection is `stable`, the installer detects the actual stable version
+and also installs the previous two minor releases, for example:
+
+```text
+stable (1.100.0)
+1.99.0
+1.98.0
+```
+
+Those three entries are written to `[node].toolchains`; the provider selects the
+matching rustc from the registry for each remote task. An exact version selection
+installs only that version. If a historical version cannot be downloaded, the
+install continues with the versions that succeeded.
+
+The directory is inside the existing `ReadWritePaths=/var/lib/<pkg>` sandbox.
+No user home or user project access is required.
+
+On removal or purge the toolchain is deliberately retained. The postrm output
+prints the directory and asks the user to remove it manually with
+`sudo rm -rf /var/lib/<pkg>/toolchains`.
 
 When the sidecar is unavailable, `nexus-rustc` writes a 30-second backoff marker
 and falls back to the real rustc. Builds still complete; incremental compilation
@@ -463,9 +504,11 @@ Package, unit, and binary names are derived automatically from `Cargo.toml`'s `n
 |---|---|
 | Main binary | `/usr/bin/NexusCompile` |
 | Wrapper | `/usr/bin/nexus-rustc` |
+| Toolchain installer | `/usr/lib/<pkg>/install-toolchain` |
 | Configuration | `/etc/<pkg>/config.toml` (generated on first start) |
 | Data/logs | `/var/lib/<pkg>/log` |
 | Cache | Defaults to `/var/lib/<pkg>/cache` |
+| Rust toolchains | `/var/lib/<pkg>/toolchains` (retained on removal) |
 | systemd unit | `/lib/systemd/system/<pkg>.service` |
 
 The service runs as NexusNet's dedicated `nexusnet` user; logs go to journald. Paths are anchored by environment variables:
@@ -477,6 +520,9 @@ The service runs as NexusNet's dedicated `nexusnet` user; logs go to journald. P
 | `NEXUSCOMPILE_LOG_PATH` | Log directory | `/var/lib/<pkg>` |
 | `NEXUSCOMPILE_CACHE` | Cache directory | `$NEXUSCOMPILE_HOME/cache` when unset |
 | `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `/run/<pkg>/nexus.sock` under systemd; otherwise `$XDG_RUNTIME_DIR/nexus-compile.sock` or `/tmp/nexus-compile-<user>.sock` |
+| `NEXUSCOMPILE_TASK_SOCKET` | Local bundle/task socket | `/run/<pkg>/task.sock` under systemd; otherwise derived from `NEXUSCOMPILE_SOCKET` |
+| `RUSTUP_HOME` | Private rustup toolchain root | `/var/lib/<pkg>/toolchains/rustup` |
+| `CARGO_HOME` | Private rustup proxy/cargo root | `/var/lib/<pkg>/toolchains/cargo` |
 
 `deploy/service.service` sets the first three variables plus `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`. The cache defaults to `$NEXUSCOMPILE_HOME/cache`. The service creates the socket with mode `0660` in a `RuntimeDirectory`; users that need local compile acceleration must be members of the `nexusnet` group. `PrivateTmp=true` is kept, so the socket is never placed in `/tmp` for the systemd deployment.
 

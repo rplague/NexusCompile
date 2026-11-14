@@ -73,6 +73,9 @@ Neither `remove` nor `purge` deletes runtime data under `/var/lib/<pkg>/`, and n
 | `NEXUSCOMPILE_LOG_PATH` | Log directory | `/var/lib/<pkg>` |
 | `NEXUSCOMPILE_CACHE` | Result cache directory | `$NEXUSCOMPILE_HOME/cache` when unset |
 | `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `/run/<pkg>/nexus.sock` under systemd |
+| `NEXUSCOMPILE_TASK_SOCKET` | Local bundle/task socket | `/run/<pkg>/task.sock` under systemd |
+| `RUSTUP_HOME` | Private rustup toolchain root | `/var/lib/<pkg>/toolchains/rustup` |
+| `CARGO_HOME` | Private rustup proxy/cargo root | `/var/lib/<pkg>/toolchains/cargo` |
 
 `deploy/service.service` sets `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock` and uses
 `RuntimeDirectory=<pkg>` with mode `0770`. The socket itself is `0660` and owned by
@@ -97,15 +100,39 @@ Cargo keys but never removes users from the shared `nexusnet` group.
 When `JOURNAL_STREAM` is present, logging switches to journald mode automatically (set by systemd);
 `NO_COLOR` or a non-TTY disables colors.
 
+## Private Rust toolchain
+
+The package installs its own Rust toolchains; it does not require a system rustc.
+The default channel is `stable`. `postinst` downloads `rustup-init` as `nexusnet`
+and stores the result under:
+
+```text
+/var/lib/<pkg>/toolchains/
+  rustup/
+  cargo/
+  rust/
+    current -> selected base toolchain
+    state   -> installed toolchains
+```
+
+For `stable`, the installer auto-detects the current stable version and installs
+the previous two minor releases as well. Exact version selections install only
+that version. The provider resolves tasks by `toolchain_id` across the registry.
+If a historical toolchain fails to install, the install keeps the successful
+ones. The service unit sets `RUSTUP_HOME` and `CARGO_HOME` and runs
+`NexusCompile doctor --skip-socket` before starting. `postrm` never deletes the
+toolchains; it prints `/var/lib/<pkg>/toolchains` and a manual `rm -rf` command.
+
 ## Directory contents
 
 | File | Purpose |
 |---|---|
 | `build-deb.sh` | Assembles the `.deb` with `dpkg-deb` (no cargo-deb needed) and derives names automatically |
+| `install-toolchain` | Downloads and installs the private Rust toolchain as `nexusnet` |
 | `service.service` | systemd unit (packaging asset with `@PKG@`/`@BIN@`/`@USER@` placeholders) |
 | `service.tmpfiles.conf` | Pre-creates directories and sets ownership (packaging asset) |
 | `../deb/{postinst,prerm,postrm}` | Debian maintainer scripts (packaging assets) |
-| `../deb/{config,templates}` | debconf user-onboarding wizard for cargo acceleration |
+| `../deb/{config,templates}` | debconf user onboarding and Rust toolchain selection |
 | `publish-release.sh` | Idempotent manual release helper: upload files from a directory to a Gitea Release |
 
 ## Building the deb manually
