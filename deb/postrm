@@ -9,9 +9,14 @@
 set -e
 
 UNIT_NAME="@PKG@"
+MARKER="/var/lib/@PKG@/onboarding-in-progress"
 
 case "$1" in
-    remove|upgrade|abort-install|abort-upgrade|disappear|purge)
+    remove|purge)
+        rm -f "${MARKER}"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ;;
+    upgrade|abort-install|abort-upgrade|disappear)
         systemctl daemon-reload >/dev/null 2>&1 || true
         ;;
 esac

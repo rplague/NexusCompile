@@ -12,6 +12,7 @@ UNIT_NAME="@PKG@"
 BIN_NAME="@BIN@"
 PKG="@PKG@"
 STATE="/var/lib/${PKG}/cargo-users"
+MARKER="/var/lib/${PKG}/onboarding-in-progress"
 SOCKET="/run/${PKG}/nexus.sock"
 CARGO_BIN="/usr/bin/${BIN_NAME}"
 
@@ -161,7 +162,8 @@ case "$1" in
                 setup_cargo_for "${user}"
             done
         fi
-        save_state "${SELECTED}"
+        save_state "${SELECTED}" || \
+            echo "NexusCompile: 写入 ${STATE} 失败" >&2
         db_stop 2>/dev/null || true
 
         if [ -n "${SELECTED}" ]; then
@@ -176,6 +178,9 @@ case "$1" in
         else
             systemctl restart "${UNIT_NAME}" >/dev/null 2>&1 || true
         fi
+
+        # Configuration completed: the next install/upgrade/reinstall must ask again.
+        rm -f "${MARKER}"
         ;;
     abort-upgrade)
         systemctl daemon-reload >/dev/null 2>&1 || true

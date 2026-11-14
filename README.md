@@ -427,6 +427,10 @@ The `.deb` postinst uses debconf to ask which users should be accelerated:
   `CARGO_INCREMENTAL = "0"`, and `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`;
 - the question is shown again on upgrade and reinstall, and old managed keys are
   cleared before the new selection is written;
+- a duplicate `config` invocation inside the same dpkg run is detected through
+  `/var/lib/<pkg>/onboarding-in-progress`, so the wizard appears only once;
+- postinst removes that marker only after configuration succeeds, so a failed
+  install can be retried without re-asking; `dpkg-reconfigure` always asks;
 - noninteractive installs do not modify users unless preseeded.
 
 Preseed example:

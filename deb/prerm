@@ -5,6 +5,7 @@ set -e
 PKG="@PKG@"
 BIN_NAME="@BIN@"
 STATE="/var/lib/${PKG}/cargo-users"
+MARKER="/var/lib/${PKG}/onboarding-in-progress"
 CARGO_BIN="/usr/bin/${BIN_NAME}"
 
 clear_cargo_for() {
@@ -33,6 +34,7 @@ clear_all_cargo_settings() {
 
 case "$1" in
     remove|upgrade|deconfigure)
+        rm -f "${MARKER}"
         clear_all_cargo_settings
         ;;
 esac

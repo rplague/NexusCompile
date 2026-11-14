@@ -82,6 +82,9 @@ Neither `remove` nor `purge` deletes runtime data under `/var/lib/<pkg>/`, and n
 The postinst runs a debconf multiselect for the users to accelerate. Selected users are
 added to `nexusnet` and receive a managed `~/.cargo/config.toml`. The question is shown
 again on upgrade and reinstall, and managed Cargo keys are cleared before being rewritten.
+A duplicate config invocation within one dpkg run is suppressed with
+`/var/lib/<pkg>/onboarding-in-progress`; postinst removes the marker after a successful
+configuration, and `dpkg-reconfigure` always asks.
 Noninteractive installs do not modify users unless preseeded:
 
 ```bash

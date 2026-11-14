@@ -6,8 +6,15 @@ set -e
 PKG="@PKG@"
 USER_NAME="@USER@"
 STATE="/var/lib/${PKG}/cargo-users"
+MARKER="/var/lib/${PKG}/onboarding-in-progress"
+VERSION="@VERSION@"
 
 db_version 2.0 || true
+
+db_seen() {
+    db_fget "$1" seen || true
+    [ "${RET:-false}" = "true" ]
+}
 
 human_users() {
     getent passwd 2>/dev/null | awk -F: '
@@ -68,9 +75,25 @@ if [ "${DEBIAN_FRONTEND:-}" = "noninteractive" ]; then
     exit 0
 fi
 
+# dpkg may invoke this config script more than once in a single run before
+# postinst completes. Keep the first set of answers instead of asking again.
+if [ "${DEBCONF_RECONFIGURE:-}" != "1" ] \
+    && [ -f "${MARKER}" ] \
+    && [ "$(cat "${MARKER}" 2>/dev/null)" = "${VERSION}" ] \
+    && db_seen "@PKG@/cargo_users"; then
+    db_stop 2>/dev/null || true
+    exit 0
+fi
+
+rm -f "${MARKER}"
+
 db_subst "@PKG@/cargo_users" USERS "${USERS_CSV}"
-db_fset "@PKG@/cargo_users" seen false || true
 db_set "@PKG@/cargo_users" "${INITIAL}"
 db_input high "@PKG@/cargo_users" || true
-db_go || true
+if db_go; then
+    db_fset "@PKG@/cargo_users" seen true || true
+    mkdir -p "$(dirname "${MARKER}")"
+    printf '%s\n' "${VERSION}" > "${MARKER}"
+    chmod 0600 "${MARKER}" 2>/dev/null || true
+fi
 db_stop 2>/dev/null || true
