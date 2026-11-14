@@ -66,9 +66,23 @@ pub fn socket_path() -> PathBuf {
     if let Some(runtime) = env_path("XDG_RUNTIME_DIR") {
         return runtime.join("nexus-compile.sock");
     }
+    env::temp_dir().join(format!("nexus-compile-{}.sock", safe_user()))
+}
+
+/// Wrapper backoff marker after a failed sidecar connection.
+///
+/// Priority: `$XDG_RUNTIME_DIR/nexus-compile.backoff`
+/// -> `/tmp/nexus-compile-<user>.backoff`.
+pub fn backoff_path() -> PathBuf {
+    if let Some(runtime) = env_path("XDG_RUNTIME_DIR") {
+        return runtime.join("nexus-compile.backoff");
+    }
+    env::temp_dir().join(format!("nexus-compile-{}.backoff", safe_user()))
+}
+
+fn safe_user() -> String {
     let user = env::var("USER").unwrap_or_else(|_| "unknown".into());
-    let safe_user: String = user
-        .chars()
+    user.chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
                 ch
@@ -76,6 +90,5 @@ pub fn socket_path() -> PathBuf {
                 '_'
             }
         })
-        .collect();
-    env::temp_dir().join(format!("nexus-compile-{safe_user}.sock"))
+        .collect()
 }
