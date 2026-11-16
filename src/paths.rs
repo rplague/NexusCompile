@@ -55,20 +55,6 @@ pub fn cache_path() -> PathBuf {
     PathBuf::from("./cache")
 }
 
-/// Local wrapper ↔ node Unix socket.
-///
-/// Priority: `NEXUSCOMPILE_SOCKET` → `$XDG_RUNTIME_DIR/nexus-compile.sock`
-/// → `/tmp/nexus-compile-<user>.sock`.
-pub fn socket_path() -> PathBuf {
-    if let Some(path) = env_path("NEXUSCOMPILE_SOCKET") {
-        return path;
-    }
-    if let Some(runtime) = env_path("XDG_RUNTIME_DIR") {
-        return runtime.join("nexus-compile.sock");
-    }
-    env::temp_dir().join(format!("nexus-compile-{}.sock", safe_user()))
-}
-
 /// Local wrapper -> sidecar task socket.
 pub fn task_socket_path() -> PathBuf {
     if let Some(path) = env_path("NEXUSCOMPILE_TASK_SOCKET") {
@@ -81,17 +67,6 @@ pub fn task_socket_path() -> PathBuf {
         return runtime.join("nexus-compile-task.sock");
     }
     env::temp_dir().join(format!("nexus-compile-{}-task.sock", safe_user()))
-}
-
-/// Wrapper backoff marker after a failed sidecar connection.
-///
-/// Priority: `$XDG_RUNTIME_DIR/nexus-compile.backoff`
-/// -> `/tmp/nexus-compile-<user>.backoff`.
-pub fn backoff_path() -> PathBuf {
-    if let Some(runtime) = env_path("XDG_RUNTIME_DIR") {
-        return runtime.join("nexus-compile.backoff");
-    }
-    env::temp_dir().join(format!("nexus-compile-{}.backoff", safe_user()))
 }
 
 fn safe_user() -> String {

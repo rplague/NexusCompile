@@ -44,7 +44,6 @@ graph LR
 ```
 
 - **Local path**: cargo -> `nexus-rustc` -> task socket -> bundle materialization -> `Coordinator::execute` -> cache, local rustc, or remote provider.
-- **Legacy local path**: cargo -> `nexus-rustc` -> local socket -> `Coordinator::execute` -> cache or local rustc (used as fallback).
 - **Remote path**: consumer -> NexusNet -> provider's `rustc-pool` service -> provider rustc -> outputs transferred back by SHA-256.
 - **Scheduling path**: `pool/runtime.rs` samples capacity; providers broadcast `CapacityUpdate`; consumers maintain provider views through `Subscribe`/`Subscribed`.
 
@@ -180,15 +179,17 @@ The wrapper replays the local result to cargo as stdout/stderr and an exit code.
 
 ### Socket path
 
-Priority:
+The wrapper uses only the task socket:
 
-1. `NEXUSCOMPILE_SOCKET`;
-2. `$XDG_RUNTIME_DIR/nexus-compile.sock`;
-3. `/tmp/nexus-compile-<user>.sock`.
+1. `NEXUSCOMPILE_TASK_SOCKET`;
+2. `<NEXUSCOMPILE_SOCKET parent>/task.sock`;
+3. `$XDG_RUNTIME_DIR/nexus-compile-task.sock`;
+4. `/tmp/nexus-compile-<user>-task.sock`.
 
-The socket permission is `0660` (group read/write). Under systemd the socket is
-placed at `/run/<pkg>/nexus.sock` with group `nexusnet`, so users in that group
-can connect without sharing the service account.
+The task socket permission is `0660` (group read/write). Under systemd it is
+placed at `/run/<pkg>/task.sock` with group `nexusnet`, so users in that group
+can connect without sharing the service account. `NEXUSCOMPILE_SOCKET` remains
+as a compatibility path base; the legacy `nexus.sock` server has been removed.
 
 ### Cache behavior
 
@@ -405,7 +406,7 @@ The current `APP_PROTOCOL_VERSION = 2`. `body` is discriminated by the text fiel
 
 ### bundle / manifest / action digest
 
-- `BUNDLE_SCHEMA = 1`.
+- `BUNDLE_SCHEMA = 3`.
 - Bundle structure: `{ schema, manifest, files: [{ path, mode, data }] }`.
 - Bundle input path prefixes:
   - `pkg/`: files under `CARGO_MANIFEST_DIR`;
@@ -428,7 +429,8 @@ should be accelerated:
 - the Rust channel defaults to `stable` and is downloaded as `nexusnet`;
 - selected users are added to the `nexusnet` group;
 - their `~/.cargo/config.toml` is merged with `rustc-wrapper`, `incremental = false`,
-  `CARGO_INCREMENTAL = "0"`, and `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`;
+  `CARGO_INCREMENTAL = "0"`, and `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`
+  (used to derive the task socket path);
 - the question is shown again on upgrade and reinstall, and old managed keys are
   cleared before the new selection is written;
 - a duplicate `config` invocation inside the same dpkg run is detected through
@@ -519,12 +521,12 @@ The service runs as NexusNet's dedicated `nexusnet` user; logs go to journald. P
 | `NEXUSCOMPILE_CONFIG` | Configuration file | `/etc/<pkg>/config.toml` |
 | `NEXUSCOMPILE_LOG_PATH` | Log directory | `/var/lib/<pkg>` |
 | `NEXUSCOMPILE_CACHE` | Cache directory | `$NEXUSCOMPILE_HOME/cache` when unset |
-| `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `/run/<pkg>/nexus.sock` under systemd; otherwise `$XDG_RUNTIME_DIR/nexus-compile.sock` or `/tmp/nexus-compile-<user>.sock` |
-| `NEXUSCOMPILE_TASK_SOCKET` | Local bundle/task socket | `/run/<pkg>/task.sock` under systemd; otherwise derived from `NEXUSCOMPILE_SOCKET` |
+| `NEXUSCOMPILE_SOCKET` | Compatibility path base for the task socket | `/run/<pkg>/nexus.sock` under systemd |
+| `NEXUSCOMPILE_TASK_SOCKET` | Task socket used by `nexus-rustc` | `/run/<pkg>/task.sock` under systemd; otherwise derived from `NEXUSCOMPILE_SOCKET` |
 | `RUSTUP_HOME` | Private rustup toolchain root | `/var/lib/<pkg>/toolchains/rustup` |
 | `CARGO_HOME` | Private rustup proxy/cargo root | `/var/lib/<pkg>/toolchains/cargo` |
 
-`deploy/service.service` sets the first three variables plus `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`. The cache defaults to `$NEXUSCOMPILE_HOME/cache`. The service creates the socket with mode `0660` in a `RuntimeDirectory`; users that need local compile acceleration must be members of the `nexusnet` group. `PrivateTmp=true` is kept, so the socket is never placed in `/tmp` for the systemd deployment.
+`deploy/service.service` sets the first three variables plus `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock`. The cache defaults to `$NEXUSCOMPILE_HOME/cache`. The service creates the task socket at `/run/<pkg>/task.sock` with mode `0660` in a `RuntimeDirectory`; users that need local compile acceleration must be members of the `nexusnet` group. `PrivateTmp=true` is kept, so the socket is never placed in `/tmp` for the systemd deployment.
 
 ```bash
 systemctl status <pkg>
@@ -550,8 +552,8 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | **compile_protocol** | `rustc-pool` application v2: `AppRequest`, `AppResponse`, task states |
 | **service** | Decode and dispatch application requests: subscribe, reserve, blob, status, cancel, result ack |
 | **task_blob** | Task bundle chunk I/O and task-directory cleanup |
-| **local_protocol** | Local wrapper <-> node protocol |
-| **local** | Unix socket server and local/remote compile orchestration |
+| **local_protocol** | Shared local request/response and framing types |
+| **local_task** | Task socket, bundle ingestion, output delivery |
 | **nexus-rustc** (bin) | cargo `RUSTC_WRAPPER` entry point |
 | **compile** | Compile primitives: `executor` (local staging), `manifest` (digest), `bundle`, `cache`, `cas`, and `hash` |
 | **remote** | Consumer `Coordinator` over `remote/transfer.rs` (bundle upload, task polling, result import) |

@@ -12,7 +12,7 @@ use crate::util::args;
 use crate::util::fs::{file_mode, set_mode};
 use crate::util::path::{resolve_path, safe_relative};
 
-pub const BUNDLE_SCHEMA: u16 = 2;
+pub const BUNDLE_SCHEMA: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BundleFile {
@@ -45,6 +45,7 @@ pub fn build_bundle(
     let out_dir = resolve_path(cwd, &out_dir);
 
     let externs = extern_paths(cwd, args);
+    let deps = link_paths(cwd, args);
     let source = args
         .iter()
         .rev()
@@ -57,6 +58,14 @@ pub fn build_bundle(
             manifest_dir.join(rest)
         } else if let Some(rest) = input.path.strip_prefix("out/") {
             out_dir.join(rest)
+        } else if let Some(rest) = input.path.strip_prefix("deps/") {
+            let (kind, name) = rest
+                .split_once('/')
+                .ok_or_else(|| format!("invalid dependency path {}", input.path))?;
+            deps.iter()
+                .find(|(dep_kind, _)| dep_kind == kind)
+                .map(|(_, path)| path.join(name))
+                .ok_or_else(|| format!("missing dependency path {kind}"))?
         } else if let Some(name) = input.path.strip_prefix("extern/") {
             externs
                 .get(name)
@@ -112,6 +121,8 @@ pub fn decode_bundle(bytes: &[u8]) -> Result<TaskBundle, String> {
 }
 
 pub fn materialize_bundle(bundle: &TaskBundle, root: &Path) -> io::Result<()> {
+    fs::create_dir_all(root.join("deps/dependency"))?;
+    fs::create_dir_all(root.join("deps/native"))?;
     for file in &bundle.files {
         let relative = safe_relative(&file.path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unsafe bundle path"))?;
@@ -175,6 +186,22 @@ pub fn prepare_task(bundle: &TaskBundle, work: &Path) -> Result<PreparedTask, St
     if !cwd.is_dir() {
         return Err(format!("cwd is missing: {}", cwd.display()));
     }
+    let mut index = 0;
+    while index < args.len() {
+        let value = if args[index] == "-L" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            args[index].strip_prefix("-L")
+        };
+        if let Some(value) = value
+            && let Some((_, path)) = value.split_once('=')
+            && !resolve_path(&cwd, path).is_dir()
+        {
+            return Err(format!("dependency path is missing: {path}"));
+        }
+        index += 1;
+    }
     if !args
         .iter()
         .rev()
@@ -212,6 +239,7 @@ pub fn substitute(value: &str, work: &Path) -> String {
         .replace("<MANIFEST>", &work.join("pkg").display().to_string())
         .replace("<OUT>", &work.join("out").display().to_string())
         .replace("<EXTERN>", &work.join("extern").display().to_string())
+        .replace("<DEPS>", &work.join("deps").display().to_string())
         .replace("<TARGET>", &work.join("target").display().to_string())
 }
 
@@ -259,6 +287,25 @@ fn normalize_extern_value(value: &str, extern_dir: &Path) -> String {
         return format!("{name}={}", extern_dir.join(file).display());
     }
     value.to_string()
+}
+
+fn link_paths(cwd: &Path, args: &[String]) -> Vec<(String, PathBuf)> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = if args[index] == "-L" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            args[index].strip_prefix("-L")
+        };
+        if let Some(value) = value {
+            let (kind, path) = value.split_once('=').unwrap_or(("unknown", value));
+            result.push((kind.to_string(), resolve_path(cwd, path)));
+        }
+        index += 1;
+    }
+    result
 }
 
 fn extern_paths(cwd: &Path, args: &[String]) -> HashMap<String, PathBuf> {

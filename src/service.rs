@@ -4,11 +4,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::compile::hash::hex_hash;
 use crate::compile_protocol::{
     APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, PeerId, TaskState,
 };
 use crate::control::ControlPlane;
-use crate::log::{LogLevel, LogStruct};
+use crate::log::{LogLevel, LogStruct, log_task_error};
 use crate::pool;
 use crate::protocol::{SidecarError, WhoamiInfo};
 use crate::state::AppState;
@@ -103,6 +104,12 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                 };
             }
             if let Err(message) = validate_reserve(app, &toolchain_id, &target) {
+                log_task_error(
+                    "remote-provider",
+                    &hex_hash(&task_id.0),
+                    "reserve_rejected",
+                    &message,
+                );
                 return AppResponse::rejected(message);
             }
             let response = app
@@ -115,12 +122,30 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
         }
         AppRequest::TaskReady { task_id, lease_id } => {
             let Some(entry) = app.provider.task_entry(&task_id) else {
+                log_task_error(
+                    "remote-provider",
+                    &hex_hash(&task_id.0),
+                    "task_ready_unknown",
+                    "unknown task",
+                );
                 return AppResponse::error(ErrorCode::NotFound, "unknown task");
             };
             if entry.lease_id != lease_id {
+                log_task_error(
+                    "remote-provider",
+                    &hex_hash(&task_id.0),
+                    "task_ready_lease_mismatch",
+                    "lease does not match task",
+                );
                 return AppResponse::error(ErrorCode::NotFound, "lease does not match task");
             }
             if !matches!(entry.state, TaskState::Queued) {
+                log_task_error(
+                    "remote-provider",
+                    &hex_hash(&task_id.0),
+                    "task_ready_state",
+                    "task is not queued",
+                );
                 return AppResponse::error(ErrorCode::InvalidState, "task is not queued");
             }
             let response = app.provider.task_ready(task_id, lease_id);
@@ -175,9 +200,21 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
             data,
         } => {
             let Some(entry) = app.provider.task_entry(&task_id) else {
+                log_task_error(
+                    "remote-provider",
+                    &hex_hash(&task_id.0),
+                    "blob_put_unknown",
+                    "unknown task",
+                );
                 return AppResponse::error(ErrorCode::NotFound, "unknown task");
             };
             if entry.input_manifest != hash {
+                log_task_error(
+                    "remote-provider",
+                    &hex_hash(&task_id.0),
+                    "blob_put_hash_mismatch",
+                    "bundle hash mismatch",
+                );
                 return AppResponse::rejected("bundle hash mismatch");
             }
 

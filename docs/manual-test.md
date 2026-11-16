@@ -19,7 +19,7 @@ cargo run
 Expected:
 
 - `config.toml` is created next to the binary (or at `NEXUSCOMPILE_CONFIG`).
-- The local socket is created (`NEXUSCOMPILE_SOCKET`, `$XDG_RUNTIME_DIR/nexus-compile.sock`, or `/tmp/nexus-compile-<user>.sock`).
+- The task socket is created (`NEXUSCOMPILE_TASK_SOCKET`, or derived from `NEXUSCOMPILE_SOCKET`).
 - The cache directory is created.
 - The process listens on `127.0.0.1:<port>`.
 
@@ -79,7 +79,6 @@ Expected:
 
 ```bash
 ls -ld /run/nexuscompile
-ls -l /run/nexuscompile/nexus.sock
 ls -l /run/nexuscompile/task.sock
 ```
 
@@ -87,7 +86,7 @@ Expected:
 
 ```text
 drwxrwx--- nexusnet nexusnet /run/nexuscompile
-srw-rw---- nexusnet nexusnet /run/nexuscompile/nexus.sock
+srw-rw---- nexusnet nexusnet /run/nexuscompile/task.sock
 ```
 
 The current session needs the group:
@@ -114,7 +113,7 @@ cargo build   # second build should hit the result cache
 If you are running from a local build instead of the package:
 
 ```bash
-export NEXUSCOMPILE_SOCKET=/run/nexuscompile/nexus.sock
+export NEXUSCOMPILE_TASK_SOCKET=/run/nexuscompile/task.sock
 export CARGO_INCREMENTAL=0
 export RUSTC_WRAPPER=/path/to/NexusCompile/target/release/nexus-rustc
 cargo build

@@ -20,6 +20,7 @@ pub struct ProviderView {
 #[derive(Debug, Default)]
 struct Inner {
     providers: HashMap<PeerId, ProviderView>,
+    cooldowns: HashMap<PeerId, u64>,
 }
 
 /// Consumer role: tracks subscribed providers and their last capacity update.
@@ -93,6 +94,15 @@ impl Consumer {
         AppResponse::Ack
     }
 
+    pub fn cool_down_provider(&self, provider: &PeerId, duration_ms: u64) {
+        let until = now_ms().saturating_add(duration_ms.max(1));
+        self.write().cooldowns.insert(provider.clone(), until);
+    }
+
+    pub fn clear_cooldown(&self, provider: &PeerId) {
+        self.write().cooldowns.remove(provider);
+    }
+
     pub fn remove_provider(&self, provider: &PeerId) {
         self.write().providers.remove(provider);
     }
@@ -113,7 +123,15 @@ impl Consumer {
     }
 
     pub fn providers(&self) -> Vec<ProviderView> {
-        self.read().providers.values().cloned().collect()
+        let now = now_ms();
+        let mut inner = self.write();
+        inner.cooldowns.retain(|_, until| *until > now);
+        inner
+            .providers
+            .iter()
+            .filter(|(provider, _)| !inner.cooldowns.contains_key(*provider))
+            .map(|(_, view)| view.clone())
+            .collect()
     }
 
     pub fn has_provider(&self, provider: &PeerId) -> bool {
@@ -121,10 +139,14 @@ impl Consumer {
     }
 
     pub fn visible_max_slots(&self) -> u32 {
-        self.read()
+        let now = now_ms();
+        let mut inner = self.write();
+        inner.cooldowns.retain(|_, until| *until > now);
+        inner
             .providers
-            .values()
-            .map(|view| view.max_slots)
+            .iter()
+            .filter(|(provider, _)| !inner.cooldowns.contains_key(*provider))
+            .map(|(_, view)| view.max_slots)
             .sum()
     }
 
@@ -188,6 +210,23 @@ mod tests {
         let expired = consumer.expire_providers(now_ms().saturating_add(61_000), 60_000);
         assert_eq!(expired, vec![peer("provider")]);
         assert!(consumer.providers().is_empty());
+    }
+
+    #[test]
+    fn cooldown_hides_provider_and_is_not_reset_by_subscribe() {
+        let consumer = Consumer::new();
+        consumer.record_subscribed(peer("provider"), 4);
+        consumer.cool_down_provider(&peer("provider"), 60_000);
+
+        assert!(consumer.providers().is_empty());
+        assert_eq!(consumer.visible_max_slots(), 0);
+
+        consumer.record_subscribed(peer("provider"), 4);
+        assert!(consumer.providers().is_empty());
+
+        consumer.clear_cooldown(&peer("provider"));
+        assert_eq!(consumer.providers().len(), 1);
+        assert_eq!(consumer.visible_max_slots(), 4);
     }
 
     #[test]

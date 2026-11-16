@@ -5,13 +5,13 @@ mod transfer;
 use crate::compile::bundle::build_bundle;
 use crate::compile::cache::ResultCache;
 use crate::compile::executor;
-use crate::compile::hash::hash_bytes;
+use crate::compile::hash::{hash_bytes, hex_hash};
 use crate::compile::manifest::collect_manifest;
 use crate::compile_protocol::{AppRequest, AppResponse, Hash32, TaskId};
 use crate::config::ServiceConfig;
 use crate::control::{self, ControlHandle};
 use crate::local_protocol::{LocalBody, LocalRequest, LocalResponse};
-use crate::log::{LogLevel, LogStruct};
+use crate::log::{LogLevel, LogStruct, log_task_error};
 use crate::pool::{Consumer, Provider};
 use crate::util::args;
 use crate::util::path::resolve_path;
@@ -21,6 +21,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use transfer::RemoteTransfer;
+
+const DEFAULT_PROVIDER_COOLDOWN_MS: u64 = 30_000;
+const MIN_BUSY_COOLDOWN_MS: u64 = 1_000;
 
 pub struct Coordinator {
     provider: Arc<Provider>,
@@ -116,6 +119,22 @@ impl Coordinator {
         }
     }
 
+    fn cool_down_provider(
+        &self,
+        provider: &crate::compile_protocol::PeerId,
+        task: &str,
+        cooldown_ms: u64,
+        reason: &str,
+    ) {
+        self.consumer.cool_down_provider(provider, cooldown_ms);
+        log_task_error(
+            "remote",
+            task,
+            "provider_cooldown",
+            &format!("provider={provider} cooldown_ms={cooldown_ms} reason={reason}"),
+        );
+    }
+
     async fn try_remote(
         &self,
         request: &LocalRequest,
@@ -124,6 +143,7 @@ impl Coordinator {
         out_dir: &Path,
         env: &HashMap<String, String>,
     ) -> Option<LocalResponse> {
+        let task = hex_hash(&digest);
         let bundle = match build_bundle(Path::new(&request.cwd), &request.args, env, manifest) {
             Ok(bundle) => bundle,
             Err(error) => {
@@ -180,7 +200,10 @@ impl Coordinator {
             )
             .await
             {
-                Ok(AppResponse::Granted { lease_id, .. }) => lease_id,
+                Ok(AppResponse::Granted { lease_id, .. }) => {
+                    self.consumer.clear_cooldown(&provider);
+                    lease_id
+                }
                 Ok(AppResponse::Cached {
                     lease_id, outputs, ..
                 }) => {
@@ -190,6 +213,7 @@ impl Coordinator {
                     {
                         return Some(LocalResponse::error("result_error", error));
                     }
+                    self.consumer.clear_cooldown(&provider);
                     let _ = control::send(
                         &self.control,
                         &self.config.service_name,
@@ -199,17 +223,53 @@ impl Coordinator {
                     .await;
                     return Some(success_response(digest));
                 }
-                Ok(AppResponse::Busy { .. }) | Ok(AppResponse::Rejected { .. }) => continue,
-                Ok(_) | Err(_) => continue,
+                Ok(AppResponse::Busy { retry_after_ms }) => {
+                    let cooldown_ms = retry_after_ms.max(MIN_BUSY_COOLDOWN_MS);
+                    self.cool_down_provider(&provider, &task, cooldown_ms, "reserve_busy");
+                    continue;
+                }
+                Ok(AppResponse::Rejected { code, message }) => {
+                    self.cool_down_provider(
+                        &provider,
+                        &task,
+                        DEFAULT_PROVIDER_COOLDOWN_MS,
+                        &format!("reserve_rejected code={code:?} message={message}"),
+                    );
+                    continue;
+                }
+                Ok(other) => {
+                    self.cool_down_provider(
+                        &provider,
+                        &task,
+                        DEFAULT_PROVIDER_COOLDOWN_MS,
+                        &format!("reserve_unexpected response={other:?}"),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    self.cool_down_provider(
+                        &provider,
+                        &task,
+                        DEFAULT_PROVIDER_COOLDOWN_MS,
+                        &format!("reserve_error message={error}"),
+                    );
+                    continue;
+                }
             };
 
             if let Err(error) = transfer
                 .upload_bundle(&provider, task_id, bundle_hash, &bundle)
                 .await
             {
+                self.cool_down_provider(
+                    &provider,
+                    &task,
+                    DEFAULT_PROVIDER_COOLDOWN_MS,
+                    &format!("upload_error message={error}"),
+                );
                 return Some(LocalResponse::error("upload_error", error));
             }
-            if control::send(
+            match control::send(
                 &self.control,
                 &self.config.service_name,
                 &provider,
@@ -219,9 +279,26 @@ impl Coordinator {
                 },
             )
             .await
-            .is_err()
             {
-                continue;
+                Ok(AppResponse::Ack) => {}
+                Ok(other) => {
+                    self.cool_down_provider(
+                        &provider,
+                        &task,
+                        DEFAULT_PROVIDER_COOLDOWN_MS,
+                        &format!("task_ready_rejected response={other:?}"),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    self.cool_down_provider(
+                        &provider,
+                        &task,
+                        DEFAULT_PROVIDER_COOLDOWN_MS,
+                        &format!("task_ready_error message={}", error.message),
+                    );
+                    continue;
+                }
             }
 
             match transfer
@@ -229,6 +306,7 @@ impl Coordinator {
                 .await
             {
                 RemoteOutcome::Success => {
+                    self.consumer.clear_cooldown(&provider);
                     LogStruct::new(
                         LogLevel::Debug,
                         "远端编译完成",
@@ -238,6 +316,17 @@ impl Coordinator {
                     return Some(success_response(digest));
                 }
                 RemoteOutcome::CompileError(stdout, stderr) => {
+                    LogStruct::new(
+                        LogLevel::Error,
+                        "远端编译失败",
+                        format!(
+                            "source=remote provider={provider} action={} stdout_bytes={} stderr_bytes={}",
+                            hex_hash(&digest),
+                            stdout.len(),
+                            stderr.len()
+                        ),
+                    )
+                    .emit();
                     return Some(LocalResponse::new(LocalBody::Compiled {
                         action_digest: digest,
                         exit_code: 1,
@@ -247,7 +336,15 @@ impl Coordinator {
                         duration_ms: 0,
                     }));
                 }
-                RemoteOutcome::Retry => continue,
+                RemoteOutcome::Retry => {
+                    self.cool_down_provider(
+                        &provider,
+                        &task,
+                        DEFAULT_PROVIDER_COOLDOWN_MS,
+                        "remote_retry",
+                    );
+                    continue;
+                }
             }
         }
         LogStruct::new(LogLevel::Debug, "远端编译", "全部 provider 失败").emit();

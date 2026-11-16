@@ -2,15 +2,17 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 
 use crate::compile::bundle::{TaskBundle, decode_bundle, materialize_bundle};
 use crate::compile::cache::ResultCache;
-use crate::compile::hash::hash_file;
+use crate::compile::hash::{hash_file, hex_hash};
 use crate::compile_protocol::Hash32;
 use crate::config::ConfigHandle;
 use crate::local_protocol::{self, LocalRequest};
@@ -18,13 +20,44 @@ use crate::local_task_protocol::{
     LOCAL_TASK_PROTOCOL_VERSION, LocalTaskRequest, LocalTaskRequestBody, LocalTaskResponse,
     LocalTaskResponseBody,
 };
-use crate::log::{LogLevel, LogStruct};
+use crate::log::{LogLevel, LogStruct, log_task_error};
 use crate::remote::Coordinator;
 use crate::toolchain::resolve_rustc;
 use crate::workspace::Workspace;
 
+const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
+const SOCKET_MODE: u32 = 0o660;
+
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
-    crate::local::bind(path)
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => {
+            fs::remove_file(path)?;
+        }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let listener = UnixListener::bind(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_MODE))?;
+    Ok(listener)
+}
+
+fn prepare_stream(stream: UnixStream) -> io::Result<std::os::unix::net::UnixStream> {
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(SOCKET_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(SOCKET_READ_TIMEOUT))?;
+    Ok(stream)
 }
 
 pub async fn run(
@@ -83,7 +116,7 @@ fn handle_stream(
     config: ConfigHandle,
     handle: Handle,
 ) -> io::Result<()> {
-    let mut stream = crate::local::prepare_stream(stream)?;
+    let mut stream = prepare_stream(stream)?;
     let mut session: Option<Session> = None;
 
     loop {
@@ -216,6 +249,9 @@ fn handle_stream(
                     current.bundle_hash,
                     current.bundle_len,
                 );
+                if let LocalTaskResponseBody::Error { code, message } = &response.body {
+                    log_task_error("local-task", &hex_hash(&current.task_id), code, message);
+                }
                 local_protocol::write_message(&mut stream, &response)?;
                 if matches!(response.body, LocalTaskResponseBody::Done { .. }) {
                     // Keep the task directory until the wrapper acknowledges.
@@ -230,6 +266,7 @@ fn handle_stream(
                     });
                 } else {
                     let _ = fs::remove_dir_all(&current.task_dir);
+                    return Ok(());
                 }
             }
             LocalTaskRequestBody::Output {

@@ -72,15 +72,16 @@ Neither `remove` nor `purge` deletes runtime data under `/var/lib/<pkg>/`, and n
 | `NEXUSCOMPILE_CONFIG` | Configuration file | `/etc/<pkg>/config.toml` |
 | `NEXUSCOMPILE_LOG_PATH` | Log directory | `/var/lib/<pkg>` |
 | `NEXUSCOMPILE_CACHE` | Result cache directory | `$NEXUSCOMPILE_HOME/cache` when unset |
-| `NEXUSCOMPILE_SOCKET` | Local wrapper socket | `/run/<pkg>/nexus.sock` under systemd |
-| `NEXUSCOMPILE_TASK_SOCKET` | Local bundle/task socket | `/run/<pkg>/task.sock` under systemd |
+| `NEXUSCOMPILE_SOCKET` | Compatibility path base for the task socket | `/run/<pkg>/nexus.sock` under systemd |
+| `NEXUSCOMPILE_TASK_SOCKET` | Task socket used by `nexus-rustc` | `/run/<pkg>/task.sock` under systemd |
 | `RUSTUP_HOME` | Private rustup toolchain root | `/var/lib/<pkg>/toolchains/rustup` |
 | `CARGO_HOME` | Private rustup proxy/cargo root | `/var/lib/<pkg>/toolchains/cargo` |
 
 `deploy/service.service` sets `NEXUSCOMPILE_SOCKET=/run/<pkg>/nexus.sock` and uses
-`RuntimeDirectory=<pkg>` with mode `0770`. The socket itself is `0660` and owned by
-`nexusnet:nexusnet`. Users that should use cargo acceleration must be members of the
-`nexusnet` group. `PrivateTmp=true` is kept; the socket is not placed in `/tmp`.
+`RuntimeDirectory=<pkg>` with mode `0770`. The task socket is
+`/run/<pkg>/task.sock`, mode `0660`, owned by `nexusnet:nexusnet`. Users that should
+use cargo acceleration must be members of the `nexusnet` group. `PrivateTmp=true`
+is kept; the socket is not placed in `/tmp`.
 
 The postinst runs a debconf multiselect for the users to accelerate. Selected users are
 added to `nexusnet` and receive a managed `~/.cargo/config.toml`. The question is shown

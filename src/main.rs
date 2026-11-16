@@ -9,7 +9,6 @@ use nexuscompile::compile_protocol::PeerId;
 use nexuscompile::config::{ConfigHandle, ServiceConfig};
 use nexuscompile::connection;
 use nexuscompile::control::new_control_handle;
-use nexuscompile::local;
 use nexuscompile::local_task;
 use nexuscompile::log::{LogLevel, LogStruct};
 use nexuscompile::paths;
@@ -124,40 +123,6 @@ async fn main() -> std::io::Result<()> {
         source,
     ));
 
-    let (local_task, local_socket): (
-        Option<tokio::task::JoinHandle<()>>,
-        Option<std::path::PathBuf>,
-    ) = {
-        let socket = paths::socket_path();
-        match local::bind(&socket) {
-            Ok(listener) => {
-                LogStruct::new(
-                    LogLevel::Important,
-                    "本地编译 socket",
-                    socket.display().to_string(),
-                )
-                .emit();
-                (
-                    Some(tokio::spawn(local::run(
-                        listener,
-                        coordinator.clone(),
-                        tokio::runtime::Handle::current(),
-                    ))),
-                    Some(socket),
-                )
-            }
-            Err(error) => {
-                LogStruct::new(
-                    LogLevel::Warning,
-                    "本地编译 socket 失败",
-                    format!("{}: {error}", socket.display()),
-                )
-                .emit();
-                (None, None)
-            }
-        }
-    };
-
     let (task_service, task_socket): (
         Option<tokio::task::JoinHandle<()>>,
         Option<std::path::PathBuf>,
@@ -222,12 +187,6 @@ async fn main() -> std::io::Result<()> {
     cache_sweep_task.abort();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), pool_task).await;
 
-    if let Some(task) = local_task {
-        task.abort();
-    }
-    if let Some(path) = local_socket {
-        let _ = std::fs::remove_file(path);
-    }
     if let Some(task) = task_service {
         task.abort();
     }

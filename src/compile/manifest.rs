@@ -149,6 +149,11 @@ fn collect_inputs(
         }
     }
 
+    let extern_names = extern_names(args);
+    for (kind, path) in link_paths(cwd, args) {
+        add_dependency_files(&kind, &path, &extern_names, out_dir, &mut inputs)?;
+    }
+
     if let Some(source) = args
         .iter()
         .rev()
@@ -177,6 +182,181 @@ fn add_extern(
     }
     let logical = format!("extern/{name}");
     add_file(&path, &logical, inputs)
+}
+
+fn link_paths(cwd: &Path, args: &[String]) -> Vec<(String, PathBuf)> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = if args[index] == "-L" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            args[index].strip_prefix("-L")
+        };
+        if let Some(value) = value {
+            let (kind, path) = value.split_once('=').unwrap_or(("unknown", value));
+            result.push((kind.to_string(), resolve_path(cwd, path)));
+        }
+        index += 1;
+    }
+    result
+}
+
+fn extern_names(args: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = if args[index] == "--extern" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            args[index].strip_prefix("--extern=")
+        };
+        if let Some(value) = value {
+            let (name, _) = value.split_once('=').unwrap_or((value, value));
+            result.push(name.to_string());
+        }
+        index += 1;
+    }
+    result
+}
+
+fn dependency_closure(
+    out_dir: &Path,
+    externs: &[String],
+) -> Option<std::collections::HashSet<String>> {
+    let profile_dir = out_dir.parent()?;
+    let fingerprint_dir = profile_dir.join(".fingerprint");
+    if !fingerprint_dir.is_dir() {
+        return None;
+    }
+
+    let mut edges = HashMap::<String, Vec<String>>::new();
+    for entry in std::fs::read_dir(&fingerprint_dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let file = file_entry.path();
+            let Some(file_name) = file.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(crate_name) = file_name
+                .strip_prefix("lib-")
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let deps = value
+                .get("deps")
+                .and_then(|value| value.as_array())
+                .map(|deps| {
+                    deps.iter()
+                        .filter_map(|dep| dep.get(1).and_then(|name| name.as_str()))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            edges.insert(crate_name.to_string(), deps);
+        }
+    }
+
+    if edges.is_empty() {
+        return None;
+    }
+
+    let mut closure = std::collections::HashSet::new();
+    let mut queue: Vec<String> = externs.to_vec();
+    while let Some(name) = queue.pop() {
+        if !closure.insert(name.clone()) {
+            continue;
+        }
+        if let Some(deps) = edges.get(&name) {
+            queue.extend(deps.iter().cloned());
+        }
+    }
+    Some(closure)
+}
+
+fn add_dependency_files(
+    kind: &str,
+    path: &Path,
+    externs: &[String],
+    out_dir: &Path,
+    inputs: &mut BTreeMap<String, InputBlob>,
+) -> Result<(), ManifestError> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+    let closure = if kind == "dependency" {
+        dependency_closure(out_dir, externs)
+    } else {
+        None
+    };
+    let mut matched = false;
+    for entry in std::fs::read_dir(path)
+        .map_err(|error| ManifestError::new(format!("read deps {}: {error}", path.display())))?
+    {
+        let entry = entry.map_err(|error| ManifestError::new(error.to_string()))?;
+        let file = entry.path();
+        if !file.is_file() {
+            continue;
+        }
+        let extension = file
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if !matches!(extension, "rmeta" | "rlib" | "so" | "a" | "dylib" | "dll") {
+            continue;
+        }
+        let name = file.file_name().unwrap_or_default().to_string_lossy();
+        if let Some(closure) = &closure {
+            let keep = closure.iter().any(|crate_name| {
+                name.starts_with(&format!("lib{crate_name}-"))
+                    || name.starts_with(&format!("lib{crate_name}."))
+            });
+            if !keep {
+                continue;
+            }
+        }
+        matched = true;
+        let logical = format!("deps/{kind}/{name}");
+        add_file(&file, &logical, inputs)?;
+    }
+
+    if closure.is_some() && !matched {
+        for entry in std::fs::read_dir(path)
+            .map_err(|error| ManifestError::new(format!("read deps {}: {error}", path.display())))?
+        {
+            let entry = entry.map_err(|error| ManifestError::new(error.to_string()))?;
+            let file = entry.path();
+            if !file.is_file() {
+                continue;
+            }
+            let extension = file
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if !matches!(extension, "rmeta" | "rlib" | "so" | "a" | "dylib" | "dll") {
+                continue;
+            }
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            let logical = format!("deps/{kind}/{name}");
+            add_file(&file, &logical, inputs)?;
+        }
+    }
+    Ok(())
 }
 
 fn hash_tree(
@@ -288,6 +468,15 @@ fn canonicalize_args(
             }
         } else if let Some(value) = arg.strip_prefix("--extern=") {
             result.push(format!("--extern={}", canonicalize_extern(value)));
+        } else if arg == "-L" {
+            result.push(arg.clone());
+            if let Some(value) = args.get(index + 1) {
+                result.push(canonicalize_link_path(value));
+                index += 2;
+                continue;
+            }
+        } else if let Some(value) = arg.strip_prefix("-L") {
+            result.push(format!("-L{}", canonicalize_link_path(value)));
         } else {
             let mut value = normalize_path_token(arg, out_dir, "<OUT>");
             if let Some(target_dir) = &target_dir {
@@ -306,6 +495,11 @@ fn canonicalize_extern(value: &str) -> String {
         Some((name, _)) => format!("{name}=<EXTERN>/{name}"),
         None => format!("<EXTERN>/{value}"),
     }
+}
+
+fn canonicalize_link_path(value: &str) -> String {
+    let (kind, _) = value.split_once('=').unwrap_or(("unknown", value));
+    format!("{kind}=<DEPS>/{kind}")
 }
 
 fn canonicalize_env(

@@ -6,14 +6,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use nexuscompile::compile::bundle::build_bundle;
 use nexuscompile::compile::executor;
 use nexuscompile::compile::hash::hash_bytes;
 use nexuscompile::compile::manifest::collect_manifest;
 use nexuscompile::compile_protocol::{Hash32, OutputRef};
-use nexuscompile::local_protocol::{LocalBody, LocalRequest, LocalResponse};
 use nexuscompile::local_task_protocol::{
     LOCAL_TASK_PROTOCOL_VERSION, LocalTaskRequest, LocalTaskRequestBody, LocalTaskResponse,
     LocalTaskResponseBody, TASK_CHUNK_SIZE,
@@ -22,7 +21,6 @@ use nexuscompile::paths;
 use nexuscompile::util::args;
 use nexuscompile::util::path::{resolve_path, safe_join};
 
-const BACKOFF_SECS: u64 = 30;
 const SOCKET_TIMEOUT_SECS: u64 = 3600;
 
 enum TaskOutcome {
@@ -45,44 +43,21 @@ fn main() {
     // already ignores CARGO_MAKEFLAGS.
     env_map.remove("CARGO_MAKEFLAGS");
 
-    if executor::is_supported(&args, &env_map).is_ok() && !backoff_active() {
-        if let Some(outcome) = try_task_socket(&rustc, &args, &env_map) {
-            clear_backoff();
-            match outcome {
-                TaskOutcome::Compiled {
-                    exit_code,
-                    stdout,
-                    stderr,
-                } => {
-                    let _ = io::stdout().write_all(&stdout);
-                    let _ = io::stdout().flush();
-                    let _ = io::stderr().write_all(&stderr);
-                    let _ = io::stderr().flush();
-                    std::process::exit(exit_code);
-                }
+    if executor::is_supported(&args, &env_map).is_ok()
+        && let Some(outcome) = try_task_socket(&rustc, &args, &env_map)
+    {
+        match outcome {
+            TaskOutcome::Compiled {
+                exit_code,
+                stdout,
+                stderr,
+            } => {
+                let _ = io::stdout().write_all(&stdout);
+                let _ = io::stdout().flush();
+                let _ = io::stderr().write_all(&stderr);
+                let _ = io::stderr().flush();
+                std::process::exit(exit_code);
             }
-        }
-
-        match try_local(&rustc, &args, &env_map) {
-            Some(response) => {
-                clear_backoff();
-                match response.body {
-                    LocalBody::Compiled {
-                        exit_code,
-                        stdout,
-                        stderr,
-                        ..
-                    } => {
-                        let _ = io::stdout().write_all(&stdout);
-                        let _ = io::stdout().flush();
-                        let _ = io::stderr().write_all(&stderr);
-                        let _ = io::stderr().flush();
-                        std::process::exit(exit_code);
-                    }
-                    LocalBody::Error { .. } => {}
-                }
-            }
-            None => write_backoff(),
         }
     }
 
@@ -242,57 +217,6 @@ fn download_output(
     fs::set_permissions(&temp, fs::Permissions::from_mode(output.mode)).ok()?;
     fs::rename(&temp, &target).ok()?;
     Some(())
-}
-
-fn try_local(
-    rustc: &std::ffi::OsStr,
-    args: &[String],
-    env_map: &HashMap<String, String>,
-) -> Option<LocalResponse> {
-    let socket = paths::socket_path();
-    let mut stream = UnixStream::connect(socket).ok()?;
-    let cwd = env::current_dir().ok()?;
-    let request = LocalRequest::new(
-        cwd.to_string_lossy(),
-        rustc.to_string_lossy(),
-        args.to_vec(),
-        env_map
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    );
-
-    nexuscompile::local_protocol::write_message(&mut stream, &request).ok()?;
-    nexuscompile::local_protocol::read_message(&mut stream).ok()
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn backoff_active() -> bool {
-    let Ok(text) = fs::read_to_string(paths::backoff_path()) else {
-        return false;
-    };
-    text.trim()
-        .parse::<u64>()
-        .map(|expires| expires > now_secs())
-        .unwrap_or(false)
-}
-
-fn write_backoff() {
-    let path = paths::backoff_path();
-    let expires = now_secs().saturating_add(BACKOFF_SECS);
-    if fs::write(&path, expires.to_string()).is_ok() {
-        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-    }
-}
-
-fn clear_backoff() {
-    let _ = fs::remove_file(paths::backoff_path());
 }
 
 fn exec_rustc(rustc: &std::ffi::OsStr, args: &[String]) -> ! {

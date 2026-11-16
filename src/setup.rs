@@ -9,160 +9,253 @@ use toml_edit::{DocumentMut, Item, Table, value};
 pub const WRAPPER_PATH: &str = "/usr/bin/nexus-rustc";
 pub const DEFAULT_SOCKET: &str = "/run/nexuscompile/nexus.sock";
 
+const MANAGED_SOCKET_PREFIX: &str = "/run/nexuscompile/";
+const BACKUP_SUFFIX: &str = ".nexuscompile.bak";
+const TEMP_SUFFIX: &str = ".nexuscompile.tmp";
+
+const BUILD_TABLE: &str = "build";
+const ENV_TABLE: &str = "env";
+const RUSTC_WRAPPER_KEY: &str = "rustc-wrapper";
+const INCREMENTAL_KEY: &str = "incremental";
+const CARGO_INCREMENTAL_KEY: &str = "CARGO_INCREMENTAL";
+const NEXUSCOMPILE_SOCKET_KEY: &str = "NEXUSCOMPILE_SOCKET";
+
+/// One managed Cargo config command.
+#[derive(Debug)]
+enum CliCommand {
+    SetupUser { config: PathBuf, socket: String },
+    UnsetupUser { config: PathBuf },
+}
+
+impl CliCommand {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::SetupUser { .. } => "setup-user",
+            Self::UnsetupUser { .. } => "unsetup-user",
+        }
+    }
+
+    fn execute(&self) -> io::Result<()> {
+        match self {
+            Self::SetupUser { config, socket } => setup_user(config, socket),
+            Self::UnsetupUser { config } => unsetup_user(config),
+        }
+    }
+}
+
+/// Result of parsing the first CLI argument.
+#[derive(Debug)]
+enum CliParse {
+    NotSetup,
+    MissingConfig(&'static str),
+    Command(CliCommand),
+}
+
 /// Handle `NexusCompile setup-user ...` / `unsetup-user ...`.
 ///
 /// Returns `None` when the arguments are not a setup command so `main` can
 /// continue starting the server.
 pub fn run_cli(args: &[String]) -> Option<i32> {
-    let command = args.first()?.as_str();
-    if command != "setup-user" && command != "unsetup-user" {
-        return None;
-    }
-
-    let Some(config) = flag(args, "--config") else {
-        eprintln!("{command}: missing --config <path>");
-        return Some(2);
-    };
-
-    let result = if command == "setup-user" {
-        let socket = flag(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_string());
-        setup_user(Path::new(&config), &socket).map(|_| ())
-    } else {
-        unsetup_user(Path::new(&config))
-    };
-
-    match result {
-        Ok(()) => Some(0),
-        Err(error) => {
-            eprintln!("{command}: {error}");
-            Some(1)
+    let command = match parse_cli(args) {
+        CliParse::NotSetup => return None,
+        CliParse::MissingConfig(name) => {
+            eprintln!("{name}: missing --config <path>");
+            return Some(2);
         }
+        CliParse::Command(command) => command,
+    };
+
+    Some(match command.execute() {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{}: {error}", command.name());
+            1
+        }
+    })
+}
+
+fn parse_cli(args: &[String]) -> CliParse {
+    match args.first().map(String::as_str) {
+        Some("setup-user") => {
+            let Some(config) = argument_value(args, "--config") else {
+                return CliParse::MissingConfig("setup-user");
+            };
+            let socket =
+                argument_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_owned());
+            CliParse::Command(CliCommand::SetupUser {
+                config: PathBuf::from(config),
+                socket,
+            })
+        }
+        Some("unsetup-user") => {
+            let Some(config) = argument_value(args, "--config") else {
+                return CliParse::MissingConfig("unsetup-user");
+            };
+            CliParse::Command(CliCommand::UnsetupUser {
+                config: PathBuf::from(config),
+            })
+        }
+        _ => CliParse::NotSetup,
     }
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
+/// Return the first value that follows an exact flag match.
+fn argument_value(args: &[String], name: &str) -> Option<String> {
     args.iter()
-        .position(|arg| arg == name)
+        .position(|argument| argument == name)
         .and_then(|index| args.get(index + 1))
         .cloned()
 }
 
-pub fn setup_user(path: &Path, socket: &str) -> io::Result<()> {
-    let mut document = load(path)?;
-    let original_permissions = fs::metadata(path).ok().map(|meta| meta.permissions());
-
-    if path.exists() {
-        backup_once(path)?;
-    }
-
-    {
-        let build = table_mut(&mut document, "build");
-        build["rustc-wrapper"] = value(WRAPPER_PATH);
-        build["incremental"] = value(false);
-
-        let env = table_mut(&mut document, "env");
-        env["CARGO_INCREMENTAL"] = value("0");
-        env["NEXUSCOMPILE_SOCKET"] = value(socket);
-    }
-
-    write_atomic(path, &document.to_string(), original_permissions)
+/// A parsed Cargo config together with its origin path and permissions.
+struct CargoConfigFile {
+    path: PathBuf,
+    document: DocumentMut,
+    permissions: Option<fs::Permissions>,
 }
 
+impl CargoConfigFile {
+    fn load(path: &Path) -> io::Result<Self> {
+        let document = match fs::read_to_string(path) {
+            Ok(content) => content
+                .parse::<DocumentMut>()
+                .map_err(|error| invalid_data(error.to_string()))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => DocumentMut::new(),
+            Err(error) => return Err(error),
+        };
+        let permissions = fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions());
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            document,
+            permissions,
+        })
+    }
+
+    /// Create the one-time backup without overwriting an existing one.
+    fn ensure_backup(&self) -> io::Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+
+        let backup = backup_path(&self.path);
+        if backup.exists() {
+            return Ok(());
+        }
+
+        fs::copy(&self.path, backup)?;
+        Ok(())
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        write_atomic(
+            &self.path,
+            &self.document.to_string(),
+            self.permissions.clone(),
+        )
+    }
+}
+
+/// Install the managed wrapper settings into a user's Cargo config.
+///
+/// `socket` is stored as `NEXUSCOMPILE_SOCKET`; it is the base for the task
+/// socket, not the wrapper socket itself.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, parsed, backed up, or written,
+/// or if an existing `[build]` / `[env]` key is not a table.
+pub fn setup_user(path: &Path, socket: &str) -> io::Result<()> {
+    let mut config = CargoConfigFile::load(path)?;
+    config.ensure_backup()?;
+    apply_managed_settings(&mut config.document, socket)?;
+    config.persist()
+}
+
+/// Remove only the settings installed by [`setup_user`].
+///
+/// Values are removed only when they still match the managed defaults, so user
+/// customizations are preserved.
+///
+/// # Errors
+///
+/// Returns an error if the file exists but cannot be read, parsed, or written.
 pub fn unsetup_user(path: &Path) -> io::Result<()> {
     if !path.exists() {
         return Ok(());
     }
 
-    let mut document = load(path)?;
-    let original_permissions = fs::metadata(path).ok().map(|meta| meta.permissions());
-    let mut changed = false;
-
-    if let Some(build) = document.get_mut("build").and_then(Item::as_table_mut) {
-        if build
-            .get("rustc-wrapper")
-            .and_then(Item::as_str)
-            .is_some_and(|value| value == WRAPPER_PATH)
-        {
-            build.remove("rustc-wrapper");
-            changed = true;
-        }
-        if build
-            .get("incremental")
-            .and_then(Item::as_bool)
-            .is_some_and(|value| !value)
-        {
-            build.remove("incremental");
-            changed = true;
-        }
-        if build.is_empty() {
-            document.remove("build");
-        }
-    }
-
-    if let Some(env) = document.get_mut("env").and_then(Item::as_table_mut) {
-        if env
-            .get("CARGO_INCREMENTAL")
-            .and_then(Item::as_str)
-            .is_some_and(|value| value == "0")
-        {
-            env.remove("CARGO_INCREMENTAL");
-            changed = true;
-        }
-        if env
-            .get("NEXUSCOMPILE_SOCKET")
-            .and_then(Item::as_str)
-            .is_some_and(|value| value.starts_with("/run/nexuscompile/"))
-        {
-            env.remove("NEXUSCOMPILE_SOCKET");
-            changed = true;
-        }
-        if env.is_empty() {
-            document.remove("env");
-        }
-    }
-
-    if changed {
-        write_atomic(path, &document.to_string(), original_permissions)?;
+    let mut config = CargoConfigFile::load(path)?;
+    if clear_managed_settings(&mut config.document) {
+        config.persist()?;
     }
     Ok(())
 }
 
-fn load(path: &Path) -> io::Result<DocumentMut> {
-    match fs::read_to_string(path) {
-        Ok(content) => content
-            .parse::<DocumentMut>()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DocumentMut::new()),
-        Err(error) => Err(error),
+fn apply_managed_settings(document: &mut DocumentMut, socket: &str) -> io::Result<()> {
+    let build = managed_table_mut(document, BUILD_TABLE)?;
+    build[RUSTC_WRAPPER_KEY] = value(WRAPPER_PATH);
+    build[INCREMENTAL_KEY] = value(false);
+
+    let env = managed_table_mut(document, ENV_TABLE)?;
+    env[CARGO_INCREMENTAL_KEY] = value("0");
+    env[NEXUSCOMPILE_SOCKET_KEY] = value(socket);
+    Ok(())
+}
+
+fn clear_managed_settings(document: &mut DocumentMut) -> bool {
+    let mut changed = false;
+
+    if let Some(build) = document.get_mut(BUILD_TABLE).and_then(Item::as_table_mut) {
+        changed |= remove_managed_value(build, RUSTC_WRAPPER_KEY, |item| {
+            item.as_str() == Some(WRAPPER_PATH)
+        });
+        changed |=
+            remove_managed_value(build, INCREMENTAL_KEY, |item| item.as_bool() == Some(false));
+        if build.is_empty() {
+            document.remove(BUILD_TABLE);
+        }
+    }
+
+    if let Some(env) = document.get_mut(ENV_TABLE).and_then(Item::as_table_mut) {
+        changed |= remove_managed_value(env, CARGO_INCREMENTAL_KEY, |item| {
+            item.as_str() == Some("0")
+        });
+        changed |= remove_managed_value(env, NEXUSCOMPILE_SOCKET_KEY, |item| {
+            item.as_str()
+                .is_some_and(|value| value.starts_with(MANAGED_SOCKET_PREFIX))
+        });
+        if env.is_empty() {
+            document.remove(ENV_TABLE);
+        }
+    }
+
+    changed
+}
+
+fn remove_managed_value(table: &mut Table, key: &str, matches: impl FnOnce(&Item) -> bool) -> bool {
+    if table.get(key).is_some_and(matches) {
+        table.remove(key);
+        true
+    } else {
+        false
     }
 }
 
-fn table_mut<'a>(document: &'a mut DocumentMut, name: &str) -> &'a mut Table {
+fn managed_table_mut<'a>(document: &'a mut DocumentMut, name: &str) -> io::Result<&'a mut Table> {
     if !document.contains_key(name) {
         document.insert(name, Item::Table(Table::new()));
     }
+
     document[name]
         .as_table_mut()
-        .expect("managed Cargo config table must be a table")
+        .ok_or_else(|| invalid_data(format!("managed Cargo config key {name:?} must be a table")))
 }
 
-fn backup_once(path: &Path) -> io::Result<()> {
-    let backup = backup_path(path);
-    if backup.exists() {
-        return Ok(());
-    }
-    fs::copy(path, backup)?;
-    Ok(())
-}
-
-fn backup_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    path.with_file_name(format!("{name}.nexuscompile.bak"))
-}
-
+/// Write `content` through a sibling temporary file and atomically replace
+/// `path`, preserving the original permissions when known.
 fn write_atomic(
     path: &Path,
     content: &str,
@@ -174,22 +267,37 @@ fn write_atomic(
         fs::create_dir_all(parent)?;
     }
 
-    let name = path
-        .file_name()
+    let temp = temp_path(path);
+    let result = fs::write(&temp, content)
+        .and_then(|()| match permissions {
+            Some(permissions) => fs::set_permissions(&temp, permissions),
+            None => Ok(()),
+        })
+        .and_then(|()| fs::rename(&temp, path));
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    result
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!("{}{BACKUP_SUFFIX}", file_name(path)))
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(".{}{TEMP_SUFFIX}", file_name(path)))
+}
+
+fn file_name(path: &Path) -> &str {
+    path.file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let temp = path.with_file_name(format!(".{name}.nexuscompile.tmp"));
-    fs::write(&temp, content)?;
-    if let Some(permissions) = permissions {
-        fs::set_permissions(&temp, permissions)?;
-    }
-    match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(error)
-        }
-    }
+        .unwrap_or("config.toml")
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[cfg(test)]
@@ -262,6 +370,139 @@ RUST_BACKTRACE = "1"
         assert!(text.contains("RUST_BACKTRACE"));
         assert!(text.contains("[build]"));
         assert!(text.contains("[env]"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cli_contract() {
+        assert!(matches!(parse_cli(&[]), CliParse::NotSetup));
+        assert!(matches!(parse_cli(&["doctor".into()]), CliParse::NotSetup));
+        assert!(matches!(
+            parse_cli(&["setup-user".into()]),
+            CliParse::MissingConfig("setup-user")
+        ));
+        assert!(matches!(
+            parse_cli(&["unsetup-user".into()]),
+            CliParse::MissingConfig("unsetup-user")
+        ));
+        assert_eq!(run_cli(&["setup-user".into()]), Some(2));
+        assert_eq!(run_cli(&["unsetup-user".into()]), Some(2));
+
+        match parse_cli(&[
+            "setup-user".into(),
+            "--config".into(),
+            "/tmp/config.toml".into(),
+        ]) {
+            CliParse::Command(CliCommand::SetupUser { socket, .. }) => {
+                assert_eq!(socket, DEFAULT_SOCKET);
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        assert!(matches!(
+            parse_cli(&[
+                "unsetup-user".into(),
+                "--config".into(),
+                "/tmp/config.toml".into(),
+            ]),
+            CliParse::Command(CliCommand::UnsetupUser { .. })
+        ));
+    }
+
+    #[test]
+    fn setup_rejects_non_table_section() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        let original = "build = 1\n";
+        fs::write(&path, original).unwrap();
+
+        let error = setup_user(&path, DEFAULT_SOCKET).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn setup_leaves_invalid_toml_untouched() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        let original = "[build\n";
+        fs::write(&path, original).unwrap();
+
+        let error = setup_user(&path, DEFAULT_SOCKET).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!backup_path(&path).exists());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn backup_is_created_once() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        fs::write(&path, "# original\n").unwrap();
+
+        setup_user(&path, DEFAULT_SOCKET).unwrap();
+        let backup = backup_path(&path);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "# original\n");
+
+        fs::write(&path, "# changed\n").unwrap();
+        setup_user(&path, DEFAULT_SOCKET).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "# original\n");
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unsetup_preserves_custom_values() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            r#"[build]
+rustc-wrapper = "/usr/local/bin/other"
+incremental = true
+jobs = 4
+
+[env]
+CARGO_INCREMENTAL = "1"
+NEXUSCOMPILE_SOCKET = "/tmp/custom.sock"
+RUST_BACKTRACE = "1"
+"#,
+        )
+        .unwrap();
+
+        unsetup_user(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("rustc-wrapper = \"/usr/local/bin/other\""));
+        assert!(text.contains("incremental = true"));
+        assert!(text.contains("CARGO_INCREMENTAL = \"1\""));
+        assert!(text.contains("NEXUSCOMPILE_SOCKET = \"/tmp/custom.sock\""));
+        assert!(text.contains("jobs = 4"));
+        assert!(text.contains("RUST_BACKTRACE"));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        fs::write(&path, "# keep\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        setup_user(&path, DEFAULT_SOCKET).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
 
         fs::remove_dir_all(dir).unwrap();
     }

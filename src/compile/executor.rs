@@ -14,7 +14,7 @@ use crate::compile::manifest::collect_manifest;
 use crate::local_protocol::{
     LOCAL_PROTOCOL_VERSION, LocalBody, LocalRequest, LocalResponse, truncate_diagnostic,
 };
-use crate::log::{LogLevel, LogStruct};
+use crate::log::{LogLevel, LogStruct, log_compile_failure};
 use crate::util::args;
 use crate::util::path::resolve_path;
 use crate::util::process;
@@ -122,6 +122,23 @@ pub fn execute_local(
     let exit_code = process::exit_code(output.status);
 
     if exit_code != 0 {
+        log_compile_failure(
+            "local",
+            &hex_hash(&action_digest),
+            &args::value(&request.args, "--crate-name").unwrap_or_default(),
+            &request.rustc,
+            &request.cwd,
+            exit_code,
+            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            &request.args,
+            &env,
+            &output.stdout,
+            &output.stderr,
+            Some(&manifest),
+            None,
+            None,
+            None,
+        );
         let _ = fs::remove_dir_all(&staging);
         return LocalResponse::new(LocalBody::Compiled {
             action_digest,

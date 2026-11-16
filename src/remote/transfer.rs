@@ -84,11 +84,12 @@ impl RemoteTransfer {
                 match response {
                     Ok(AppResponse::TaskStatus { state }) => match state {
                         TaskState::Done { outputs, .. } => {
-                            if let Err(error) = self
+                            if self
                                 .import_outputs(provider, digest, outputs, out_dir)
                                 .await
+                                .is_err()
                             {
-                                return RemoteOutcome::CompileError(Vec::new(), error.into_bytes());
+                                return RemoteOutcome::Retry;
                             }
                             let _ = self
                                 .send(provider, AppRequest::ResultAck { lease_id: lease })

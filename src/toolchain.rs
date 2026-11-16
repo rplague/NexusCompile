@@ -229,7 +229,7 @@ fn check_cache(config: &ServiceConfig) -> Result<(), String> {
 }
 
 fn check_socket() -> Result<(), String> {
-    let socket = paths::socket_path();
+    let socket = paths::task_socket_path();
     let parent = socket
         .parent()
         .ok_or_else(|| format!("socket has no parent: {}", socket.display()))?;

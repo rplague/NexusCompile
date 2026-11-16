@@ -83,7 +83,12 @@ pub async fn ensure_target(
 
     let peers = match control::discover(control, service_name).await {
         Ok(peers) if !peers.is_empty() => {
-            discovery.last_abnormal = false;
+            LogStruct::new(
+                LogLevel::Important,
+                "自动发现结果",
+                format!("service={service_name} peers={}", peers.join(",")),
+            )
+            .emit();
             peers
         }
         Ok(_) => {
@@ -135,8 +140,39 @@ pub async fn ensure_target(
                 visible_capacity = visible_capacity.saturating_add(max_slots);
                 subscribed += 1;
             }
-            Ok(_) | Err(_) => consumer.remove_provider(&peer),
+            Ok(other) => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "订阅失败",
+                    format!("provider={peer} response={other:?}"),
+                )
+                .emit();
+                consumer.remove_provider(&peer);
+            }
+            Err(error) => {
+                LogStruct::new(
+                    LogLevel::Warning,
+                    "订阅失败",
+                    format!("provider={peer} error={error}"),
+                )
+                .emit();
+                consumer.remove_provider(&peer);
+            }
         }
+    }
+    if visible_capacity >= subscription.target_slots {
+        discovery.last_abnormal = false;
+    } else {
+        discovery.last_abnormal = true;
+        LogStruct::new(
+            LogLevel::Warning,
+            "自动发现不足",
+            format!(
+                "service={service_name} visible_slots={} target_slots={} subscribed={subscribed}",
+                visible_capacity, subscription.target_slots
+            ),
+        )
+        .emit();
     }
     subscribed
 }

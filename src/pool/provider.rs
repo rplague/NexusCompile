@@ -14,7 +14,7 @@ use crate::compile_protocol::{
 };
 use crate::config::ServiceConfig;
 use crate::local_protocol::truncate_diagnostic;
-use crate::log::{LogLevel, LogStruct};
+use crate::log::{LogLevel, LogStruct, log_compile_failure};
 use crate::toolchain::resolve_rustc;
 use crate::util::process;
 use crate::util::time::now_ms;
@@ -643,10 +643,31 @@ fn run_task_blocking(
     };
 
     if !output.status.success() {
+        let exit_code = process::exit_code(output.status);
+        let bundle_size = fs::metadata(&bundle_path)
+            .map(|metadata| metadata.len())
+            .ok();
+        log_compile_failure(
+            "provider",
+            &hex_hash(&task_id.0),
+            &bundle.manifest.crate_name,
+            &rustc,
+            &prepared.cwd.to_string_lossy(),
+            exit_code,
+            0,
+            &prepared.args,
+            &prepared.env,
+            &output.stdout,
+            &output.stderr,
+            Some(&bundle.manifest),
+            Some(&bundle_hash),
+            bundle_size,
+            Some(bundle.files.len()),
+        );
         fail(
             &provider,
             ErrorCode::Compile,
-            format!("rustc exited with {}", process::exit_code(output.status)),
+            format!("rustc exited with {exit_code}"),
             truncate_diagnostic(output.stdout),
             truncate_diagnostic(output.stderr),
         );
