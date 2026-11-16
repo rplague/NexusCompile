@@ -30,8 +30,17 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(code);
     }
 
-    let config_handle = ConfigHandle::load_or_create_default();
+    let config_handle = match ConfigHandle::load_or_create_default() {
+        Ok(handle) => handle,
+        Err(error) => {
+            LogStruct::new(LogLevel::Critical, "配置加载失败", error.to_string()).emit();
+            std::process::exit(1);
+        }
+    };
     let config_snapshot = config_handle.snapshot();
+    for warning in config_snapshot.warnings() {
+        LogStruct::new(LogLevel::Warning, "配置警告", warning).emit();
+    }
     let address = format!("127.0.0.1:{}", config_handle.port());
     let listener = TcpListener::bind(&address).await?;
 

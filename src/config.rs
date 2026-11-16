@@ -1,6 +1,7 @@
 use crate::log::{LogLevel, LogStruct};
 use crate::paths;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -147,149 +148,230 @@ impl Default for ServiceConfig {
     }
 }
 
+/// Kind of configuration loading failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigErrorKind {
+    Io,
+    Parse,
+    Invalid,
+}
+
+/// Configuration loading failure that does not terminate the process.
+#[derive(Debug, Clone)]
+pub struct ConfigError {
+    pub kind: ConfigErrorKind,
+    pub message: String,
+}
+
+impl ConfigError {
+    fn new(kind: ConfigErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    fn io(message: impl Into<String>) -> Self {
+        Self::new(ConfigErrorKind::Io, message)
+    }
+
+    fn parse(message: impl Into<String>) -> Self {
+        Self::new(ConfigErrorKind::Parse, message)
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
 impl ServiceConfig {
-    pub fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> ServiceConfig {
+    /// Load a configuration file without terminating the process.
+    ///
+    /// An existing file is read-only: missing fields fall back to defaults in
+    /// memory and are never written back. A missing file is created with
+    /// defaults only when `create_if_missing` is true.
+    pub fn try_from_toml_file(
+        path: impl AsRef<Path>,
+        create_if_missing: bool,
+    ) -> Result<ServiceConfig, ConfigError> {
         let path = path.as_ref();
 
-        if !create_if_missing && !path.exists() {
-            LogStruct::new(LogLevel::Warning, "配置文件不存在，使用默认配置", "").emit();
-            return ServiceConfig::default();
+        match fs::read_to_string(path) {
+            Ok(content) => toml::from_str::<ServiceConfig>(&content).map_err(|error| {
+                ConfigError::parse(format!("parse {}: {error}", path.display()))
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !create_if_missing {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "配置文件不存在，使用默认配置",
+                        path.display().to_string(),
+                    )
+                    .emit();
+                    return Ok(ServiceConfig::default());
+                }
+
+                let config = ServiceConfig::default();
+                config.save_to_file(path)?;
+                LogStruct::new(
+                    LogLevel::Important,
+                    "配置文件已创建",
+                    path.display().to_string(),
+                )
+                .emit();
+                Ok(config)
+            }
+            Err(error) => Err(ConfigError::io(format!(
+                "read {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Serialize this configuration and replace `path` atomically.
+    pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        let serialized = toml::to_string_pretty(self)
+            .map_err(|error| ConfigError::io(format!("serialize config: {error}")))?;
+        write_atomic(path.as_ref(), &serialized)
+    }
+
+    /// Non-fatal configuration warnings. These do not reject the file.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.port == 0 || self.port > u16::MAX as u32 {
+            warnings.push(format!("port 超出范围 1..={}: {}", u16::MAX, self.port));
+        }
+        if self.service_name.trim().is_empty() {
+            warnings.push("service_name 为空".into());
+        }
+        if self.node.max_usage_percent > 100 {
+            warnings.push(format!(
+                "node.max_usage_percent 大于 100: {}",
+                self.node.max_usage_percent
+            ));
+        }
+        if self.node.sample_interval_secs == 0 {
+            warnings.push("node.sample_interval_secs 为 0".into());
+        }
+        if self.subscription.update_interval_secs == 0 {
+            warnings.push("subscription.update_interval_secs 为 0".into());
+        }
+        if self.subscription.ttl_secs == 0 {
+            warnings.push("subscription.ttl_secs 为 0".into());
+        }
+        if self.subscription.target_reevaluate_secs == 0 {
+            warnings.push("subscription.target_reevaluate_secs 为 0".into());
+        }
+        if self.subscription.ttl_secs <= self.subscription.update_interval_secs {
+            warnings.push(format!(
+                "subscription.ttl_secs ({}) 应大于 update_interval_secs ({})",
+                self.subscription.ttl_secs, self.subscription.update_interval_secs
+            ));
+        }
+        if self.subscription.target_reevaluate_secs > self.subscription.ttl_secs {
+            warnings.push(format!(
+                "subscription.target_reevaluate_secs ({}) 大于 ttl_secs ({})",
+                self.subscription.target_reevaluate_secs, self.subscription.ttl_secs
+            ));
         }
 
-        match fs::read_to_string(path) {
-            Ok(content) => match toml::from_str::<ServiceConfig>(&content) {
-                Ok(config) => {
-                    if let Err(error) = rewrite_if_needed(path, &content, &config) {
-                        LogStruct::new(
-                            LogLevel::Warning,
-                            "配置迁移失败，继续使用内存配置",
-                            error.to_string(),
-                        )
-                        .emit();
-                    }
-                    return config;
-                }
-                Err(e) => {
-                    LogStruct::new(LogLevel::Error, "配置文件解析失败", e.to_string()).emit();
-                    if let Err(rename_err) = rename_bad_config(path) {
-                        LogStruct::new(
-                            LogLevel::Critical,
-                            "重命名损坏的配置文件失败",
-                            rename_err.to_string(),
-                        )
-                        .emit();
-                        std::process::exit(1);
-                    }
-                }
-            },
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                LogStruct::new(LogLevel::Critical, "无法读取配置文件", e.to_string()).emit();
-                std::process::exit(1);
+        for entry in &self.node.toolchains {
+            if entry.rustc.trim().is_empty() {
+                warnings.push("node.toolchains[].rustc 为空".into());
             }
         }
 
-        let default_config = ServiceConfig::default();
-        if let Err(error) = write_config(path, &default_config, false) {
-            LogStruct::new(
-                LogLevel::Critical,
-                "写入默认配置文件失败",
-                error.to_string(),
-            )
-            .emit();
-            std::process::exit(1);
-        }
-        default_config
+        warnings
     }
 }
 
-fn rewrite_if_needed(path: &Path, current: &str, config: &ServiceConfig) -> io::Result<()> {
-    let serialized = toml::to_string_pretty(config)
-        .map_err(|error| io::Error::other(format!("序列化配置失败: {error}")))?;
-    if current == serialized {
-        return Ok(());
-    }
-    write_config(path, config, true)
-}
-
-fn write_config(path: &Path, config: &ServiceConfig, backup: bool) -> io::Result<()> {
-    let serialized = toml::to_string_pretty(config)
-        .map_err(|error| io::Error::other(format!("序列化配置失败: {error}")))?;
-
-    if backup && path.exists() {
-        backup_config(path)?;
-    }
-
+fn write_atomic(path: &Path, content: &str) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|error| {
+            ConfigError::io(format!("create {}: {error}", parent.display()))
+        })?;
     }
 
-    let temp = temp_path(path);
-    fs::write(&temp, serialized)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp = path.with_file_name(format!(".{file_name}.tmp"));
+
+    fs::write(&temp, content)
+        .map_err(|error| ConfigError::io(format!("write {}: {error}", temp.display())))?;
+
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = fs::remove_file(&temp);
-            Err(error)
+            Err(ConfigError::io(format!(
+                "rename {}: {error}",
+                path.display()
+            )))
         }
     }
-}
-
-fn backup_config(path: &Path) -> io::Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let mut backup = path.with_file_name(format!("{file_name}.bak"));
-    let mut counter = 1;
-    while backup.exists() {
-        backup = path.with_file_name(format!("{file_name}.bak.{counter}"));
-        counter += 1;
-    }
-    fs::copy(path, backup)?;
-    Ok(())
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    path.with_file_name(format!(".{file_name}.tmp"))
-}
-
-fn rename_bad_config(path: &Path) -> io::Result<()> {
-    let mut backup_path = path.with_extension("bak");
-    let mut counter = 1;
-    while backup_path.exists() {
-        backup_path = path.with_extension(format!("bak.{}", counter));
-        counter += 1;
-    }
-    fs::rename(path, &backup_path)?;
-    Ok(())
 }
 
 #[derive(Clone)]
 pub struct ConfigHandle {
     inner: Arc<RwLock<ServiceConfig>>,
+    path: Option<Arc<PathBuf>>,
 }
 
 impl ConfigHandle {
     pub fn new(config: ServiceConfig) -> Self {
         Self {
             inner: Arc::new(RwLock::new(config)),
+            path: None,
         }
     }
 
-    pub fn from_toml_file(path: impl AsRef<Path>, create_if_missing: bool) -> Self {
-        let config = ServiceConfig::from_toml_file(path, create_if_missing);
-        Self::new(config)
+    pub fn try_from_toml_file(
+        path: impl AsRef<Path>,
+        create_if_missing: bool,
+    ) -> Result<Self, ConfigError> {
+        let path = path.as_ref().to_path_buf();
+        let config = ServiceConfig::try_from_toml_file(&path, create_if_missing)?;
+        Ok(Self {
+            inner: Arc::new(RwLock::new(config)),
+            path: Some(Arc::new(path)),
+        })
     }
 
-    pub fn load_or_create_default() -> Self {
-        Self::from_toml_file(paths::config_path(), true)
+    pub fn load_or_create_default() -> Result<Self, ConfigError> {
+        Self::try_from_toml_file(paths::config_path(), true)
+    }
+
+    /// Re-read the bound file and replace the in-memory config.
+    ///
+    /// Returns an error without touching the current config when the file
+    /// cannot be read or parsed.
+    pub fn reload_from_file(&self) -> Result<(), ConfigError> {
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Err(ConfigError::io(format!(
+                "config file is missing: {}",
+                path.display()
+            )));
+        }
+        let config = ServiceConfig::try_from_toml_file(path.as_path(), false)?;
+        *self.inner.write().expect("RwLock 被污染") = config;
+        Ok(())
+    }
+
+    /// Path this handle was loaded from, if any.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref().map(PathBuf::as_path)
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, ServiceConfig> {
@@ -298,6 +380,12 @@ impl ConfigHandle {
 
     pub fn snapshot(&self) -> ServiceConfig {
         self.read().clone()
+    }
+
+    /// Save a snapshot to an explicit path. Intended for installer CLI use.
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        let snapshot = self.snapshot();
+        snapshot.save_to_file(path)
     }
 
     // ========== Convenience read-only methods ==========
@@ -341,12 +429,10 @@ mod tests {
     }
 
     #[test]
-    fn legacy_config_is_rebuilt_with_new_fields() {
+    fn legacy_fields_are_ignored_without_rewriting() {
         let root = temp_dir();
         let path = root.join("config.toml");
-        fs::write(
-            &path,
-            r#"
+        let original = r#"# keep me
 port = 6100
 
 [node]
@@ -366,11 +452,10 @@ static_peers = ["peer-a"]
 [cache]
 dir = "/tmp/cache"
 result_cache_mb = 128
-"#,
-        )
-        .unwrap();
+"#;
+        fs::write(&path, original).unwrap();
 
-        let config = ServiceConfig::from_toml_file(&path, true);
+        let config = ServiceConfig::try_from_toml_file(&path, true).unwrap();
         assert_eq!(config.port, 6100);
         assert_eq!(config.service_name, "rustc-pool");
         assert_eq!(config.node.max_usage_percent, 80);
@@ -380,17 +465,58 @@ result_cache_mb = 128
         assert_eq!(config.cache.dir, "/tmp/cache");
         assert_eq!(config.cache.result_cache_mb, 128);
 
-        let migrated = fs::read_to_string(&path).unwrap();
-        assert!(migrated.contains("service_name = \"rustc-pool\""));
-        assert!(migrated.contains("max_usage_percent = 80"));
-        assert!(!migrated.contains("cores_per_slot"));
-        assert!(!migrated.contains("mem_per_slot_mb"));
-        assert!(!migrated.contains("reserve_cores"));
-        assert!(!migrated.contains("reserve_mem_mb"));
-        assert!(!migrated.contains("static_peers"));
-        assert!(!migrated.contains("toolchain ="));
-        assert!(!migrated.contains("target ="));
-        assert!(root.join("config.toml.bak").is_file());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!root.join("config.toml.bak").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_file_is_created_only_when_requested() {
+        let root = temp_dir();
+        let path = root.join("config.toml");
+
+        let config = ServiceConfig::try_from_toml_file(&path, false).unwrap();
+        assert_eq!(config.port, 5100);
+        assert!(!path.exists());
+
+        let created = ServiceConfig::try_from_toml_file(&path, true).unwrap();
+        assert_eq!(created.port, 5100);
+        assert!(path.is_file());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_toml_is_a_parse_error_without_rename() {
+        let root = temp_dir();
+        let path = root.join("config.toml");
+        let original = "[node\n";
+        fs::write(&path, original).unwrap();
+
+        let error = ServiceConfig::try_from_toml_file(&path, true).unwrap_err();
+        assert_eq!(error.kind, ConfigErrorKind::Parse);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!root.join("config.toml.bak").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reload_keeps_old_config_on_parse_error() {
+        let root = temp_dir();
+        let path = root.join("config.toml");
+        fs::write(&path, "port = 6100\n").unwrap();
+        let handle = ConfigHandle::try_from_toml_file(&path, true).unwrap();
+        assert_eq!(handle.port(), 6100);
+
+        fs::write(&path, "port = [\n").unwrap();
+        assert!(handle.reload_from_file().is_err());
+        assert_eq!(handle.port(), 6100);
+
+        fs::write(&path, "port = 6200\n").unwrap();
+        handle.reload_from_file().unwrap();
+        assert_eq!(handle.port(), 6200);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -7,7 +7,7 @@
 //!   variables are set (`./config.toml`, `./log`), preserving existing behavior.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Read a non-empty environment variable as a path.
 fn env_path(key: &str) -> Option<PathBuf> {
@@ -27,6 +27,15 @@ pub fn config_path() -> PathBuf {
         return home.join("config.toml");
     }
     PathBuf::from("./config.toml")
+}
+
+/// Directory that holds the configuration file and `config.schema`.
+pub fn config_dir() -> PathBuf {
+    config_path()
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Log directory.

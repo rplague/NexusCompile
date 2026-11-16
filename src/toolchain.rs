@@ -76,6 +76,9 @@ fn doctor(args: &[String]) -> Result<(), String> {
 
     let config_path = config_path.unwrap_or_else(paths::config_path);
     let config = load_service_config(&config_path)?;
+    for warning in config.warnings() {
+        println!("doctor: warning: {warning}");
+    }
 
     for entry in configured_toolchains(&config) {
         let rustc = entry.rustc.trim();
@@ -156,9 +159,10 @@ pub fn resolve_rustc(
 }
 
 fn load_service_config(path: &Path) -> Result<ServiceConfig, String> {
-    let text =
-        fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+    if !path.exists() {
+        return Err(format!("read {}: file not found", path.display()));
+    }
+    ServiceConfig::try_from_toml_file(path, false).map_err(|error| error.to_string())
 }
 
 fn check_rustc(rustc: &str) -> Result<String, String> {
