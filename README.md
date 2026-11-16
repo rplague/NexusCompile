@@ -55,7 +55,9 @@ graph LR
 cargo run
 ```
 
-The first run creates `./config.toml` automatically and listens on `127.0.0.1:{port}` (default port `5100`; it must match the `host`/`port` registered in NexusNet `local_services`).
+The first run creates `./config.toml` when it is missing and listens on `127.0.0.1:{port}` (default port `5100`; it must match the `host`/`port` registered in NexusNet `local_services`).
+
+Existing configuration files are **read-only at runtime**: missing fields fall back to defaults in memory and are never written back. Invalid TOML prevents startup; unknown and legacy keys are preserved and ignored.
 
 Complete default configuration:
 
@@ -67,6 +69,7 @@ service_name = "rustc-pool"
 max_usage_percent = 80
 sample_interval_secs = 1
 rustc = "rustc"
+toolchains = []
 
 [subscription]
 target_slots = 8
@@ -154,6 +157,21 @@ manifest; there are no manual labels.
 |---|---|---|
 | `dir` | `""` | Cache root. When empty, resolves via `NEXUSCOMPILE_CACHE` -> `$NEXUSCOMPILE_HOME/cache` -> `./cache`. |
 | `result_cache_mb` | `512` | Result cache quota (MB). `0` disables the result cache while still allowing compilation. |
+
+### Loading and upgrade behavior
+
+- An existing `config.toml` is never rewritten by the service.
+- Missing fields use defaults in memory; no implicit migration is written.
+- Invalid TOML fails startup instead of renaming or replacing the file.
+- The Debian package records a schema version in `/etc/<pkg>/config.schema` and runs `config-check` on install/upgrade.
+- Legacy keys are ignored and preserved; they are not removed by this version.
+
+Installer-facing commands:
+
+```bash
+NexusCompile config-defaults --config <file>   # write defaults only when missing
+NexusCompile config-check    --config <file>   # parse + warnings; exit 2 on invalid TOML
+```
 
 ## Local compile wrapper
 
@@ -543,7 +561,8 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 |---|---|
 | **main** | Entry point: configuration, listener, accept loop, result-cache setup, graceful shutdown |
 | **state** | Shared `AppState` (provider, consumer, cache, workspace, config, control handle) |
-| **config** | Load/generate `config.toml` and expose `ConfigHandle` |
+| **config** | Read-only `config.toml` loading, warnings, and `ConfigHandle` |
+| **config_cli** | Installer-facing `config-defaults` / `config-check` commands |
 | **paths** | Path resolution anchored by environment variables, with current-directory fallback for local runs |
 | **log** | Leveled logging split into `log/format.rs` and `log/file.rs`: terminal output, file rotation (gz at 10 MB), journald mode |
 | **protocol** | sidecar v2 contract: `Message`, control result payloads, frame encoding/decoding |
@@ -561,10 +580,6 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | **workspace** | Staging and provider task directories |
 | **capacity** | `/proc` sampling and slot calculation |
 | **util** | Shared argument, path, filesystem, process, and time helpers |
-
-## Manual test checklist
-
-See [docs/manual-test.md](docs/manual-test.md) for the two-node/local smoke checklist used before release.
 
 ## Tests
 

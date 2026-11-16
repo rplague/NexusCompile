@@ -17,7 +17,8 @@ Package and binary names are **derived automatically from `Cargo.toml`'s `[packa
 
 | File | Path | Owner/permissions | Description |
 |---|---|---|---|
-| Configuration | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0644` | **Generated automatically on first start** (not shipped in the package) |
+| Configuration | `/etc/<pkg>/config.toml` | `nexusnet:nexusnet 0644` | Created by postinst when missing; **read-only at runtime** |
+| Config schema | `/etc/<pkg>/config.schema` | `nexusnet:nexusnet 0644` | Installer upgrade decision marker |
 | Data/logs | `/var/lib/<pkg>/log` | `nexusnet:nexusnet 0700` | Rotated files (`.gz`) live in the same directory; nothing is written in journald mode |
 | Cache | `/var/lib/<pkg>/cache` | `nexusnet:nexusnet` | Result cache, created on first run |
 | Logs | journald | - | Collected, rotated, compressed, and retained by systemd |
@@ -54,6 +55,11 @@ apt install -y ./<pkg>_<new-version>.deb
 ```
 
 During an upgrade, prerm stops the service and postinst starts it again; configuration and data are preserved.
+The postinst creates `/etc/<pkg>/config.toml` if missing, runs `config-check`, and records the
+package's config schema in `/etc/<pkg>/config.schema`. If the check fails, the service is disabled
+and debconf shows the error instead of starting with an invalid configuration. Existing config files
+are never rewritten by the service: missing fields use defaults in memory, and unknown/legacy keys
+are preserved.
 
 ## Removal
 
