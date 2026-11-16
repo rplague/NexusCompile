@@ -32,10 +32,27 @@ read_package_field() {
     ' "${PROJECT_DIR}/Cargo.toml"
 }
 
+read_schema_field() {
+    awk -v key="$1" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+            if (match($0, /[0-9]+/)) {
+                print substr($0, RSTART, RLENGTH)
+                exit
+            }
+        }
+    ' "${PROJECT_DIR}/config-schema.toml"
+}
+
 NAME="$(read_package_field name)"
 VERSION="$(read_package_field version)"
+CONFIG_SCHEMA="$(read_schema_field current)"
+BREAKING_BELOW="$(read_schema_field breaking_below)"
 [ -n "${NAME}" ] || { echo "[build-deb] 无法从 Cargo.toml 提取包名" >&2; exit 1; }
 [ -n "${VERSION}" ] || { echo "[build-deb] 无法从 Cargo.toml 提取版本" >&2; exit 1; }
+[ -n "${CONFIG_SCHEMA}" ] || { echo "[build-deb] 无法从 config-schema.toml 提取 current" >&2; exit 1; }
+[ -n "${BREAKING_BELOW}" ] || { echo "[build-deb] 无法从 config-schema.toml 提取 breaking_below" >&2; exit 1; }
 
 # Debian package name rules: lowercase letters, digits, '-', '+', '.';
 # uppercase -> lowercase, '_' -> '-'
@@ -52,7 +69,7 @@ BINARY="${PROJECT_DIR}/target/release/${BIN}"
 WRAPPER="${PROJECT_DIR}/target/release/nexus-rustc"
 DEB="${OUT_DIR}/${PKG}_${VERSION}_${ARCH}.deb"
 
-echo "[build-deb] 包名=${PKG} 二进制=${BIN} 版本=${VERSION} 架构=${ARCH}"
+echo "[build-deb] 包名=${PKG} 二进制=${BIN} 版本=${VERSION} 架构=${ARCH} schema=${CONFIG_SCHEMA}"
 
 # Preflight checks
 [ -x "${BINARY}" ] || { echo "[build-deb] 未找到二进制 ${BINARY}，请先: cargo build --release" >&2; exit 1; }
@@ -63,7 +80,9 @@ render() {
     sed -e "s/@PKG@/${PKG}/g" \
         -e "s/@BIN@/${BIN}/g" \
         -e "s/@USER@/${SERVICE_USER}/g" \
-        -e "s/@VERSION@/${VERSION}/g" "$1"
+        -e "s/@VERSION@/${VERSION}/g" \
+        -e "s/@CONFIG_SCHEMA@/${CONFIG_SCHEMA}/g" \
+        -e "s/@BREAKING_BELOW@/${BREAKING_BELOW}/g" "$1"
 }
 
 # Clean and prepare the staging directory

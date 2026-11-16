@@ -23,6 +23,9 @@ use tokio::sync::watch;
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = nexuscompile::config_cli::run_cli(&args) {
+        std::process::exit(code);
+    }
     if let Some(code) = nexuscompile::setup::run_cli(&args) {
         std::process::exit(code);
     }

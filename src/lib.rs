@@ -2,6 +2,7 @@ pub mod capacity;
 pub mod compile;
 pub mod compile_protocol;
 pub mod config;
+pub mod config_cli;
 pub mod connection;
 pub mod control;
 pub mod local_protocol;
