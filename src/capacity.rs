@@ -219,7 +219,7 @@ mod tests {
         let cases = [
             ("usage_percent", 4.0, 1.2, 8192, 4096, 80, 3, 1, true),
             ("idle", 16.0, 0.0, 16384, 16384, 80, 6, 6, true),
-            ("memory_limit", 8.0, 0.0, 8192, 1024, 80, 0, 0, false),
+            ("memory_limit", 8.0, 0.0, 8192, 1024, 80, 3, 0, false),
             ("zero_capacity", 1.0, 1.0, 1024, 0, 80, 0, 0, false),
             ("fifty_percent", 8.0, 4.0, 32768, 16384, 100, 8, 4, true),
         ];

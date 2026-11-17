@@ -405,16 +405,6 @@ mod tests {
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let request: LocalTaskRequest = read_message(&mut server).unwrap();
-            assert!(matches!(request.body, LocalTaskRequestBody::Probe { .. }));
-            write_message(
-                &mut server,
-                &LocalTaskResponse::new(LocalTaskResponseBody::Hit {
-                    outputs: vec![output.clone()],
-                }),
-            )
-            .unwrap();
-
-            let request: LocalTaskRequest = read_message(&mut server).unwrap();
             assert!(matches!(request.body, LocalTaskRequestBody::Output { .. }));
             write_message(
                 &mut server,
@@ -515,6 +505,25 @@ mod tests {
         client.start(Hash32([4; 32]), Hash32([5; 32]), 3).unwrap();
         client.upload_bundle(Hash32([4; 32]), b"abc").unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn task_client_probe_reports_protocol_error() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let request: LocalTaskRequest = read_message(&mut server).unwrap();
+            assert!(matches!(request.body, LocalTaskRequestBody::Probe { .. }));
+            write_message(
+                &mut server,
+                &LocalTaskResponse::error("unavailable", "offline"),
+            )
+            .unwrap();
+        });
+
+        let mut client = TaskSocketClient { stream: client };
+        let error = client.probe(Hash32([7; 32])).unwrap_err();
+        server.join().unwrap();
+        assert!(matches!(error, WrapperError::Protocol(_)));
     }
 
     #[test]
