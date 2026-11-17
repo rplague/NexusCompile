@@ -314,54 +314,47 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incremental_and_unsupported_crate_types() {
+    fn rejects_unsupported_invocations_and_rewrites_out_dir() {
         let mut env = base_env();
         env.insert("CARGO_INCREMENTAL".into(), "1".into());
-        assert!(is_supported(&base_args(), &env).is_err());
+        assert!(is_supported(&base_args(), &env).is_err(), "case: incremental");
 
         let mut args = base_args();
         let index = args.iter().position(|arg| arg == "lib").unwrap();
         args[index] = "bin".into();
-        assert!(is_supported(&args, &base_env()).is_err());
-    }
+        assert!(is_supported(&args, &base_env()).is_err(), "case: crate type");
 
-    #[test]
-    fn rejects_missing_link_or_out_dir() {
         let mut args = base_args();
         args.retain(|arg| arg != "--out-dir" && arg != "/tmp/out");
-        assert!(is_supported(&args, &base_env()).is_err());
+        assert!(is_supported(&args, &base_env()).is_err(), "case: out dir");
 
         let mut args = base_args();
         args.retain(|arg| arg != "--emit=dep-info,metadata,link");
         args.push("--emit=metadata".into());
-        assert!(is_supported(&args, &base_env()).is_err());
-    }
+        assert!(is_supported(&args, &base_env()).is_err(), "case: emit");
 
-    #[test]
-    fn rejects_build_scripts_and_test_invocations() {
         let mut args = base_args();
         let index = args.iter().position(|arg| arg == "demo").unwrap();
         args[index] = "build_script_build".into();
-        assert!(is_supported(&args, &base_env()).is_err());
+        assert!(is_supported(&args, &base_env()).is_err(), "case: build script");
 
         let mut args = base_args();
         args.push("--test".into());
-        assert!(is_supported(&args, &base_env()).is_err());
-    }
+        assert!(is_supported(&args, &base_env()).is_err(), "case: test invocation");
 
-    #[test]
-    fn rewrites_both_out_dir_forms() {
         let staging = Path::new("/tmp/staging/out");
         let args = vec!["--out-dir".into(), "/tmp/real".into()];
         assert_eq!(
             rewrite_out_dir(&args, staging).unwrap(),
-            vec!["--out-dir", "/tmp/staging/out"]
+            vec!["--out-dir", "/tmp/staging/out"],
+            "case: out dir split"
         );
 
         let args = vec!["--out-dir=/tmp/real".into()];
         assert_eq!(
             rewrite_out_dir(&args, staging).unwrap(),
-            vec!["--out-dir=/tmp/staging/out"]
+            vec!["--out-dir=/tmp/staging/out"],
+            "case: out dir joined"
         );
     }
 }

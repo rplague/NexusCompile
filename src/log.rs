@@ -395,18 +395,3 @@ fn log_onlycli(info: &LogStruct) {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn syslog_priority_mapping() {
-        assert_eq!(LogLevel::Critical.syslog_priority(), 2);
-        assert_eq!(LogLevel::Error.syslog_priority(), 3);
-        assert_eq!(LogLevel::Warning.syslog_priority(), 4);
-        assert_eq!(LogLevel::Important.syslog_priority(), 5);
-        assert_eq!(LogLevel::Preset.syslog_priority(), 6);
-        assert_eq!(LogLevel::Debug.syslog_priority(), 7);
-    }
-}

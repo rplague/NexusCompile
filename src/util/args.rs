@@ -10,3 +10,22 @@ pub fn value(args: &[String], flag: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_parsing() {
+        let args = vec![
+            "--crate-name=demo".into(),
+            "--out-dir".into(),
+            "/tmp/out".into(),
+            "--emit".into(),
+            "link".into(),
+        ];
+        assert_eq!(value(&args, "--crate-name").as_deref(), Some("demo"));
+        assert_eq!(value(&args, "--out-dir").as_deref(), Some("/tmp/out"));
+        assert_eq!(value(&args, "--emit").as_deref(), Some("link"));
+    }
+}
