@@ -100,6 +100,9 @@ impl RuntimeHandle {
     }
 
     /// Wait until the server loop exits on its own.
+    ///
+    /// This consumes the stored join handle; a subsequent `shutdown` can still
+    /// signal the runtime but cannot await the same server task again.
     pub async fn wait(&self) {
         let task = self.inner.server_task.lock().await.take();
         if let Some(task) = task {
@@ -191,21 +194,20 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
     ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server_task = tokio::spawn(run_server(
-        listener,
+    let services = RuntimeServices {
         app,
         coordinator,
         cache,
         workspace,
-        config_handle.clone(),
+        config_handle: config_handle.clone(),
         control,
         provider,
         consumer,
         config,
         source,
-        options.task_socket,
-        shutdown_rx,
-    ));
+        task_socket: options.task_socket,
+    };
+    let server_task = tokio::spawn(run_server(listener, services, shutdown_rx));
 
     Ok(RuntimeHandle {
         inner: Arc::new(RuntimeInner {
@@ -217,9 +219,7 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_server(
-    listener: TcpListener,
+struct RuntimeServices {
     app: AppState,
     coordinator: Arc<Coordinator>,
     cache: Arc<ResultCache>,
@@ -231,8 +231,26 @@ async fn run_server(
     config: ServiceConfig,
     source: Box<dyn CapacitySource + Send>,
     task_socket: PathBuf,
+}
+
+async fn run_server(
+    listener: TcpListener,
+    services: RuntimeServices,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let RuntimeServices {
+        app,
+        coordinator,
+        cache,
+        workspace,
+        config_handle,
+        control,
+        provider,
+        consumer,
+        config,
+        source,
+        task_socket,
+    } = services;
     let cache_sweep_task = spawn_cache_sweeper(cache.clone());
     let pool_task = tokio::spawn(pool::run_pool(
         control,
