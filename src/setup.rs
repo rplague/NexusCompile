@@ -303,24 +303,11 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "nexuscompile-setup-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn setup_creates_unique_keys_and_backup() {
-        let dir = temp_dir();
+        let dir = TempDir::new("setup");
         let path = dir.join("config.toml");
         fs::write(&path, "# keep me\n[net]\nretry = 2\n").unwrap();
 
@@ -338,12 +325,11 @@ mod tests {
         assert_eq!(second.matches("rustc-wrapper").count(), 1);
         assert_eq!(second.matches("NEXUSCOMPILE_SOCKET").count(), 1);
 
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn unsetup_removes_only_managed_keys() {
-        let dir = temp_dir();
+        let dir = TempDir::new("setup");
         let path = dir.join("config.toml");
         fs::write(
             &path,
@@ -371,7 +357,6 @@ RUST_BACKTRACE = "1"
         assert!(text.contains("[build]"));
         assert!(text.contains("[env]"));
 
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -412,7 +397,7 @@ RUST_BACKTRACE = "1"
 
     #[test]
     fn setup_rejects_non_table_section() {
-        let dir = temp_dir();
+        let dir = TempDir::new("setup");
         let path = dir.join("config.toml");
         let original = "build = 1\n";
         fs::write(&path, original).unwrap();
@@ -422,12 +407,11 @@ RUST_BACKTRACE = "1"
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn setup_leaves_invalid_toml_untouched() {
-        let dir = temp_dir();
+        let dir = TempDir::new("setup");
         let path = dir.join("config.toml");
         let original = "[build\n";
         fs::write(&path, original).unwrap();
@@ -438,12 +422,11 @@ RUST_BACKTRACE = "1"
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!backup_path(&path).exists());
 
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn backup_is_created_once() {
-        let dir = temp_dir();
+        let dir = TempDir::new("setup");
         let path = dir.join("config.toml");
         fs::write(&path, "# original\n").unwrap();
 
@@ -455,12 +438,11 @@ RUST_BACKTRACE = "1"
         setup_user(&path, DEFAULT_SOCKET).unwrap();
         assert_eq!(fs::read_to_string(&backup).unwrap(), "# original\n");
 
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn unsetup_preserves_custom_values() {
-        let dir = temp_dir();
+        let dir = TempDir::new("setup");
         let path = dir.join("config.toml");
         fs::write(
             &path,
@@ -486,7 +468,6 @@ RUST_BACKTRACE = "1"
         assert!(text.contains("jobs = 4"));
         assert!(text.contains("RUST_BACKTRACE"));
 
-        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -494,7 +475,7 @@ RUST_BACKTRACE = "1"
     fn setup_preserves_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = temp_dir();
+        let dir = TempDir::new("setup");
         let path = dir.join("config.toml");
         fs::write(&path, "# keep\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -504,6 +485,5 @@ RUST_BACKTRACE = "1"
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 
-        fs::remove_dir_all(dir).unwrap();
     }
 }

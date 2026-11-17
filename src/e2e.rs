@@ -130,7 +130,6 @@ mod local_remote {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::compile::cache::ResultCache;
     use crate::compile::executor;
@@ -142,21 +141,8 @@ mod local_remote {
     use crate::remote::Coordinator;
     use crate::workspace::Workspace;
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "nexuscompile-e2e-{tag}-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    fn project(tag: &str) -> (PathBuf, PathBuf, LocalRequest) {
-        let root = temp_dir(tag);
+    fn project(tag: &str) -> (crate::test_support::TempDir, PathBuf, LocalRequest) {
+        let root = crate::test_support::TempDir::new(tag);
         let project = root.join("project");
         let out = project.join("out");
         let generated = project.join("generated");
@@ -223,7 +209,6 @@ mod local_remote {
             other => panic!("expected cached compiled, got {other:?}"),
         }
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -298,6 +283,5 @@ mod local_remote {
         assert!(cache.cached_outputs(&digest).is_some());
         assert_eq!(mock.sent().len(), 3);
 
-        fs::remove_dir_all(root).unwrap();
     }
 }

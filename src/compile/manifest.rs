@@ -625,21 +625,8 @@ fn hex_digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "nexuscompile-manifest-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
 
     fn base_env(root: &Path, out: &Path) -> HashMap<String, String> {
         HashMap::from([
@@ -670,7 +657,7 @@ mod tests {
 
     #[test]
     fn manifest_hashes_package_out_dir_and_extern() {
-        let root = temp_dir();
+        let root = TempDir::new("manifest");
         let out = root.join("out");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("target")).unwrap();
@@ -701,12 +688,11 @@ mod tests {
         assert!(args.contains("<EXTERN>/dep"));
         assert!(!args.contains(&root.display().to_string()));
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn digest_changes_when_source_changes() {
-        let root = temp_dir();
+        let root = TempDir::new("manifest");
         let out = root.join("out");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(&out).unwrap();
@@ -719,7 +705,6 @@ mod tests {
         let second = collect(&root, &out, &extern_path).digest().unwrap();
         assert_ne!(first, second);
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

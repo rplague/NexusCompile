@@ -464,20 +464,7 @@ fn write_manifest(root: &Path, manifest: &CachedManifest) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "nexuscompile-cache-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::test_support::TempDir;
 
     fn cache(root: &Path, max_bytes: u64) -> ResultCache {
         ResultCache::open(root, max_bytes).unwrap()
@@ -496,7 +483,7 @@ mod tests {
 
     #[test]
     fn store_and_materialize_cache_hit() {
-        let root = temp_dir();
+        let root = TempDir::new("cache");
         let cache = cache(&root, 10 * 1024 * 1024);
         let digest = store_payload(&cache, 1, b"compiled bytes");
 
@@ -508,12 +495,11 @@ mod tests {
             b"compiled bytes"
         );
         assert!(cache.total_bytes() > 0);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn ttl_survives_reopen_and_resets() {
-        let root = temp_dir();
+        let root = TempDir::new("cache");
         let digest = {
             let cache = cache(&root, 10 * 1024 * 1024);
             store_payload(&cache, 2, b"persistent")
@@ -524,12 +510,11 @@ mod tests {
                 .lookup_and_materialize(&digest, &root.join("out2"))
                 .is_some()
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn respects_quota_and_evicts_unpinned_entries() {
-        let root = temp_dir();
+        let root = TempDir::new("cache");
         let cache = cache(&root, 10);
         let first = store_payload(&cache, 3, b"123456");
         let second = store_payload(&cache, 4, b"abcdef");
@@ -542,12 +527,11 @@ mod tests {
         .flatten()
         .count();
         assert_eq!(hits, 1);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn cached_outputs_peek_validates_blobs() {
-        let root = temp_dir();
+        let root = TempDir::new("cache");
         let cache = cache(&root, 10 * 1024 * 1024);
         let digest = store_payload(&cache, 6, b"peek");
 
@@ -569,12 +553,11 @@ mod tests {
                 .lookup_and_materialize(&digest, &root.join("out"))
                 .is_none()
         );
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn pinned_entry_survives_quota_eviction() {
-        let root = temp_dir();
+        let root = TempDir::new("cache");
         let cache = cache(&root, 10);
         let pinned = store_payload(&cache, 7, b"123456");
         assert!(cache.pin(&pinned));
@@ -597,12 +580,11 @@ mod tests {
         .count();
         assert!(hits <= 1);
         assert!(cache.total_bytes() <= 10);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn unsafe_output_path_is_rejected() {
-        let root = temp_dir();
+        let root = TempDir::new("cache");
         let cache = cache(&root, 10 * 1024 * 1024);
         let workspace = crate::workspace::Workspace::new(cache.root());
         let staging = workspace.staging_dir(&Hash32([9; 32])).unwrap();
@@ -613,12 +595,11 @@ mod tests {
             mode: 0o644,
         }];
         assert!(cache.materialize_outputs(&outputs, &staging).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn missing_blob_invalidates_entry() {
-        let root = temp_dir();
+        let root = TempDir::new("cache");
         let cache = cache(&root, 10 * 1024 * 1024);
         let digest = store_payload(&cache, 5, b"gone");
         let blobs: Vec<PathBuf> = fs::read_dir(cache.cas.blobs_dir())
@@ -634,6 +615,5 @@ mod tests {
                 .lookup_and_materialize(&digest, &root.join("out5"))
                 .is_none()
         );
-        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -54,24 +54,11 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "nexuscompile-workspace-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn staging_and_task_dirs_are_separate() {
-        let root = temp_dir();
+        let root = TempDir::new("workspace");
         let workspace = Workspace::new(&root);
         let digest = Hash32([1; 32]);
         let staging = workspace.staging_dir(&digest).unwrap();
@@ -81,6 +68,5 @@ mod tests {
         assert_ne!(staging, task);
         workspace.remove_task_dir(&digest);
         assert!(!task.exists());
-        fs::remove_dir_all(root).unwrap();
     }
 }

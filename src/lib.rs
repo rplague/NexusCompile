@@ -23,3 +23,5 @@ pub mod workspace;
 
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod test_support;

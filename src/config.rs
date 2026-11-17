@@ -393,20 +393,7 @@ impl ConfigHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "nexuscompile-config-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn legacy_port_only_config_uses_defaults() {
@@ -425,7 +412,7 @@ mod tests {
 
     #[test]
     fn legacy_fields_are_ignored_without_rewriting() {
-        let root = temp_dir();
+        let root = TempDir::new("config");
         let path = root.join("config.toml");
         let original = r#"# keep me
 port = 6100
@@ -463,12 +450,11 @@ result_cache_mb = 128
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!root.join("config.toml.bak").exists());
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn missing_file_is_created_only_when_requested() {
-        let root = temp_dir();
+        let root = TempDir::new("config");
         let path = root.join("config.toml");
 
         let config = ServiceConfig::try_from_toml_file(&path, false).unwrap();
@@ -479,12 +465,11 @@ result_cache_mb = 128
         assert_eq!(created.port, 5100);
         assert!(path.is_file());
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn invalid_toml_is_a_parse_error_without_rename() {
-        let root = temp_dir();
+        let root = TempDir::new("config");
         let path = root.join("config.toml");
         let original = "[node\n";
         fs::write(&path, original).unwrap();
@@ -494,12 +479,11 @@ result_cache_mb = 128
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!root.join("config.toml.bak").exists());
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn reload_keeps_old_config_on_parse_error() {
-        let root = temp_dir();
+        let root = TempDir::new("config");
         let path = root.join("config.toml");
         fs::write(&path, "port = 6100\n").unwrap();
         let handle = ConfigHandle::try_from_toml_file(&path, true).unwrap();
@@ -513,7 +497,6 @@ result_cache_mb = 128
         handle.reload_from_file().unwrap();
         assert_eq!(handle.port(), 6200);
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

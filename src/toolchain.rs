@@ -446,24 +446,11 @@ fn run(command: &mut Command) -> Result<Output, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = env::temp_dir().join(format!(
-            "nexuscompile-toolchain-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::test_support::TempDir;
 
     #[test]
     fn configure_preserves_existing_content() {
-        let root = temp_dir();
+        let root = TempDir::new("toolchain");
         let path = root.join("config.toml");
         fs::write(
             &path,
@@ -486,12 +473,11 @@ mod tests {
         assert!(text.contains("rustc = \"/opt/rust/bin/rustc\""));
         assert_eq!(text.matches("rustc =").count(), 1);
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn configure_creates_node_table() {
-        let root = temp_dir();
+        let root = TempDir::new("toolchain");
         let path = root.join("config.toml");
 
         configure(&[
@@ -506,12 +492,11 @@ mod tests {
         assert!(text.contains("[node]"));
         assert!(text.contains("rustc = \"/opt/rust/bin/rustc\""));
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn configure_toolchains_writes_registry() {
-        let root = temp_dir();
+        let root = TempDir::new("toolchain");
         let config = root.join("config.toml");
         let state = root.join("state");
         fs::write(
@@ -536,16 +521,14 @@ mod tests {
         assert_eq!(parsed.node.toolchains[1].channel, "1.99.0");
         assert!(parsed.node.toolchains[1].target.is_empty());
 
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn state_rejects_malformed_lines() {
-        let root = temp_dir();
+        let root = TempDir::new("toolchain");
         let state = root.join("state");
         fs::write(&state, "stable|/opt/stable/bin/rustc\n").unwrap();
         assert!(read_toolchain_state(&state).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
