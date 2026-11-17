@@ -2,10 +2,8 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::log::{LogLevel, LogStruct};
-
-use super::error::ConfigError;
-use super::model::ServiceConfig;
+use super::ConfigError;
+use super::ServiceConfig;
 
 /// Result of loading a configuration file.
 #[derive(Debug, Clone)]
@@ -55,29 +53,12 @@ impl ServiceConfig {
         }
     }
 
-    /// Load a configuration file, logging missing/default creation outcomes.
+    /// Load a configuration file without logging side effects.
     pub fn try_from_toml_file(
         path: impl AsRef<Path>,
         create_if_missing: bool,
     ) -> Result<ServiceConfig, ConfigError> {
-        let path = path.as_ref();
-        let loaded = Self::load_or_create(path, create_if_missing)?;
-        if loaded.created {
-            LogStruct::new(
-                LogLevel::Important,
-                "配置文件已创建",
-                path.display().to_string(),
-            )
-            .emit();
-        } else if loaded.missing {
-            LogStruct::new(
-                LogLevel::Warning,
-                "配置文件不存在，使用默认配置",
-                path.display().to_string(),
-            )
-            .emit();
-        }
-        Ok(loaded.config)
+        Self::load_or_create(path, create_if_missing).map(|loaded| loaded.config)
     }
 
     /// Serialize this configuration and replace `path` atomically.
@@ -87,5 +68,13 @@ impl ServiceConfig {
             .map_err(|error| ConfigError::io(format!("serialize config: {error}")))?;
         crate::util::fs::write_atomic(path, serialized.as_bytes(), None)
             .map_err(|error| ConfigError::io(format!("write {}: {error}", path.display())))
+    }
+
+    /// Serialize this configuration and create `path` only if it is absent.
+    pub fn save_to_new_file(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+        let serialized = toml::to_string_pretty(self)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        crate::util::fs::write_atomic_new(path, serialized.as_bytes(), None)
     }
 }
