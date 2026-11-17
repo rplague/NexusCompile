@@ -8,105 +8,82 @@ use std::time::Instant;
 
 use walkdir::WalkDir;
 
+use crate::compile::bundle::TaskJob;
 use crate::compile::cache::ResultCache;
 use crate::compile::hash::hex_hash;
-use crate::compile::manifest::collect_manifest;
-use crate::local_protocol::{
-    LOCAL_PROTOCOL_VERSION, LocalBody, LocalRequest, LocalResponse, truncate_diagnostic,
-};
+use crate::compile::{TaskError, TaskResult, TaskSource};
 use crate::log::{LogLevel, LogStruct, log_compile_failure};
 use crate::util::args;
-use crate::util::path::resolve_path;
 use crate::util::process;
 use crate::workspace::Workspace;
 
-pub fn execute_local(
-    request: &LocalRequest,
+/// Execute one validated, materialized task.
+pub fn execute_job(
+    job: &TaskJob,
+    rustc: &str,
     cache: &ResultCache,
     workspace: &Workspace,
-) -> LocalResponse {
-    if request.v != LOCAL_PROTOCOL_VERSION {
-        return LocalResponse::error(
-            "unsupported_version",
-            format!("unsupported local protocol version {}", request.v),
-        );
+    source: TaskSource,
+) -> Result<TaskResult, TaskError> {
+    if let Err(reason) = is_supported(&job.prepared.args, &job.prepared.env) {
+        return Err(TaskError::new("unsupported", reason));
     }
 
-    let env: HashMap<String, String> = request.env.iter().cloned().collect();
-    if let Err(reason) = is_supported(&request.args, &env) {
-        return LocalResponse::error("unsupported", reason);
-    }
-
-    let cwd = Path::new(&request.cwd);
-    let rustc = Path::new(&request.rustc);
-    let out_dir = match args::value(&request.args, "--out-dir") {
-        Some(value) => resolve_path(cwd, &value),
-        None => return LocalResponse::error("unsupported", "missing --out-dir"),
-    };
-
-    let manifest = match collect_manifest(cwd, rustc, &request.args, &env) {
-        Ok(manifest) => manifest,
-        Err(error) => return LocalResponse::error("manifest_error", error.to_string()),
-    };
-    let action_digest = match manifest.digest() {
-        Ok(digest) => digest,
-        Err(error) => return LocalResponse::error("manifest_error", error.to_string()),
-    };
-
-    let digest_prefix = &hex_hash(&action_digest)[..8];
-    if cache
-        .lookup_and_materialize(&action_digest, &out_dir)
-        .is_some()
-    {
+    let digest_prefix = &hex_hash(&job.task_id)[..8];
+    if let Some(cached) = cache.lookup_and_materialize(&job.task_id, &job.prepared.out_dir) {
         LogStruct::new(
             LogLevel::Debug,
             "缓存命中",
             format!("action={digest_prefix}"),
         )
         .emit();
-        return LocalResponse::new(LocalBody::Compiled {
-            action_digest,
+        return Ok(TaskResult {
+            action_digest: job.task_id,
             exit_code: 0,
             cache_hit: true,
             stdout: Vec::new(),
             stderr: Vec::new(),
             duration_ms: 0,
+            outputs: cached.outputs,
         });
     }
 
-    let staging = match workspace.staging_dir(&action_digest) {
-        Ok(staging) => staging,
-        Err(error) => return LocalResponse::error("cache_error", error.to_string()),
-    };
+    let staging = workspace
+        .staging_dir(&job.task_id)
+        .map_err(|error| TaskError::new("cache_error", error.to_string()))?;
     let staging_out = staging.join("out");
     if let Err(error) = fs::create_dir_all(&staging_out) {
         let _ = fs::remove_dir_all(&staging);
-        return LocalResponse::error("cache_error", error.to_string());
+        return Err(TaskError::new("cache_error", error.to_string()));
     }
 
-    let exec_args = match rewrite_out_dir(&request.args, &staging_out) {
+    let exec_args = match rewrite_out_dir(&job.prepared.args, &staging_out) {
         Some(args) => args,
         None => {
             let _ = fs::remove_dir_all(&staging);
-            return LocalResponse::error("unsupported", "unable to rewrite --out-dir");
+            return Err(TaskError::new("unsupported", "unable to rewrite --out-dir"));
         }
     };
 
     let started = Instant::now();
+    let topic = match source {
+        TaskSource::Local => "本地编译",
+        TaskSource::Provider => "远端编译",
+    };
     LogStruct::new(
         LogLevel::Debug,
-        "本地编译",
+        topic,
         format!(
             "action={digest_prefix}, crate={}",
-            args::value(&request.args, "--crate-name").unwrap_or_default()
+            args::value(&job.prepared.args, "--crate-name").unwrap_or_default()
         ),
     )
     .emit();
 
-    let output = Command::new(&request.rustc)
+    let output = Command::new(rustc)
         .args(&exec_args)
-        .current_dir(cwd)
-        .envs(&env)
+        .current_dir(&job.prepared.cwd)
+        .envs(&job.prepared.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -116,74 +93,86 @@ pub fn execute_local(
         Ok(output) => output,
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
-            return LocalResponse::error("spawn_error", error.to_string());
+            return Err(TaskError::new("spawn_error", error.to_string()));
         }
     };
     let exit_code = process::exit_code(output.status);
+    let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
     if exit_code != 0 {
         log_compile_failure(
-            "local",
-            &hex_hash(&action_digest),
-            &args::value(&request.args, "--crate-name").unwrap_or_default(),
-            &request.rustc,
-            &request.cwd,
+            source.as_str(),
+            &hex_hash(&job.task_id),
+            &job.manifest.crate_name,
+            rustc,
+            &job.prepared.cwd.to_string_lossy(),
             exit_code,
-            started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            &request.args,
-            &env,
+            duration_ms,
+            &job.prepared.args,
+            &job.prepared.env,
             &output.stdout,
             &output.stderr,
-            Some(&manifest),
-            None,
-            None,
-            None,
+            Some(&job.manifest),
+            Some(&job.bundle_hash),
+            Some(job.bundle_size),
+            Some(job.bundle.files.len()),
         );
         let _ = fs::remove_dir_all(&staging);
-        return LocalResponse::new(LocalBody::Compiled {
-            action_digest,
+        return Ok(TaskResult {
+            action_digest: job.task_id,
             exit_code,
             cache_hit: false,
             stdout: truncate_diagnostic(output.stdout),
             stderr: truncate_diagnostic(output.stderr),
-            duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            duration_ms,
+            outputs: Vec::new(),
         });
     }
 
-    if let Err(error) = rewrite_dep_info_files(&staging_out, &out_dir) {
+    if let Err(error) = rewrite_dep_info_files(&staging_out, &job.prepared.out_dir) {
         let _ = fs::remove_dir_all(&staging);
-        return LocalResponse::error("output_error", error.to_string());
+        return Err(TaskError::new("output_error", error.to_string()));
     }
 
     let outputs = match cache.collect_outputs(&staging_out) {
-        Ok(outputs) => outputs,
+        Ok(outputs) if !outputs.is_empty() => outputs,
+        Ok(_) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(TaskError::new("output_error", "rustc produced no outputs"));
+        }
         Err(error) => {
             let _ = fs::remove_dir_all(&staging);
-            return LocalResponse::error("output_error", error.to_string());
+            return Err(TaskError::new("output_error", error.to_string()));
         }
     };
 
-    if outputs.is_empty() {
+    if let Err(error) = cache.materialize_outputs(&outputs, &job.prepared.out_dir) {
         let _ = fs::remove_dir_all(&staging);
-        return LocalResponse::error("output_error", "rustc produced no outputs");
+        return Err(TaskError::new("output_error", error.to_string()));
     }
 
-    if let Err(error) = cache.materialize_outputs(&outputs, &out_dir) {
-        let _ = fs::remove_dir_all(&staging);
-        return LocalResponse::error("output_error", error.to_string());
-    }
-
-    let _ = cache.store(action_digest, outputs);
+    let _ = cache.store(job.task_id, outputs.clone());
     let _ = fs::remove_dir_all(&staging);
 
-    LocalResponse::new(LocalBody::Compiled {
-        action_digest,
+    Ok(TaskResult {
+        action_digest: job.task_id,
         exit_code: 0,
         cache_hit: false,
         stdout: truncate_diagnostic(output.stdout),
         stderr: truncate_diagnostic(output.stderr),
-        duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        duration_ms,
+        outputs,
     })
+}
+
+pub fn truncate_diagnostic(mut bytes: Vec<u8>) -> Vec<u8> {
+    const MAX_DIAGNOSTIC: usize = 6 << 20;
+    if bytes.len() <= MAX_DIAGNOSTIC {
+        return bytes;
+    }
+    bytes.truncate(MAX_DIAGNOSTIC);
+    bytes.extend_from_slice(b"\n[nexus-compile: output truncated]\n");
+    bytes
 }
 
 /// Check whether this rustc invocation is supported by the local executor.

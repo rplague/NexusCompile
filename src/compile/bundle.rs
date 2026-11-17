@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compile::TaskError;
+use crate::compile::hash::hash_file;
 use crate::compile::manifest::ActionManifest;
+use crate::compile_protocol::Hash32;
 use crate::util::args;
 use crate::util::fs::{file_mode, set_mode};
 use crate::util::path::{resolve_path, safe_relative};
@@ -143,6 +146,72 @@ pub struct PreparedTask {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub out_dir: PathBuf,
+}
+
+/// A fully validated and materialized task.
+#[derive(Debug)]
+pub struct TaskJob {
+    pub task_id: Hash32,
+    pub bundle_hash: Hash32,
+    pub bundle_size: u64,
+    pub bundle_bytes: Vec<u8>,
+    pub manifest: ActionManifest,
+    pub bundle: TaskBundle,
+    pub prepared: PreparedTask,
+}
+
+impl TaskJob {
+    pub fn from_bundle_file(
+        bundle_path: &Path,
+        task_id: Hash32,
+        bundle_hash: Hash32,
+        bundle_len: u64,
+        work: &Path,
+    ) -> Result<Self, TaskError> {
+        let metadata = fs::metadata(bundle_path)
+            .map_err(|error| TaskError::new("bundle_error", format!("read bundle: {error}")))?;
+        if metadata.len() != bundle_len {
+            return Err(TaskError::new("bundle_error", "bundle size mismatch"));
+        }
+        let (actual_hash, _) = hash_file(bundle_path)
+            .map_err(|error| TaskError::new("bundle_error", format!("hash bundle: {error}")))?;
+        if actual_hash != bundle_hash {
+            return Err(TaskError::new("bundle_error", "bundle hash mismatch"));
+        }
+        let bytes = fs::read(bundle_path)
+            .map_err(|error| TaskError::new("bundle_error", format!("read bundle: {error}")))?;
+        let bundle_bytes = bytes.clone();
+        let bundle =
+            decode_bundle(&bytes).map_err(|error| TaskError::new("bundle_error", error))?;
+        let digest = bundle
+            .manifest
+            .digest()
+            .map_err(|error| TaskError::new("manifest_error", error.to_string()))?;
+        if digest != task_id {
+            return Err(TaskError::new("manifest_error", "manifest digest mismatch"));
+        }
+        let work_out = work.join("out");
+        let work_extern = work.join("extern");
+        fs::create_dir_all(work)
+            .and_then(|_| materialize_bundle(&bundle, work))
+            .and_then(|_| fs::create_dir_all(&work_out))
+            .and_then(|_| fs::create_dir_all(&work_extern))
+            .and_then(|_| fs::create_dir_all(work.join("target")))
+            .map_err(|error| {
+                TaskError::new("bundle_error", format!("materialize bundle: {error}"))
+            })?;
+        let prepared =
+            prepare_task(&bundle, work).map_err(|error| TaskError::new("bundle_error", error))?;
+        Ok(Self {
+            task_id,
+            bundle_hash,
+            bundle_size: bundle_len,
+            bundle_bytes,
+            manifest: bundle.manifest.clone(),
+            bundle,
+            prepared,
+        })
+    }
 }
 
 pub fn prepare_task(bundle: &TaskBundle, work: &Path) -> Result<PreparedTask, String> {
@@ -426,5 +495,30 @@ mod tests {
         ciborium::ser::into_writer(&bundle(BUNDLE_SCHEMA + 1, "pkg/src/lib.rs"), &mut bytes)
             .unwrap();
         assert!(decode_bundle(&bytes).is_err(), "case: unsupported schema");
+    }
+    #[test]
+    fn task_job_validates_bundle_identity() {
+        let root = TempDir::new("task-job");
+        let bundle = bundle(BUNDLE_SCHEMA, "pkg/src/lib.rs");
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&bundle, &mut bytes).unwrap();
+        let bundle_path = root.join("bundle");
+        fs::write(&bundle_path, &bytes).unwrap();
+        let task_id = bundle.manifest.digest().unwrap();
+        let hash = crate::compile::hash::hash_bytes(&bytes);
+        let len = bytes.len() as u64;
+        let work = root.join("work");
+
+        let job = TaskJob::from_bundle_file(&bundle_path, task_id, hash, len, &work).unwrap();
+        assert_eq!(job.task_id, task_id);
+        assert_eq!(job.bundle_bytes, bytes);
+
+        let error = TaskJob::from_bundle_file(&bundle_path, task_id, Hash32([9; 32]), len, &work)
+            .unwrap_err();
+        assert_eq!(error.code, "bundle_error");
+
+        let error =
+            TaskJob::from_bundle_file(&bundle_path, task_id, hash, len + 1, &work).unwrap_err();
+        assert_eq!(error.code, "bundle_error");
     }
 }

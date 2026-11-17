@@ -13,17 +13,19 @@ mod local_remote {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use crate::compile::TaskSource;
+    use crate::compile::bundle::{TaskJob, build_bundle};
     use crate::compile::cache::ResultCache;
     use crate::compile::executor;
+    use crate::compile::hash::{hash_bytes, hash_file};
     use crate::compile::manifest::collect_manifest;
     use crate::compile_protocol::{LeaseId, OutputRef, TaskId};
     use crate::config::ServiceConfig;
-    use crate::local_protocol::{LocalBody, LocalRequest};
     use crate::pool::{Consumer, Provider};
     use crate::remote::Coordinator;
     use crate::workspace::Workspace;
 
-    fn project(tag: &str) -> (crate::test_support::TempDir, PathBuf, LocalRequest) {
+    fn project(tag: &str) -> (crate::test_support::TempDir, PathBuf, TaskJob) {
         let root = crate::test_support::TempDir::new(tag);
         let project = root.join("project");
         let out = project.join("out");
@@ -46,68 +48,57 @@ mod local_remote {
             "--emit=dep-info,metadata,link".into(),
             project.join("src/lib.rs").display().to_string(),
         ];
-        let env = vec![
+        let env = HashMap::from([
             ("CARGO_MANIFEST_DIR".into(), project.display().to_string()),
             ("OUT_DIR".into(), generated.display().to_string()),
             ("TARGET".into(), "x86_64-unknown-linux-gnu".into()),
             ("PROFILE".into(), "debug".into()),
             ("CARGO_INCREMENTAL".into(), "0".into()),
-        ];
-        let request = LocalRequest::new(project.display().to_string(), "rustc", args, env);
-        (root, cache, request)
+        ]);
+        let manifest = collect_manifest(&project, Path::new("rustc"), &args, &env).unwrap();
+        let task_id = manifest.digest().unwrap();
+        let bundle = build_bundle(&project, &args, &env, &manifest).unwrap();
+        let bundle_path = root.join("bundle");
+        fs::write(&bundle_path, &bundle).unwrap();
+        let bundle_hash = hash_bytes(&bundle);
+        let (_, bundle_len) = hash_file(&bundle_path).unwrap();
+        let job = TaskJob::from_bundle_file(
+            &bundle_path,
+            task_id,
+            bundle_hash,
+            bundle_len,
+            &root.join("work"),
+        )
+        .unwrap();
+        (root, cache, job)
     }
 
     #[test]
     fn local_compile_then_cache_hit() {
-        let (_root, cache_dir, request) = project("local");
+        let (_root, cache_dir, job) = project("local");
         let cache = ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap();
         let workspace = Workspace::new(&cache_dir);
 
-        let first = executor::execute_local(&request, &cache, &workspace);
-        match first.body {
-            LocalBody::Compiled {
-                exit_code,
-                cache_hit,
-                ..
-            } => {
-                assert_eq!(exit_code, 0);
-                assert!(!cache_hit);
-            }
-            other => panic!("expected compiled, got {other:?}"),
-        }
-        let out = Path::new(&request.cwd).join("out");
-        assert!(out.join("libdemo.rlib").is_file());
+        let first =
+            executor::execute_job(&job, "rustc", &cache, &workspace, TaskSource::Local).unwrap();
+        assert_eq!(first.exit_code, 0);
+        assert!(!first.cache_hit);
+        assert!(job.prepared.out_dir.join("libdemo.rlib").is_file());
 
-        let second = executor::execute_local(&request, &cache, &workspace);
-        match second.body {
-            LocalBody::Compiled {
-                exit_code,
-                cache_hit,
-                ..
-            } => {
-                assert_eq!(exit_code, 0);
-                assert!(cache_hit);
-            }
-            other => panic!("expected cached compiled, got {other:?}"),
-        }
+        let second =
+            executor::execute_job(&job, "rustc", &cache, &workspace, TaskSource::Local).unwrap();
+        assert_eq!(second.exit_code, 0);
+        assert!(second.cache_hit);
     }
 
     #[tokio::test]
     async fn remote_cached_result_is_imported() {
-        let (_root, cache_dir, request) = project("remote");
+        let (_root, cache_dir, job) = project("remote");
         let cache = Arc::new(ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap());
         let workspace = Arc::new(Workspace::new(&cache_dir));
 
-        let env: HashMap<String, String> = request.env.iter().cloned().collect();
-        let manifest = collect_manifest(
-            Path::new(&request.cwd),
-            Path::new(&request.rustc),
-            &request.args,
-            &env,
-        )
-        .unwrap();
-        let digest = manifest.digest().unwrap();
-
+        let digest = job.task_id;
+        let out_dir = job.prepared.out_dir.clone();
         let payload = b"remote rlib bytes";
         let blob = cache.cas().put_bytes(payload).unwrap();
         let output = OutputRef {
@@ -147,20 +138,10 @@ mod local_remote {
             control,
             ServiceConfig::default(),
         );
-        let response = coordinator.execute(&request).await;
-        match response.body {
-            LocalBody::Compiled {
-                exit_code,
-                cache_hit,
-                ..
-            } => {
-                assert_eq!(exit_code, 0);
-                assert!(!cache_hit);
-            }
-            other => panic!("expected remote success, got {other:?}"),
-        }
-        let out = Path::new(&request.cwd).join("out");
-        assert_eq!(fs::read(out.join("libdemo.rlib")).unwrap(), payload);
+        let result = coordinator.execute(job).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(result.cache_hit);
+        assert_eq!(fs::read(out_dir.join("libdemo.rlib")).unwrap(), payload);
         assert!(cache.cached_outputs(&digest).is_some());
         assert_eq!(mock.sent().len(), 3);
     }
