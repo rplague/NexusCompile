@@ -1,4 +1,5 @@
 pub mod capacity;
+pub mod cli;
 pub mod compile;
 pub mod compile_protocol;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod paths;
 pub mod pool;
 pub mod protocol;
 pub mod remote;
+pub mod runtime;
 pub mod service;
 pub mod setup;
 pub mod state;
