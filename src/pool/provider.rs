@@ -754,7 +754,7 @@ mod tests {
             assert!(matches!(
                 response,
                 AppResponse::Subscribed {
-                    provider: ref provider,
+                    ref provider,
                     max_slots: 4,
                     ..
                 } if provider == &peer("provider")
