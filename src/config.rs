@@ -201,9 +201,8 @@ impl ServiceConfig {
         let path = path.as_ref();
 
         match fs::read_to_string(path) {
-            Ok(content) => toml::from_str::<ServiceConfig>(&content).map_err(|error| {
-                ConfigError::parse(format!("parse {}: {error}", path.display()))
-            }),
+            Ok(content) => toml::from_str::<ServiceConfig>(&content)
+                .map_err(|error| ConfigError::parse(format!("parse {}: {error}", path.display()))),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if !create_if_missing {
                     LogStruct::new(
@@ -225,10 +224,7 @@ impl ServiceConfig {
                 .emit();
                 Ok(config)
             }
-            Err(error) => Err(ConfigError::io(format!(
-                "read {}: {error}",
-                path.display()
-            ))),
+            Err(error) => Err(ConfigError::io(format!("read {}: {error}", path.display()))),
         }
     }
 
@@ -294,9 +290,8 @@ fn write_atomic(path: &Path, content: &str) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent).map_err(|error| {
-            ConfigError::io(format!("create {}: {error}", parent.display()))
-        })?;
+        fs::create_dir_all(parent)
+            .map_err(|error| ConfigError::io(format!("create {}: {error}", parent.display())))?;
     }
 
     let file_name = path
