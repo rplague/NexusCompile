@@ -1,5 +1,4 @@
 pub mod capacity;
-pub mod cli;
 pub mod compile;
 pub mod compile_protocol;
 pub mod config;
