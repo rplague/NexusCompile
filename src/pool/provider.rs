@@ -2,21 +2,18 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::capacity::CapacitySnapshot;
-use crate::compile::bundle::{decode_bundle, materialize_bundle};
+use crate::compile::bundle::TaskJob;
 use crate::compile::cache::ResultCache;
-use crate::compile::hash::{hash_file, hex_hash};
+use crate::compile::hash::hex_hash;
 use crate::compile_protocol::{
     AppRequest, AppResponse, ErrorCode, Hash32, LeaseId, OutputRef, PeerId, TaskId, TaskState,
 };
 use crate::config::ServiceConfig;
-use crate::local_protocol::truncate_diagnostic;
-use crate::log::{LogLevel, LogStruct, log_compile_failure};
+use crate::log::{LogLevel, LogStruct};
 use crate::toolchain::resolve_rustc;
-use crate::util::process;
 use crate::util::time::now_ms;
 use crate::workspace::Workspace;
 
@@ -495,8 +492,8 @@ fn run_task_blocking(
         let _ = fs::remove_dir_all(&task_dir);
     };
 
-    let actual = match hash_file(&bundle_path) {
-        Ok((hash, _)) => hash,
+    let bundle_len = match fs::metadata(&bundle_path) {
+        Ok(metadata) => metadata.len(),
         Err(error) => {
             fail(
                 &provider,
@@ -508,72 +505,26 @@ fn run_task_blocking(
             return;
         }
     };
-    if actual != bundle_hash {
-        fail(
-            &provider,
-            ErrorCode::Internal,
-            "task bundle hash mismatch".into(),
-            Vec::new(),
-            Vec::new(),
-        );
-        return;
-    }
-
-    let bytes = match fs::read(&bundle_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                format!("read task bundle: {error}"),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-    };
-    let bundle = match decode_bundle(&bytes) {
-        Ok(bundle) => bundle,
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                error,
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-    };
-    let digest = match bundle.manifest.digest() {
-        Ok(digest) => digest,
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                error.to_string(),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-    };
-    if digest != task_id.0 {
-        fail(
-            &provider,
-            ErrorCode::Internal,
-            "manifest digest does not match task id".into(),
-            Vec::new(),
-            Vec::new(),
-        );
-        return;
-    }
-
-    let rustc = match resolve_rustc(
-        &config,
-        &bundle.manifest.toolchain_id,
-        &bundle.manifest.target,
+    let job = match TaskJob::from_bundle_file(
+        &bundle_path,
+        task_id.0,
+        bundle_hash,
+        bundle_len,
+        &task_dir.join("work"),
     ) {
+        Ok(job) => job,
+        Err(error) => {
+            fail(
+                &provider,
+                ErrorCode::Internal,
+                error.message,
+                Vec::new(),
+                Vec::new(),
+            );
+            return;
+        }
+    };
+    let rustc = match resolve_rustc(&config, &job.manifest.toolchain_id, &job.manifest.target) {
         Ok(rustc) => rustc,
         Err(error) => {
             fail(
@@ -587,54 +538,19 @@ fn run_task_blocking(
         }
     };
 
-    let work = task_dir.join("work");
-    let work_out = work.join("out");
-    let work_extern = work.join("extern");
-    if let Err(error) = fs::create_dir_all(&work)
-        .and_then(|_| materialize_bundle(&bundle, &work))
-        .and_then(|_| fs::create_dir_all(&work_out))
-        .and_then(|_| fs::create_dir_all(&work_extern))
-        .and_then(|_| fs::create_dir_all(work.join("target")))
-    {
-        fail(
-            &provider,
-            ErrorCode::Internal,
-            format!("materialize task: {error}"),
-            Vec::new(),
-            Vec::new(),
-        );
-        return;
-    }
-
-    let prepared = match crate::compile::bundle::prepare_task(&bundle, &work) {
-        Ok(prepared) => prepared,
+    let result = match crate::compile::executor::execute_job(
+        &job,
+        &rustc,
+        &cache,
+        &workspace,
+        crate::compile::TaskSource::Provider,
+    ) {
+        Ok(result) => result,
         Err(error) => {
             fail(
                 &provider,
                 ErrorCode::Internal,
-                format!("prepare task: {error}"),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-    };
-    let output = Command::new(&rustc)
-        .args(&prepared.args)
-        .current_dir(&prepared.cwd)
-        .envs(&prepared.env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
-
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                format!("spawn rustc: {error}"),
+                error.message,
                 Vec::new(),
                 Vec::new(),
             );
@@ -642,73 +558,25 @@ fn run_task_blocking(
         }
     };
 
-    if !output.status.success() {
-        let exit_code = process::exit_code(output.status);
-        let bundle_size = fs::metadata(&bundle_path)
-            .map(|metadata| metadata.len())
-            .ok();
-        log_compile_failure(
-            "provider",
-            &hex_hash(&task_id.0),
-            &bundle.manifest.crate_name,
-            &rustc,
-            &prepared.cwd.to_string_lossy(),
-            exit_code,
-            0,
-            &prepared.args,
-            &prepared.env,
-            &output.stdout,
-            &output.stderr,
-            Some(&bundle.manifest),
-            Some(&bundle_hash),
-            bundle_size,
-            Some(bundle.files.len()),
-        );
+    if result.exit_code != 0 {
         fail(
             &provider,
             ErrorCode::Compile,
-            format!("rustc exited with {exit_code}"),
-            truncate_diagnostic(output.stdout),
-            truncate_diagnostic(output.stderr),
+            format!("rustc exited with {}", result.exit_code),
+            result.stdout,
+            result.stderr,
         );
         return;
     }
 
-    let outputs = match cache.collect_outputs(&work_out) {
-        Ok(outputs) if !outputs.is_empty() => outputs,
-        Ok(_) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                "rustc produced no outputs".into(),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                format!("collect outputs: {error}"),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-    };
-
-    let stored = cache.store(task_id.0, outputs.clone()).unwrap_or(false);
-    if stored {
-        cache.pin(&task_id.0);
-    }
+    cache.pin(&task_id.0);
     LogStruct::new(
         LogLevel::Debug,
         "远端任务完成",
         format!("action={digest_prefix}"),
     )
     .emit();
-    provider.complete_task(task_id, outputs);
+    provider.complete_task(task_id, result.outputs);
 }
 
 #[cfg(test)]
