@@ -4,8 +4,7 @@ use nexuscompile::log::{LogLevel, LogStruct};
 use nexuscompile::runtime::{RuntimeHandle, RuntimeOptions};
 
 fn run_from_args(args: &[String]) -> Option<i32> {
-    nexuscompile::config_cli::run_cli(args)
-        .or_else(|| nexuscompile::setup::run_cli(args))
+    nexuscompile::installer::run_cli(args)
         .or_else(|| nexuscompile::toolchain::run_cli(args))
 }
 

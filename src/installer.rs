@@ -1,4 +1,4 @@
-//! Per-user Cargo configuration used by the package installer.
+//! Installer-facing service configuration and per-user Cargo configuration.
 
 use std::fs;
 use std::io;
@@ -6,8 +6,14 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
 
+use crate::config::{ConfigErrorKind, ServiceConfig};
+use crate::paths;
+
 pub const WRAPPER_PATH: &str = "/usr/bin/nexus-rustc";
 pub const DEFAULT_SOCKET: &str = "/run/nexuscompile/nexus.sock";
+
+const EXIT_USAGE: i32 = 2;
+const EXIT_IO: i32 = 4;
 
 const MANAGED_SOCKET_PREFIX: &str = "/run/nexuscompile/";
 const BACKUP_SUFFIX: &str = ".nexuscompile.bak";
@@ -55,6 +61,14 @@ enum CliParse {
 /// Returns `None` when the arguments are not a setup command so `main` can
 /// continue starting the server.
 pub fn run_cli(args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str) {
+        Some("config-defaults") => Some(run_defaults(&args[1..])),
+        Some("config-check") => Some(run_check(&args[1..])),
+        _ => run_setup_cli(args),
+    }
+}
+
+fn run_setup_cli(args: &[String]) -> Option<i32> {
     let command = match parse_cli(args) {
         CliParse::NotSetup => return None,
         CliParse::MissingConfig(name) => {
@@ -267,6 +281,84 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn run_defaults(args: &[String]) -> i32 {
+    let path = match parse_config_arg(args) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+
+    if path.exists() {
+        println!("config: keeping existing {}", path.display());
+        return 0;
+    }
+
+    match ServiceConfig::default().save_to_file(&path) {
+        Ok(()) => {
+            println!("config: wrote {}", path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("config: {error}");
+            EXIT_IO
+        }
+    }
+}
+
+fn run_check(args: &[String]) -> i32 {
+    let path = match parse_config_arg(args) {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+
+    if !path.exists() {
+        eprintln!("config: no config at {}", path.display());
+        return EXIT_IO;
+    }
+
+    match ServiceConfig::try_from_toml_file(&path, false) {
+        Ok(config) => {
+            for warning in config.warnings() {
+                println!("config: warning: {warning}");
+            }
+            println!("config: ok {}", path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("config: {error}");
+            if error.kind == ConfigErrorKind::Io {
+                EXIT_IO
+            } else {
+                EXIT_USAGE
+            }
+        }
+    }
+}
+
+fn parse_config_arg(args: &[String]) -> Result<PathBuf, i32> {
+    let mut config = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    eprintln!("config: --config requires a path");
+                    return Err(EXIT_USAGE);
+                };
+                config = Some(PathBuf::from(value));
+            }
+            other => {
+                eprintln!("config: unknown argument: {other}");
+                return Err(EXIT_USAGE);
+            }
+        }
+        index += 1;
+    }
+
+    Ok(config.unwrap_or_else(paths::config_path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,5 +526,54 @@ RUST_BACKTRACE = "1"
             ]),
             CliParse::Command(CliCommand::UnsetupUser { .. })
         ));
+    }
+
+    #[test]
+    fn config_defaults_does_not_overwrite_existing() {
+        let dir = TempDir::new("config-cli-defaults");
+        let path = dir.join("config.toml");
+        fs::write(&path, "# existing\n").unwrap();
+        let args = vec![
+            "config-defaults".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# existing\n");
+
+        let missing = dir.join("new.toml");
+        let args = vec![
+            "config-defaults".to_string(),
+            "--config".to_string(),
+            missing.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0));
+        assert!(missing.is_file());
+    }
+
+    #[test]
+    fn config_check_exit_codes() {
+        let dir = TempDir::new("config-cli-check");
+        let path = dir.join("config.toml");
+        fs::write(&path, "port = 6100\n").unwrap();
+        let args = vec![
+            "config-check".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0), "case: valid");
+
+        fs::write(&path, "[node\n").unwrap();
+        assert_eq!(run_cli(&args), Some(2), "case: invalid");
+
+        let missing = dir.join("missing.toml");
+        let args = vec![
+            "config-check".to_string(),
+            "--config".to_string(),
+            missing.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(4), "case: missing");
+
+        assert_eq!(run_cli(&["not-a-config-command".to_string()]), None);
     }
 }
