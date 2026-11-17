@@ -1,6 +1,5 @@
 //! Local rustc execution for supported lib-crate invocations.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -25,10 +24,6 @@ pub fn execute_job(
     workspace: &Workspace,
     source: TaskSource,
 ) -> Result<TaskResult, TaskError> {
-    if let Err(reason) = is_supported(&job.prepared.args, &job.prepared.env) {
-        return Err(TaskError::new("unsupported", reason));
-    }
-
     let digest_prefix = &hex_hash(&job.task_id)[..8];
     if let Some(cached) = cache.lookup_and_materialize(&job.task_id, &job.prepared.out_dir) {
         LogStruct::new(
@@ -175,55 +170,6 @@ pub fn truncate_diagnostic(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-/// Check whether this rustc invocation is supported by the local executor.
-pub fn is_supported(args: &[String], env: &HashMap<String, String>) -> Result<(), String> {
-    if env.get("CARGO_INCREMENTAL").map(String::as_str) != Some("0") {
-        return Err("CARGO_INCREMENTAL must be 0".into());
-    }
-
-    let crate_name = args::value(args, "--crate-name").unwrap_or_default();
-    if crate_name == "build_script_build" {
-        return Err("build scripts stay local-direct".into());
-    }
-
-    let crate_type =
-        args::value(args, "--crate-type").ok_or_else(|| "missing --crate-type".to_string())?;
-    for kind in crate_type.split(',') {
-        if !matches!(kind.trim(), "lib" | "rlib") {
-            return Err(format!("unsupported crate type: {kind}"));
-        }
-    }
-
-    if !args::value(args, "--emit")
-        .map(|emit| emit.split(',').any(|kind| kind.trim() == "link"))
-        .unwrap_or(false)
-    {
-        return Err("missing link in --emit".into());
-    }
-
-    if args::value(args, "--out-dir").is_none() {
-        return Err("missing --out-dir".into());
-    }
-
-    if args.iter().any(|arg| arg == "--test" || arg == "--print") {
-        return Err("test/print invocations stay local-direct".into());
-    }
-
-    for (index, arg) in args.iter().enumerate() {
-        if arg == "-C" {
-            if let Some(next) = args.get(index + 1)
-                && next.contains("incremental")
-            {
-                return Err("incremental compilation is not supported".into());
-            }
-        } else if arg.starts_with("-C") && arg.contains("incremental") {
-            return Err("incremental compilation is not supported".into());
-        }
-    }
-
-    Ok(())
-}
-
 fn rewrite_out_dir(args: &[String], staging_out: &Path) -> Option<Vec<String>> {
     let mut result = Vec::with_capacity(args.len());
     let mut index = 0;
@@ -281,68 +227,8 @@ fn rewrite_dep_info_files(staging_out: &Path, out_dir: &Path) -> std::io::Result
 mod tests {
     use super::*;
 
-    fn base_env() -> HashMap<String, String> {
-        HashMap::from([("CARGO_INCREMENTAL".into(), "0".into())])
-    }
-
-    fn base_args() -> Vec<String> {
-        vec![
-            "--crate-name".into(),
-            "demo".into(),
-            "--crate-type".into(),
-            "lib".into(),
-            "--out-dir".into(),
-            "/tmp/out".into(),
-            "--emit=dep-info,metadata,link".into(),
-        ]
-    }
-
     #[test]
-    fn accepts_supported_lib_invocation() {
-        assert!(is_supported(&base_args(), &base_env()).is_ok());
-    }
-
-    #[test]
-    fn rejects_unsupported_invocations_and_rewrites_out_dir() {
-        let mut env = base_env();
-        env.insert("CARGO_INCREMENTAL".into(), "1".into());
-        assert!(
-            is_supported(&base_args(), &env).is_err(),
-            "case: incremental"
-        );
-
-        let mut args = base_args();
-        let index = args.iter().position(|arg| arg == "lib").unwrap();
-        args[index] = "bin".into();
-        assert!(
-            is_supported(&args, &base_env()).is_err(),
-            "case: crate type"
-        );
-
-        let mut args = base_args();
-        args.retain(|arg| arg != "--out-dir" && arg != "/tmp/out");
-        assert!(is_supported(&args, &base_env()).is_err(), "case: out dir");
-
-        let mut args = base_args();
-        args.retain(|arg| arg != "--emit=dep-info,metadata,link");
-        args.push("--emit=metadata".into());
-        assert!(is_supported(&args, &base_env()).is_err(), "case: emit");
-
-        let mut args = base_args();
-        let index = args.iter().position(|arg| arg == "demo").unwrap();
-        args[index] = "build_script_build".into();
-        assert!(
-            is_supported(&args, &base_env()).is_err(),
-            "case: build script"
-        );
-
-        let mut args = base_args();
-        args.push("--test".into());
-        assert!(
-            is_supported(&args, &base_env()).is_err(),
-            "case: test invocation"
-        );
-
+    fn rewrites_out_dir_in_both_forms() {
         let staging = Path::new("/tmp/staging/out");
         let args = vec!["--out-dir".into(), "/tmp/real".into()];
         assert_eq!(

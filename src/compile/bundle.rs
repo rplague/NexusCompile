@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::TaskError;
 use crate::compile::hash::hash_file;
 use crate::compile::manifest::ActionManifest;
+use crate::compile::{TaskError, TaskRequirements, review_task};
 use crate::compile_protocol::Hash32;
 use crate::util::args;
 use crate::util::fs::{file_mode, set_mode};
@@ -158,6 +158,7 @@ pub struct TaskJob {
     pub manifest: ActionManifest,
     pub bundle: TaskBundle,
     pub prepared: PreparedTask,
+    pub requirements: TaskRequirements,
 }
 
 impl TaskJob {
@@ -190,6 +191,8 @@ impl TaskJob {
         if digest != task_id {
             return Err(TaskError::new("manifest_error", "manifest digest mismatch"));
         }
+        let requirements = review_task(&bundle.manifest, bundle_hash)
+            .map_err(|error| TaskError::new(error.code, error.message))?;
         let work_out = work.join("out");
         let work_extern = work.join("extern");
         fs::create_dir_all(work)
@@ -210,6 +213,7 @@ impl TaskJob {
             manifest: bundle.manifest.clone(),
             bundle,
             prepared,
+            requirements,
         })
     }
 }
@@ -411,7 +415,7 @@ mod tests {
     fn manifest() -> ActionManifest {
         ActionManifest {
             schema: crate::compile::manifest::MANIFEST_SCHEMA,
-            toolchain_id: String::new(),
+            toolchain_id: "test-toolchain".into(),
             target: String::new(),
             profile: String::new(),
             cwd: "<TARGET>/pkg".into(),
@@ -425,9 +429,10 @@ mod tests {
                 "lib".into(),
                 "--out-dir".into(),
                 "<OUT>".into(),
+                "--emit=dep-info,metadata,link".into(),
                 "src/lib.rs".into(),
             ],
-            env: Default::default(),
+            env: std::collections::BTreeMap::from([("CARGO_INCREMENTAL".into(), "0".into())]),
             inputs: Vec::new(),
             outputs: Vec::new(),
             incremental: false,
@@ -496,6 +501,26 @@ mod tests {
             .unwrap();
         assert!(decode_bundle(&bytes).is_err(), "case: unsupported schema");
     }
+    #[test]
+    fn task_job_rejects_unsupported_invocation_before_materializing() {
+        let root = TempDir::new("task-job-unsupported");
+        let mut task = bundle(BUNDLE_SCHEMA, "pkg/src/lib.rs");
+        task.manifest.args[3] = "bin".into();
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&task, &mut bytes).unwrap();
+        let bundle_path = root.join("bundle");
+        fs::write(&bundle_path, &bytes).unwrap();
+        let task_id = task.manifest.digest().unwrap();
+        let hash = crate::compile::hash::hash_bytes(&bytes);
+        let work = root.join("work");
+
+        let error =
+            TaskJob::from_bundle_file(&bundle_path, task_id, hash, bytes.len() as u64, &work)
+                .unwrap_err();
+        assert_eq!(error.code, "unsupported");
+        assert!(!work.exists());
+    }
+
     #[test]
     fn task_job_validates_bundle_identity() {
         let root = TempDir::new("task-job");

@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use nexuscompile::compile::bundle::build_bundle;
-use nexuscompile::compile::executor;
 use nexuscompile::compile::hash::hash_bytes;
 use nexuscompile::compile::manifest::collect_manifest;
+use nexuscompile::compile::{ReviewError, review_invocation};
 use nexuscompile::compile_protocol::{Hash32, OutputRef};
 use nexuscompile::local_task_protocol::{
     LOCAL_TASK_PROTOCOL_VERSION, LocalTaskRequest, LocalTaskRequestBody, LocalTaskResponse,
@@ -110,7 +110,10 @@ fn main() {
 /// Run the wrapper. Always exits or replaces the process with rustc.
 pub fn run() -> ! {
     let invocation = Invocation::from_env();
-    if executor::is_supported(&invocation.args, &invocation.env).is_ok() {
+    let incremental = invocation.env.get("CARGO_INCREMENTAL").map(String::as_str);
+    if let Err(error) = review_invocation(&invocation.args, incremental) {
+        debug_review(&error);
+    } else {
         match try_remote(&invocation) {
             Ok(outcome) => replay(outcome),
             Err(error) => debug(&error),
@@ -375,6 +378,15 @@ fn replay(outcome: CompileOutcome) -> ! {
 fn debug(error: &WrapperError) {
     if env::var_os(DEBUG_ENV).is_some() {
         eprintln!("nexus-rustc: {error}");
+    }
+}
+
+fn debug_review(error: &ReviewError) {
+    if env::var_os(DEBUG_ENV).is_some() {
+        eprintln!(
+            "nexus-rustc: unsupported: {}: {}",
+            error.code, error.message
+        );
     }
 }
 

@@ -9,7 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
-use crate::compile::manifest::{target_installed, toolchain_id};
+use crate::compile::manifest::{target_installed, toolchain_info};
+use crate::compile::{ToolchainInfo, ToolchainRequirement};
+use crate::compile_protocol::ToolchainCapability;
 use crate::config::{ServiceConfig, ToolchainEntry};
 use crate::paths;
 
@@ -123,43 +125,102 @@ pub fn configured_toolchains(config: &ServiceConfig) -> Vec<ToolchainEntry> {
     }]
 }
 
-pub fn resolve_rustc(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedToolchain {
+    pub rustc: String,
+    pub info: ToolchainInfo,
+}
+
+pub fn resolve_toolchain(
     config: &ServiceConfig,
-    requested_toolchain_id: &str,
-    target: &str,
-) -> Result<String, String> {
+    requirement: &ToolchainRequirement,
+) -> Result<ResolvedToolchain, String> {
     for entry in configured_toolchains(config) {
         let rustc = entry.rustc.trim();
         if rustc.is_empty() {
             continue;
         }
-        if !entry.target.is_empty() && !target.is_empty() && entry.target != target {
+        if !entry.target.is_empty()
+            && !requirement.target.is_empty()
+            && entry.target != requirement.target
+        {
             continue;
         }
-        if !requested_toolchain_id.is_empty() {
-            let expected = match toolchain_id(Path::new(rustc), target) {
-                Ok(expected) => expected,
-                Err(_) => continue,
-            };
-            if expected != requested_toolchain_id {
+        let info = match toolchain_info(Path::new(rustc), &requirement.target) {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
+        if !requirement.id.is_empty() && info.id != requirement.id {
+            continue;
+        }
+        if !target_installed(Path::new(rustc), &requirement.target).unwrap_or(false) {
+            if requirement.id.is_empty() {
                 continue;
             }
-            if !target_installed(Path::new(rustc), target).unwrap_or(false) {
-                return Err(format!("target {target} is not installed"));
-            }
-            return Ok(rustc.to_string());
+            return Err(format!("target {} is not installed", requirement.target));
         }
-        if !target_installed(Path::new(rustc), target).unwrap_or(false) {
-            continue;
-        }
-        return Ok(rustc.to_string());
+        return Ok(ResolvedToolchain {
+            rustc: rustc.to_string(),
+            info,
+        });
     }
 
-    if requested_toolchain_id.is_empty() {
+    if requirement.id.is_empty() {
         Err("no usable toolchain configured".into())
     } else {
-        Err("toolchain mismatch".into())
+        Err(format!(
+            "toolchain mismatch for {}{}",
+            requirement.id,
+            if requirement.target.is_empty() {
+                String::new()
+            } else {
+                format!(" target={}", requirement.target)
+            }
+        ))
     }
+}
+
+pub fn capabilities(config: &ServiceConfig) -> Vec<ToolchainCapability> {
+    configured_toolchains(config)
+        .into_iter()
+        .filter_map(|entry| {
+            let rustc = entry.rustc.trim();
+            if rustc.is_empty() {
+                return None;
+            }
+            let configured_target = entry.target.trim();
+            let info = toolchain_info(Path::new(rustc), configured_target).ok()?;
+            let effective_target = if configured_target.is_empty() {
+                info.host.clone()
+            } else {
+                configured_target.to_string()
+            };
+            let info = if effective_target == configured_target {
+                info
+            } else {
+                toolchain_info(Path::new(rustc), &effective_target).ok()?
+            };
+            Some(ToolchainCapability {
+                id: info.id,
+                target: effective_target,
+            })
+        })
+        .collect()
+}
+
+pub fn resolve_rustc(
+    config: &ServiceConfig,
+    requested_toolchain_id: &str,
+    target: &str,
+) -> Result<String, String> {
+    resolve_toolchain(
+        config,
+        &ToolchainRequirement {
+            id: requested_toolchain_id.to_string(),
+            target: target.to_string(),
+        },
+    )
+    .map(|resolved| resolved.rustc)
 }
 
 fn load_service_config(path: &Path) -> Result<ServiceConfig, String> {
@@ -445,6 +506,7 @@ fn run(command: &mut Command) -> Result<Output, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compile::manifest::toolchain_id;
     use crate::test_support::TempDir;
 
     #[test]

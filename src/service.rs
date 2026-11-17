@@ -1,9 +1,11 @@
 //! Inbound sidecar service dispatch (protocol v2 business entry point).
 
+use std::fs;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::compile::bundle::TaskJob;
 use crate::compile::hash::hex_hash;
 use crate::compile_protocol::{
     APP_PROTOCOL_VERSION, AppRequest, AppResponse, Envelope, ErrorCode, PeerId, TaskState,
@@ -14,6 +16,7 @@ use crate::pool;
 use crate::protocol::{SidecarError, WhoamiInfo};
 use crate::state::AppState;
 use crate::task_blob::TaskBlobStore;
+use crate::toolchain::resolve_toolchain;
 
 /// Boxed future so async business logic can be spawned from the connection loop.
 pub type ServiceFuture<'a> =
@@ -97,6 +100,7 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
             toolchain_id,
             target,
         } => {
+            let _ = (toolchain_id, target);
             if app.provider.task_entry(&task_id).is_none()
                 && let Some(outputs) = app.cache.cached_outputs(&task_id.0)
                 && app.cache.pin(&task_id.0)
@@ -106,15 +110,6 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                     outputs,
                     lease_id: app.provider.create_lease(task_id),
                 };
-            }
-            if let Err(message) = validate_reserve(app, &toolchain_id, &target) {
-                log_task_error(
-                    "remote-provider",
-                    &hex_hash(&task_id.0),
-                    "reserve_rejected",
-                    &message,
-                );
-                return AppResponse::rejected(message);
             }
             let response = app
                 .provider
@@ -152,21 +147,68 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                 );
                 return AppResponse::error(ErrorCode::InvalidState, "task is not queued");
             }
+            let task_dir = app.workspace.task_dir(&task_id.0);
+            let bundle_path = task_dir.join("bundle");
+            let bundle_len = match fs::metadata(&bundle_path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    return reject_task(
+                        app,
+                        task_id,
+                        ErrorCode::Internal,
+                        format!("read task bundle: {error}"),
+                    );
+                }
+            };
+            let job = match TaskJob::from_bundle_file(
+                &bundle_path,
+                task_id.0,
+                entry.input_manifest,
+                bundle_len,
+                &task_dir.join("work"),
+            ) {
+                Ok(job) => job,
+                Err(error) => {
+                    return reject_task(app, task_id, ErrorCode::Rejected, error.message);
+                }
+            };
+            let config = app.config_snapshot();
+            let resolved = match resolve_toolchain(&config, &job.requirements.toolchain) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return reject_task(
+                        app,
+                        task_id,
+                        ErrorCode::Rejected,
+                        format!("toolchain check failed: {error}"),
+                    );
+                }
+            };
+
             let response = app.provider.task_ready(task_id, lease_id);
             if matches!(response, AppResponse::Ack) {
-                let bundle_hash = entry.input_manifest;
-                let cache = app.cache.clone();
-                let config = app.config.snapshot();
                 pool::spawn_task(
                     app.provider.clone(),
-                    cache,
+                    app.cache.clone(),
                     app.workspace.clone(),
-                    config,
-                    task_id,
-                    bundle_hash,
+                    job,
+                    resolved.rustc,
                 );
             }
             response
+        }
+        AppRequest::FetchCached { task_id } => {
+            let Some(outputs) = app.cache.cached_outputs(&task_id.0) else {
+                return AppResponse::error(ErrorCode::NotFound, "cache miss");
+            };
+            if !app.cache.pin(&task_id.0) {
+                return AppResponse::error(ErrorCode::NotFound, "cache miss");
+            }
+            AppResponse::Cached {
+                task_id,
+                outputs,
+                lease_id: app.provider.create_lease(task_id),
+            }
         }
         AppRequest::Status { task_id } => {
             let response = app.provider.status(task_id);
@@ -259,11 +301,22 @@ impl Dispatch for AppState {
     }
 }
 
-fn validate_reserve(app: &AppState, toolchain_id: &str, target: &str) -> Result<(), String> {
-    let config = app.config_snapshot();
-    crate::toolchain::resolve_rustc(&config, toolchain_id, target)
-        .map(|_| ())
-        .map_err(|error| format!("toolchain check failed: {error}"))
+fn reject_task(
+    app: &AppState,
+    task_id: crate::compile_protocol::TaskId,
+    code: ErrorCode,
+    message: String,
+) -> AppResponse {
+    log_task_error(
+        "remote-provider",
+        &hex_hash(&task_id.0),
+        "task_ready_rejected",
+        &message,
+    );
+    let _ = app.provider.fail_task(task_id, code, message.clone());
+    app.provider.discard_task(task_id);
+    TaskBlobStore::new(&app.workspace).remove_task_dir(&task_id.0);
+    AppResponse::Rejected { code, message }
 }
 
 impl AppResponse {
@@ -337,65 +390,133 @@ mod tests {
     }
 
     #[test]
-    fn reserve_checks_toolchain_and_target() {
+    fn reserve_is_capacity_only() {
         let dir = TempDir::new("service");
         let context = context(&dir);
-        let toolchain_id =
-            crate::compile::manifest::toolchain_id(std::path::Path::new("rustc"), "").unwrap();
 
         let request = encode_request(AppRequest::Reserve {
             consumer: PeerId::new("consumer"),
             task_id: TaskId(Hash32([14; 32])),
             slots: 1,
             input_manifest: Hash32([15; 32]),
-            toolchain_id,
-            target: String::new(),
-        });
-        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        assert!(
-            matches!(response.body, AppResponse::Granted { .. }),
-            "case: matching"
-        );
-
-        let request = encode_request(AppRequest::Reserve {
-            consumer: PeerId::new("consumer"),
-            task_id: TaskId(Hash32([10; 32])),
-            slots: 1,
-            input_manifest: Hash32([11; 32]),
             toolchain_id: "not-the-local-toolchain".into(),
-            target: String::new(),
-        });
-        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        assert!(
-            matches!(
-                response.body,
-                AppResponse::Rejected {
-                    code: ErrorCode::Rejected,
-                    ..
-                }
-            ),
-            "case: toolchain mismatch"
-        );
-
-        let request = encode_request(AppRequest::Reserve {
-            consumer: PeerId::new("consumer"),
-            task_id: TaskId(Hash32([12; 32])),
-            slots: 1,
-            input_manifest: Hash32([13; 32]),
-            toolchain_id: String::new(),
             target: "definitely-not-a-target".into(),
         });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
         assert!(
-            matches!(
-                response.body,
-                AppResponse::Rejected {
-                    code: ErrorCode::Rejected,
-                    ..
-                }
-            ),
-            "case: uninstalled target"
+            matches!(response.body, AppResponse::Granted { .. }),
+            "reserve must not validate the task"
         );
+    }
+
+    #[test]
+    fn task_ready_rejects_unsupported_bundle_and_cleans_up() {
+        let dir = TempDir::new("service-task-ready");
+        let context = context(&dir);
+        let project = dir.join("project");
+        let out = project.join("out");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(project.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let args = vec![
+            "--crate-name".into(),
+            "demo".into(),
+            "--crate-type".into(),
+            "bin".into(),
+            "--out-dir".into(),
+            out.display().to_string(),
+            "--emit=dep-info,metadata,link".into(),
+            project.join("src/lib.rs").display().to_string(),
+        ];
+        let env = std::collections::HashMap::from([
+            ("CARGO_MANIFEST_DIR".into(), project.display().to_string()),
+            ("OUT_DIR".into(), out.display().to_string()),
+            ("CARGO_INCREMENTAL".into(), "0".into()),
+        ]);
+        let manifest =
+            crate::compile::manifest::collect_manifest(&project, Path::new("rustc"), &args, &env)
+                .unwrap();
+        let bundle =
+            crate::compile::bundle::build_bundle(&project, &args, &env, &manifest).unwrap();
+        let task_id = TaskId(manifest.digest().unwrap());
+        let bundle_hash = crate::compile::hash::hash_bytes(&bundle);
+        let task_dir = context.workspace.task_dir(&task_id.0);
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("bundle"), &bundle).unwrap();
+
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id,
+            slots: 1,
+            input_manifest: bundle_hash,
+            toolchain_id: manifest.toolchain_id.clone(),
+            target: manifest.target.clone(),
+        });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        let lease_id = match response.body {
+            AppResponse::Granted { lease_id, .. } => lease_id,
+            other => panic!("expected granted, got {other:?}"),
+        };
+
+        let request = encode_request(AppRequest::TaskReady { task_id, lease_id });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(matches!(
+            response.body,
+            AppResponse::Rejected {
+                code: ErrorCode::Rejected,
+                ..
+            }
+        ));
+        assert!(!task_dir.exists());
+    }
+
+    #[test]
+    fn fetch_cached_does_not_create_task() {
+        let dir = TempDir::new("service-fetch-cached");
+        let context = context(&dir);
+        let task_id = TaskId(Hash32([10; 32]));
+        let output = seed_output(&context, task_id, b"cached");
+        let free_slots = context.provider.free_slots();
+
+        let request = encode_request(AppRequest::FetchCached { task_id });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        let lease_id = match response.body {
+            AppResponse::Cached {
+                task_id: cached_task,
+                outputs,
+                lease_id,
+            } => {
+                assert_eq!(cached_task, task_id);
+                assert_eq!(outputs, vec![output]);
+                lease_id
+            }
+            other => panic!("expected cached, got {other:?}"),
+        };
+        assert!(context.provider.task_entry(&task_id).is_none());
+        assert_eq!(context.provider.free_slots(), free_slots);
+
+        let request = encode_request(AppRequest::ResultAck { lease_id });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert_eq!(response.body, AppResponse::Ack);
+        assert!(context.cache.cached_outputs(&task_id.0).is_some());
+    }
+
+    #[test]
+    fn fetch_cached_miss_returns_not_found() {
+        let dir = TempDir::new("service-fetch-cached-miss");
+        let context = context(&dir);
+        let request = encode_request(AppRequest::FetchCached {
+            task_id: TaskId(Hash32([11; 32])),
+        });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(matches!(
+            response.body,
+            AppResponse::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
     }
 
     #[test]

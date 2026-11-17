@@ -135,8 +135,13 @@ pub async fn ensure_target(
         };
 
         match control::send(control, service_name, &peer, request).await {
-            Ok(AppResponse::Subscribed { max_slots, .. }) => {
+            Ok(AppResponse::Subscribed {
+                max_slots,
+                capabilities,
+                ..
+            }) => {
                 consumer.record_subscribed(peer.clone(), max_slots);
+                consumer.record_capabilities(peer.clone(), capabilities);
                 visible_capacity = visible_capacity.saturating_add(max_slots);
                 subscribed += 1;
             }
@@ -474,12 +479,14 @@ mod tests {
                     toolchain: "rustc".into(),
                     target: "x86_64".into(),
                     max_slots: 2,
+                    capabilities: Vec::new(),
                 }),
                 Ok(AppResponse::Subscribed {
                     provider: PeerId::new("b"),
                     toolchain: "rustc".into(),
                     target: "x86_64".into(),
                     max_slots: 2,
+                    capabilities: Vec::new(),
                 }),
             ],
             vec![Ok(vec!["a".into(), "b".into(), "c".into()])],

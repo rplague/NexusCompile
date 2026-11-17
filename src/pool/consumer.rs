@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::compile_protocol::{AppResponse, ErrorCode, PeerId};
+use crate::compile_protocol::{AppResponse, ErrorCode, Hash32, PeerId, ToolchainCapability};
 use crate::util::time::now_ms;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub struct ProviderView {
     pub free_slots: u32,
     pub queue_len: u32,
     pub accepting: bool,
+    pub capabilities: Vec<ToolchainCapability>,
     pub last_seq: u64,
     pub last_seen_ms: u64,
 }
@@ -21,6 +22,7 @@ pub struct ProviderView {
 struct Inner {
     providers: HashMap<PeerId, ProviderView>,
     cooldowns: HashMap<PeerId, u64>,
+    remote_cache: HashMap<Hash32, Vec<PeerId>>,
 }
 
 /// Consumer role: tracks subscribed providers and their last capacity update.
@@ -44,6 +46,7 @@ impl Consumer {
                 free_slots: 0,
                 queue_len: 0,
                 accepting: false,
+                capabilities: Vec::new(),
                 last_seq: 0,
                 last_seen_ms: now_ms(),
             },
@@ -62,11 +65,18 @@ impl Consumer {
                 free_slots: 0,
                 queue_len: 0,
                 accepting: false,
+                capabilities: Vec::new(),
                 last_seq: 0,
                 last_seen_ms: now_ms(),
             });
         view.max_slots = max_slots;
         view.last_seen_ms = now_ms();
+    }
+
+    pub fn record_capabilities(&self, provider: PeerId, capabilities: Vec<ToolchainCapability>) {
+        if let Some(view) = self.write().providers.get_mut(&provider) {
+            view.capabilities = capabilities;
+        }
     }
 
     pub fn apply_capacity(
@@ -104,7 +114,9 @@ impl Consumer {
     }
 
     pub fn remove_provider(&self, provider: &PeerId) {
-        self.write().providers.remove(provider);
+        let mut inner = self.write();
+        inner.providers.remove(provider);
+        forget_remote_provider(&mut inner, provider);
     }
 
     pub fn expire_providers(&self, now: u64, ttl_ms: u64) -> Vec<PeerId> {
@@ -118,6 +130,7 @@ impl Consumer {
 
         for peer in &expired {
             inner.providers.remove(peer);
+            forget_remote_provider(&mut inner, peer);
         }
         expired
     }
@@ -132,6 +145,36 @@ impl Consumer {
             .filter(|(provider, _)| !inner.cooldowns.contains_key(*provider))
             .map(|(_, view)| view.clone())
             .collect()
+    }
+
+    pub fn record_remote_cache(&self, task_id: Hash32, provider: &PeerId) {
+        let mut inner = self.write();
+        let providers = inner.remote_cache.entry(task_id).or_default();
+        if !providers.iter().any(|p| p == provider) {
+            providers.push(provider.clone());
+        }
+    }
+
+    pub fn remote_cache_providers(&self, task_id: &Hash32) -> Vec<PeerId> {
+        self.read()
+            .remote_cache
+            .get(task_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn remove_remote_cache(&self, task_id: &Hash32, provider: &PeerId) {
+        let mut inner = self.write();
+        let empty = {
+            let Some(providers) = inner.remote_cache.get_mut(task_id) else {
+                return;
+            };
+            providers.retain(|p| p != provider);
+            providers.is_empty()
+        };
+        if empty {
+            inner.remote_cache.remove(task_id);
+        }
     }
 
     pub fn has_provider(&self, provider: &PeerId) -> bool {
@@ -155,6 +198,7 @@ impl Consumer {
         let mut inner = self.write();
         let peers: Vec<PeerId> = inner.providers.keys().cloned().collect();
         inner.providers.clear();
+        inner.remote_cache.clear();
         peers
     }
 
@@ -165,6 +209,13 @@ impl Consumer {
     fn write(&self) -> RwLockWriteGuard<'_, Inner> {
         self.inner.write().expect("Consumer RwLock 被污染")
     }
+}
+
+fn forget_remote_provider(inner: &mut Inner, provider: &PeerId) {
+    inner.remote_cache.retain(|_, providers| {
+        providers.retain(|p| p != provider);
+        !providers.is_empty()
+    });
 }
 
 #[cfg(test)]
@@ -202,6 +253,68 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn capabilities_are_recorded() {
+        use crate::compile_protocol::ToolchainCapability;
+
+        let consumer = Consumer::new();
+        consumer.record_subscribed(peer("provider"), 2);
+        consumer.record_capabilities(
+            peer("provider"),
+            vec![ToolchainCapability {
+                id: "rustc-1".into(),
+                target: "x86_64-unknown-linux-gnu".into(),
+            }],
+        );
+        let view = &consumer.providers()[0];
+        assert_eq!(view.capabilities.len(), 1);
+        assert_eq!(view.capabilities[0].id, "rustc-1");
+    }
+
+    #[test]
+    fn remote_cache_hints_are_recorded_and_removed() {
+        let consumer = Consumer::new();
+        let task_id = Hash32([7; 32]);
+        let first = peer("provider-a");
+        let second = peer("provider-b");
+
+        consumer.record_remote_cache(task_id, &first);
+        consumer.record_remote_cache(task_id, &first);
+        consumer.record_remote_cache(task_id, &second);
+        assert_eq!(
+            consumer.remote_cache_providers(&task_id),
+            vec![first.clone(), second.clone()]
+        );
+
+        consumer.remove_remote_cache(&task_id, &first);
+        assert_eq!(
+            consumer.remote_cache_providers(&task_id),
+            vec![second.clone()]
+        );
+
+        consumer.remove_remote_cache(&task_id, &second);
+        assert!(consumer.remote_cache_providers(&task_id).is_empty());
+    }
+
+    #[test]
+    fn removing_or_expiring_provider_drops_remote_cache() {
+        let consumer = Consumer::new();
+        let task_id = Hash32([8; 32]);
+        let provider = peer("provider");
+        consumer.record_subscribed(provider.clone(), 1);
+        consumer.record_remote_cache(task_id, &provider);
+
+        consumer.remove_provider(&provider);
+        assert!(consumer.remote_cache_providers(&task_id).is_empty());
+
+        let consumer = Consumer::new();
+        let provider = peer("provider");
+        consumer.record_pending(provider.clone());
+        consumer.record_remote_cache(task_id, &provider);
+        consumer.expire_providers(now_ms().saturating_add(61_000), 60_000);
+        assert!(consumer.remote_cache_providers(&task_id).is_empty());
     }
 
     #[test]

@@ -178,6 +178,7 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
 
     let provider = Arc::new(Provider::new(PeerId::new("local"), initial.max_slots));
     provider.set_capacity(initial.max_slots, initial.free_slots);
+    provider.set_capabilities(crate::toolchain::capabilities(&config));
     let consumer = Arc::new(Consumer::new());
     LogStruct::new(
         LogLevel::Important,

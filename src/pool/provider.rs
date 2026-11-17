@@ -10,10 +10,9 @@ use crate::compile::cache::ResultCache;
 use crate::compile::hash::hex_hash;
 use crate::compile_protocol::{
     AppRequest, AppResponse, ErrorCode, Hash32, LeaseId, OutputRef, PeerId, TaskId, TaskState,
+    ToolchainCapability,
 };
-use crate::config::ServiceConfig;
 use crate::log::{LogLevel, LogStruct};
-use crate::toolchain::resolve_rustc;
 use crate::util::time::now_ms;
 use crate::workspace::Workspace;
 
@@ -49,6 +48,7 @@ struct Inner {
     provider_id: PeerId,
     max_slots: u32,
     free_slots: u32,
+    capabilities: Vec<ToolchainCapability>,
     subscriptions: HashMap<PeerId, Subscription>,
     tasks: HashMap<TaskId, TaskEntry>,
     leases: HashMap<LeaseId, Lease>,
@@ -68,6 +68,7 @@ impl Provider {
                 provider_id,
                 max_slots,
                 free_slots: max_slots,
+                capabilities: Vec::new(),
                 subscriptions: HashMap::new(),
                 tasks: HashMap::new(),
                 leases: HashMap::new(),
@@ -123,6 +124,14 @@ impl Provider {
         inner.free_slots = free_slots.min(max_slots);
     }
 
+    pub fn set_capabilities(&self, capabilities: Vec<ToolchainCapability>) {
+        self.write().capabilities = capabilities;
+    }
+
+    pub fn capabilities(&self) -> Vec<ToolchainCapability> {
+        self.read().capabilities.clone()
+    }
+
     pub fn capacity_snapshot(&self) -> CapacitySnapshot {
         let inner = self.read();
         CapacitySnapshot {
@@ -152,11 +161,17 @@ impl Provider {
                 last_sent_accepting: false,
             },
         );
+        let (toolchain, target) = inner
+            .capabilities
+            .first()
+            .map(|capability| (capability.id.clone(), capability.target.clone()))
+            .unwrap_or_default();
         AppResponse::Subscribed {
             provider: inner.provider_id.clone(),
-            toolchain: String::new(),
-            target: String::new(),
+            toolchain,
+            target,
             max_slots: inner.max_slots,
+            capabilities: inner.capabilities.clone(),
         }
     }
 
@@ -293,6 +308,12 @@ impl Provider {
 
     pub fn task_entry(&self, task_id: &TaskId) -> Option<TaskEntry> {
         self.read().tasks.get(task_id).cloned()
+    }
+
+    pub fn discard_task(&self, task_id: TaskId) {
+        let mut inner = self.write();
+        inner.tasks.remove(&task_id);
+        inner.leases.retain(|_, lease| lease.task_id != task_id);
     }
 
     /// Create a lease for a result served from cache, independent of a task.
@@ -455,12 +476,11 @@ pub fn spawn_task(
     provider: Arc<Provider>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
-    config: ServiceConfig,
-    task_id: TaskId,
-    bundle_hash: Hash32,
+    job: TaskJob,
+    rustc: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        run_task_blocking(provider, cache, workspace, config, task_id, bundle_hash);
+        run_task_blocking(provider, cache, workspace, job, rustc);
     })
 }
 
@@ -468,12 +488,11 @@ fn run_task_blocking(
     provider: Arc<Provider>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
-    config: ServiceConfig,
-    task_id: TaskId,
-    bundle_hash: Hash32,
+    job: TaskJob,
+    rustc: String,
 ) {
+    let task_id = TaskId(job.task_id);
     let task_dir = workspace.task_dir(&task_id.0);
-    let bundle_path = task_dir.join("bundle");
     let digest_prefix = &hex_hash(&task_id.0)[..8];
     LogStruct::new(
         LogLevel::Debug,
@@ -490,52 +509,6 @@ fn run_task_blocking(
         .emit();
         provider.fail_task_with_logs(task_id, code, message, stdout, stderr);
         let _ = fs::remove_dir_all(&task_dir);
-    };
-
-    let bundle_len = match fs::metadata(&bundle_path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                format!("read task bundle: {error}"),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-    };
-    let job = match TaskJob::from_bundle_file(
-        &bundle_path,
-        task_id.0,
-        bundle_hash,
-        bundle_len,
-        &task_dir.join("work"),
-    ) {
-        Ok(job) => job,
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                error.message,
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
-    };
-    let rustc = match resolve_rustc(&config, &job.manifest.toolchain_id, &job.manifest.target) {
-        Ok(rustc) => rustc,
-        Err(error) => {
-            fail(
-                &provider,
-                ErrorCode::Internal,
-                format!("toolchain check failed: {error}"),
-                Vec::new(),
-                Vec::new(),
-            );
-            return;
-        }
     };
 
     let result = match crate::compile::executor::execute_job(

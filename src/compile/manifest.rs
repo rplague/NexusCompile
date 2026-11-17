@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
+use crate::compile::ToolchainInfo;
 use crate::compile::hash::hash_bytes;
 use crate::compile_protocol::Hash32;
 use crate::util::args;
@@ -559,8 +560,8 @@ fn normalize_path_token(value: &str, path: &Path, placeholder: &str) -> String {
     value.to_string()
 }
 
-pub fn toolchain_id(rustc: &Path, target: &str) -> Result<String, ManifestError> {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+pub fn toolchain_info(rustc: &Path, target: &str) -> Result<ToolchainInfo, ManifestError> {
+    static CACHE: OnceLock<Mutex<HashMap<String, ToolchainInfo>>> = OnceLock::new();
     let key = format!("{}|{target}", rustc.display());
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(value) = cache.lock().ok().and_then(|cache| cache.get(&key).cloned()) {
@@ -575,14 +576,34 @@ pub fn toolchain_id(rustc: &Path, target: &str) -> Result<String, ManifestError>
         return Err(ManifestError::new("rustc -vV failed"));
     }
 
+    let text = String::from_utf8_lossy(&output.stdout);
+    let release = text
+        .lines()
+        .find_map(|line| line.strip_prefix("release: "))
+        .unwrap_or_default()
+        .to_string();
+    let host = text
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap_or_default()
+        .to_string();
+
     let mut hasher = Sha256::new();
     hasher.update(&output.stdout);
     hasher.update(target.as_bytes());
-    let id = hex_digest(&hasher.finalize());
+    let info = ToolchainInfo {
+        id: hex_digest(&hasher.finalize()),
+        release,
+        host,
+    };
     if let Ok(mut cache) = cache.lock() {
-        cache.insert(key, id.clone());
+        cache.insert(key, info.clone());
     }
-    Ok(id)
+    Ok(info)
+}
+
+pub fn toolchain_id(rustc: &Path, target: &str) -> Result<String, ManifestError> {
+    toolchain_info(rustc, target).map(|info| info.id)
 }
 
 /// Whether the target standard library is installed for this rustc.

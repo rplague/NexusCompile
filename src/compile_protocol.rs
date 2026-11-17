@@ -88,6 +88,13 @@ pub struct BlobRef {
     pub size: u64,
 }
 
+/// One toolchain advertised by a provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolchainCapability {
+    pub id: String,
+    pub target: String,
+}
+
 /// One output file in a remote task result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputRef {
@@ -199,6 +206,9 @@ pub enum AppRequest {
     Cancel {
         task_id: TaskId,
     },
+    FetchCached {
+        task_id: TaskId,
+    },
     ResultAck {
         lease_id: LeaseId,
     },
@@ -213,6 +223,8 @@ pub enum AppResponse {
         toolchain: String,
         target: String,
         max_slots: u32,
+        #[serde(default)]
+        capabilities: Vec<ToolchainCapability>,
     },
     Ack,
     Cached {
@@ -318,6 +330,7 @@ mod tests {
         roundtrip_request(AppRequest::TaskReady { task_id, lease_id });
         roundtrip_request(AppRequest::Status { task_id });
         roundtrip_request(AppRequest::Cancel { task_id });
+        roundtrip_request(AppRequest::FetchCached { task_id });
         roundtrip_request(AppRequest::ResultAck { lease_id });
 
         let provider = PeerId::new("12D3KooWprovider");
@@ -326,6 +339,10 @@ mod tests {
             toolchain: "rustc-1".into(),
             target: "x86_64-unknown-linux-gnu".into(),
             max_slots: 4,
+            capabilities: vec![ToolchainCapability {
+                id: "rustc-1".into(),
+                target: "x86_64-unknown-linux-gnu".into(),
+            }],
         });
         roundtrip_response(AppResponse::Ack);
         roundtrip_response(AppResponse::Cached {

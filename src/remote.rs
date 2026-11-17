@@ -11,8 +11,8 @@ use crate::compile_protocol::{
 use crate::config::ServiceConfig;
 use crate::control::{self, ControlHandle};
 use crate::log::{LogLevel, LogStruct, log_task_error};
-use crate::pool::{Consumer, Provider};
-use crate::toolchain::resolve_rustc;
+use crate::pool::{Consumer, Placement, Provider};
+use crate::toolchain::resolve_toolchain;
 use crate::workspace::Workspace;
 use std::path::Path;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use tokio::time::{sleep, timeout};
 
 const DEFAULT_PROVIDER_COOLDOWN_MS: u64 = 30_000;
 const MIN_BUSY_COOLDOWN_MS: u64 = 1_000;
+const CACHE_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct Coordinator {
     provider: Arc<Provider>,
@@ -68,32 +69,155 @@ impl Coordinator {
             });
         }
 
-        if self.provider.free_slots() == 0
-            && let Some(Ok(result)) = self.try_remote(&job).await
-        {
+        if let Some(result) = self.try_cached(&job).await {
             return Ok(result);
         }
 
-        self.run_local(job).await
+        match self.place(&job) {
+            Placement::Local(rustc) => self.run_local(job, rustc).await,
+            Placement::Remote(providers) => match self.try_remote(&job, providers).await {
+                Some(result) => result,
+                None => Err(TaskError::new(
+                    "no_provider",
+                    "no remote provider accepted the task",
+                )),
+            },
+            Placement::Reject(error) => Err(error),
+        }
     }
 
-    async fn run_local(&self, job: TaskJob) -> Result<TaskResult, TaskError> {
-        let rustc = resolve_rustc(
-            &self.config,
-            &job.manifest.toolchain_id,
-            &job.manifest.target,
-        )
-        .map_err(|error| TaskError::new("toolchain_error", error))?;
+    async fn try_cached(&self, job: &TaskJob) -> Option<TaskResult> {
+        let providers = self.consumer.remote_cache_providers(&job.task_id);
+        if providers.is_empty() {
+            return None;
+        }
+
+        let transfer = RemoteTransfer::new(
+            self.control.clone(),
+            self.cache.clone(),
+            self.config.service_name.clone(),
+        );
+
+        for provider in providers {
+            match transfer
+                .fetch_cached(&provider, job.task_id, &job.prepared.out_dir)
+                .await
+            {
+                Ok(outputs) => {
+                    self.consumer.record_remote_cache(job.task_id, &provider);
+                    self.consumer.clear_cooldown(&provider);
+                    return Some(TaskResult {
+                        action_digest: job.task_id,
+                        exit_code: 0,
+                        cache_hit: true,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                        duration_ms: 0,
+                        outputs,
+                    });
+                }
+                Err(error) => {
+                    self.consumer.remove_remote_cache(&job.task_id, &provider);
+                    LogStruct::new(
+                        LogLevel::Debug,
+                        "缓存",
+                        format!("remote cache miss provider={provider}: {error}"),
+                    )
+                    .emit();
+                }
+            }
+        }
+
+        None
+    }
+
+    fn place(&self, job: &TaskJob) -> Placement {
+        if self.provider.free_slots() > 0
+            && let Ok(resolved) = resolve_toolchain(&self.config, &job.requirements.toolchain)
+        {
+            return Placement::Local(resolved.rustc);
+        }
+
+        let providers: Vec<_> = self
+            .consumer
+            .providers()
+            .into_iter()
+            .filter(|view| {
+                view.accepting
+                    && view.free_slots > 0
+                    && (view.capabilities.is_empty()
+                        || view.capabilities.iter().any(|capability| {
+                            capability.id == job.requirements.toolchain.id
+                                && capability.target == job.requirements.toolchain.target
+                        }))
+            })
+            .map(|view| view.provider)
+            .collect();
+        if providers.is_empty() {
+            return Placement::Reject(TaskError::new(
+                "no_capacity",
+                "no local or remote capacity for task",
+            ));
+        }
+        Placement::Remote(providers)
+    }
+
+    async fn run_local(&self, job: TaskJob, rustc: String) -> Result<TaskResult, TaskError> {
+        let task_id = TaskId(job.task_id);
+        let consumer = self.provider.provider_id();
+        let lease =
+            match self
+                .provider
+                .reserve(consumer, task_id, job.requirements.slots, job.bundle_hash)
+            {
+                crate::compile_protocol::AppResponse::Granted { lease_id, .. } => lease_id,
+                other => {
+                    return Err(TaskError::new(
+                        "reserve_error",
+                        format!("local reservation failed: {other:?}"),
+                    ));
+                }
+            };
+        if !matches!(
+            self.provider.task_ready(task_id, lease),
+            crate::compile_protocol::AppResponse::Ack
+        ) {
+            return Err(TaskError::new("reserve_error", "local task was not ready"));
+        }
+
         let cache = self.cache.clone();
         let workspace = self.workspace.clone();
-        match tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             executor::execute_job(&job, &rustc, &cache, &workspace, TaskSource::Local)
         })
         .await
-        {
-            Ok(result) => result,
-            Err(error) => Err(TaskError::new("join_error", error.to_string())),
+        .map_err(|error| TaskError::new("join_error", error.to_string()))?;
+
+        match &result {
+            Ok(task_result) if task_result.exit_code == 0 => {
+                self.provider
+                    .complete_task(task_id, task_result.outputs.clone());
+                self.provider.result_ack(lease);
+            }
+            Ok(task_result) => {
+                self.provider.fail_task(
+                    task_id,
+                    crate::compile_protocol::ErrorCode::Compile,
+                    format!("rustc exited with {}", task_result.exit_code),
+                );
+                self.provider.discard_task(task_id);
+            }
+            Err(error) => {
+                self.provider.fail_task(
+                    task_id,
+                    crate::compile_protocol::ErrorCode::Internal,
+                    error.message.clone(),
+                );
+                self.provider.discard_task(task_id);
+            }
         }
+
+        result
     }
 
     fn cool_down_provider(
@@ -112,30 +236,18 @@ impl Coordinator {
         );
     }
 
-    async fn try_remote(&self, job: &TaskJob) -> Option<Result<TaskResult, TaskError>> {
+    async fn try_remote(
+        &self,
+        job: &TaskJob,
+        providers: Vec<PeerId>,
+    ) -> Option<Result<TaskResult, TaskError>> {
         let task = hex_hash(&job.task_id);
         let transfer = RemoteTransfer::new(
             self.control.clone(),
             self.cache.clone(),
             self.config.service_name.clone(),
         );
-
-        let (consumer, providers) = {
-            let consumer = self.provider.provider_id();
-            let providers: Vec<_> = self
-                .consumer
-                .providers()
-                .into_iter()
-                .filter(|view| view.accepting && view.free_slots > 0)
-                .map(|view| view.provider)
-                .collect();
-            (consumer, providers)
-        };
-
-        if providers.is_empty() {
-            LogStruct::new(LogLevel::Debug, "远端编译", "没有可用的 provider").emit();
-            return None;
-        }
+        let consumer = self.provider.provider_id();
 
         for provider in providers {
             LogStruct::new(
@@ -176,9 +288,17 @@ impl Coordinator {
                     {
                         Ok(outputs) => outputs,
                         Err(error) => {
-                            return Some(Err(TaskError::new("result_error", error)));
+                            self.consumer.remove_remote_cache(&job.task_id, &provider);
+                            self.cool_down_provider(
+                                &provider,
+                                &task,
+                                DEFAULT_PROVIDER_COOLDOWN_MS,
+                                &format!("cache_import_error message={error}"),
+                            );
+                            continue;
                         }
                     };
+                    self.consumer.record_remote_cache(job.task_id, &provider);
                     self.consumer.clear_cooldown(&provider);
                     let _ = control::send(
                         &self.control,
@@ -286,6 +406,7 @@ impl Coordinator {
                 .await
             {
                 RemoteOutcome::Success(outputs) => {
+                    self.consumer.record_remote_cache(job.task_id, &provider);
                     self.consumer.clear_cooldown(&provider);
                     LogStruct::new(
                         LogLevel::Debug,
@@ -369,6 +490,38 @@ impl RemoteTransfer {
         control::send(&self.control, &self.service_name, provider, request)
             .await
             .map_err(|e| e.message)
+    }
+
+    async fn fetch_cached(
+        &self,
+        provider: &PeerId,
+        digest: Hash32,
+        out_dir: &Path,
+    ) -> Result<Vec<OutputRef>, String> {
+        let task_id = TaskId(digest);
+        let response = timeout(
+            CACHE_FETCH_TIMEOUT,
+            self.send(provider, AppRequest::FetchCached { task_id }),
+        )
+        .await
+        .map_err(|_| "cache fetch timeout".to_string())??;
+
+        match response {
+            AppResponse::Cached {
+                task_id: cached_task,
+                outputs,
+                lease_id,
+            } if cached_task == task_id => {
+                let result = self
+                    .import_outputs(provider, digest, outputs, out_dir)
+                    .await;
+                let _ = self
+                    .send(provider, AppRequest::ResultAck { lease_id })
+                    .await;
+                result
+            }
+            other => Err(format!("cache fetch miss: {other:?}")),
+        }
     }
 
     async fn upload_bundle(

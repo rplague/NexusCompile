@@ -19,7 +19,7 @@ This project is more than a NexusNet backend adapter: it implements the local wr
 | **node / backend** | This process. Listens on `127.0.0.1:<port>` and is dialed by the NexusNet node, which completes the hello handshake. |
 | **wrapper** | `nexus-rustc`. cargo invokes it through `RUSTC_WRAPPER`; it forwards requests to this process over a Unix socket. |
 | **provider** | The side that accepts `rustc-pool` tasks, runs rustc, and returns outputs. |
-| **consumer** | The side that starts remote compiles when the local cache misses and local capacity is busy. |
+| **consumer** | The side that places tasks into the unified local/remote pool and tracks provider toolchain capabilities. |
 | **task / action digest** | The normalized fingerprint of one rustc invocation (32 bytes), also used as the `TaskId`. |
 | **bundle** | The manifest, sources, externs, and OUT_DIR inputs required by one remote task. |
 | **slot** | One unit of compile concurrency, derived from CPU and memory. |
@@ -213,7 +213,7 @@ as a compatibility path base; the legacy `nexus.sock` server has been removed.
 
 - The cache is partitioned by action digest; outputs are stored by SHA-256 content address in the CAS.
 - Result TTL is fixed at 24 hours; hits renew the TTL; the TTL resets after a restart.
-- The cache is local only and is not shared across nodes. A remote provider's own cache can still hit on a later `Reserve` and return `Cached`.
+- The cache is local only and is not shared across nodes. The consumer keeps an in-memory location hint for remote providers that successfully served a digest; a later `FetchCached` asks that provider for the result, and a failure removes the hint before falling back to the compile pool.
 - If the cache cannot be opened, it degrades to disabled; if local execution fails, the wrapper falls back to the real rustc.
 
 ## Distributed compile pool
@@ -221,14 +221,18 @@ as a compatibility path base; the legacy `nexus.sock` server has been removed.
 ### Task lifecycle
 
 ```text
-Reserve
-  -> BlobPut (upload the bundle in 1 MiB chunks)
-  -> TaskReady
-  -> provider runs rustc
-  -> consumer polls Status
-  -> BlobGet (download outputs in 1 MiB chunks)
-  -> verify SHA-256 and write to the local cache
-  -> ResultAck
+try local result cache
+  -> FetchCached (remote location hint; no slot)
+       -> Cached -> BlobGet outputs -> ResultAck
+       -> miss/failure -> remove hint -> compile pool
+  -> Reserve
+       -> BlobPut (upload the bundle in 1 MiB chunks)
+       -> TaskReady
+       -> provider runs rustc
+       -> consumer polls Status
+       -> BlobGet (download outputs in 1 MiB chunks)
+       -> verify SHA-256 and write to the local cache
+       -> ResultAck
 ```
 
 - `TaskId` is the action digest (32 bytes); the same digest maps to the same task.
@@ -240,17 +244,20 @@ Reserve
 - By default, the consumer polls `Status` once per second with an overall timeout of 30 minutes.
 - `Done` returns the `OutputRef` list; the consumer downloads each chunk, verifies hashes, and writes to its local CAS/cache.
 - Every `Reserve` that returns a result creates a lease. `ResultAck` releases that lease's pin, removes the task directory when the last lease is gone, and deletes the `TaskEntry`. The provider result cache remains available for later hits.
+- `FetchCached` checks only the provider result cache, validates blobs, and returns `Cached` with a lease; it does not create a `TaskEntry` or consume a slot.
 - `Reserve` and `Status` fall back to the provider result cache when no `TaskEntry` exists; a cache-only `Cached` reply carries a lease and pins the cache entry until `ResultAck` or lease expiry.
 - `Cancel` marks the task `Cancelled` and frees the slot.
 
-The provider side:
+`Reserve` only reserves a slot and creates a lease; it does not inspect the task. The provider side performs the full review after `TaskReady`, once the bundle has been uploaded:
 
 1. verifies that the bundle file hash equals `Reserve.input_manifest`;
-2. recomputes the manifest digest and compares it with `TaskId`;
-3. materializes bundle files into the task work directory;
-4. substitutes `<MANIFEST>`, `<OUT>`, and `<EXTERN>` placeholders;
-5. runs `[node].rustc` and collects outputs under `OUT_DIR`;
+2. reviews the invocation shape and recomputes the manifest digest against `TaskId`;
+3. resolves the requested `toolchain_id` and `target` once;
+4. materializes bundle files and substitutes `<MANIFEST>`, `<OUT>`, and `<EXTERN>` placeholders;
+5. runs the resolved rustc and collects outputs under `OUT_DIR`;
 6. writes the local cache and marks the task `Done`.
+
+If `TaskReady` review fails, the provider fails the task, removes the bundle directory, and the consumer may try another provider.
 
 ### Capacity and subscriptions
 
@@ -283,7 +290,7 @@ require_auth = false
 
 - Both nodes must run this backend and use the same `service_name`.
 - Providers are discovered automatically; there is no static peer list.
-- Consumers send the action manifest's `toolchain_id` and `target` in `Reserve`; providers reject mismatches and missing target standard libraries.
+- Providers advertise toolchain capabilities in `Subscribed`; consumers prefer providers whose `toolchain_id` and `target` match. The final authority is the provider's review after the complete bundle arrives.
 - Production deployments should enable NexusNet authentication and allow only trusted peers to reach this service.
 
 ## Protocol
@@ -391,6 +398,7 @@ The current `APP_PROTOCOL_VERSION = 2`. `body` is discriminated by the text fiel
 | `subscribe` | consumer -> provider | `consumer`, `toolchain`, `target` | Subscribe to capacity updates |
 | `unsubscribe` | consumer -> provider | `consumer` | Cancel a subscription |
 | `capacity_update` | provider -> consumer | `provider`, `seq`, `free_slots`, `queue_len`, `accepting` | Capacity broadcast |
+| `fetch_cached` | consumer -> provider | `task_id` | Request a cached result without reserving a slot |
 | `reserve` | consumer -> provider | `consumer`, `task_id`, `slots`, `input_manifest` | Request a slot |
 | `blob_put` | consumer -> provider | `task_id`, `hash`, `offset`, `data` | Upload a bundle chunk |
 | `blob_get` | consumer -> provider | `hash`, `offset`, `len` | Download an output chunk |
@@ -403,7 +411,7 @@ The current `APP_PROTOCOL_VERSION = 2`. `body` is discriminated by the text fiel
 
 | `t` | Fields | Description |
 |---|---|---|
-| `subscribed` | `provider`, `toolchain`, `target`, `max_slots` | Subscription accepted |
+| `subscribed` | `provider`, `toolchain`, `target`, `max_slots`, `capabilities` | Subscription accepted |
 | `ack` | - | Generic acknowledgement |
 | `cached` | `task_id`, `outputs`, `lease_id` | Result is available from the task entry or the provider cache |
 | `granted` | `task_id`, `lease_id` | Slot granted |
@@ -436,7 +444,7 @@ The current `APP_PROTOCOL_VERSION = 2`. `body` is discriminated by the text fiel
   - the `toolchain_id` derived from `rustc -vV` and the target;
   - normalized args/env (paths replaced with `<MANIFEST>`, `<OUT>`, `<EXTERN>`, `<TARGET>`);
   - SHA-256 and size of every input file.
-- The provider verifies the bundle file hash and manifest digest before running rustc.
+- The provider verifies the bundle file hash, manifest digest, invocation shape, and toolchain requirement after `TaskReady` and before running rustc.
 - `<TARGET>` is currently used only for digest normalization; the provider substitutes only `<MANIFEST>`, `<OUT>`, and `<EXTERN>` before execution.
 
 ## Enabling cargo acceleration on Debian/Ubuntu
@@ -565,11 +573,12 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 
 ## Compile task pipeline
 
-1. `nexus-rustc` builds a `TaskBundle` and sends it over the local task socket.
-2. `local_task` validates the bundle once and constructs a `TaskJob`.
-3. `Coordinator` checks the cache, then executes locally or uploads the same job remotely.
-4. Remote providers execute the same `TaskJob` through `compile::executor`; they do not re-parse bundles or rebuild manifests.
+1. `nexus-rustc` preflights the invocation, builds a `TaskBundle`, and sends it over the local task socket.
+2. `local_task` constructs a `TaskJob`, which performs the single full task review: invocation shape, bundle identity, manifest digest, and toolchain requirement.
+3. `Coordinator` checks the local cache, then remote cache hints via `FetchCached`, and only then places the task in the compile pool. Cache failures remove the hint; local execution and remote `Reserve` both use a task lease.
+4. A remote provider performs the same full review after the complete bundle arrives at `TaskReady`; it resolves the requested toolchain once and executes through `compile::executor`.
 5. `TaskResult` carries outputs, diagnostics, cache state and duration back to the transport layer.
+6. Providers advertise toolchain capabilities so the consumer can prefer matching versions; providers still verify the actual bundle before execution.
 
 ## Module map
 
@@ -586,13 +595,13 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | **control** | `ControlPlane` abstraction over the local node connection |
 | **connection** | Handshake, read loop, pending table, and `BackendClient` control helpers |
 | **compile_protocol** | `rustc-pool` application v2: `AppRequest`, `AppResponse`, task states |
-| **service** | Decode and dispatch application requests: subscribe, reserve, blob, status, cancel, result ack |
+| **service** | Decode and dispatch application requests: subscribe, capacity-only reserve, task-ready review, blob, status, cancel, result ack |
 | **task_blob** | Task bundle chunk I/O and task-directory cleanup |
 | **local_task_protocol** | Local wrapper ↔ sidecar task protocol and framing helpers |
 | **local_task** | Task socket/session, TaskJob construction, output delivery |
 | **nexus-rustc** (bin) | `RUSTC_WRAPPER` implementation: typed socket client, staged output commit, rustc fallback |
-| **compile** | Shared `TaskJob`/`TaskResult` pipeline: `bundle` (validate/materialize/prepare), `executor` (local staging), `manifest`, `cache`, `cas`, `hash` |
-| **remote** | Consumer `Coordinator`: provider routing, bundle upload, task polling and result import |
+| **compile** | Shared `TaskJob`/`TaskResult` pipeline: `review` (invocation/toolchain requirements), `bundle` (validate/materialize/prepare), `executor` (local staging), `manifest`, `cache`, `cas`, `hash` |
+| **remote** | Consumer `Coordinator`: local/remote cache lookup, provider routing, bundle upload, task polling and result import |
 | **pool** | `Provider` (capacity/subscriptions/tasks/leases), `Consumer` (provider views), and `runtime` scheduling |
 | **workspace** | Staging and provider task directories |
 | **capacity** | `/proc` sampling and slot calculation |
@@ -615,9 +624,9 @@ end-to-end tests that invoke the local `rustc`.
 
 - **Shared task lifetime**: multiple consumers can share a task lease; the first `ResultAck` removes the `TaskEntry`. Other consumers recover the result through the provider cache via `Status`; if the cache entry is evicted first, they retry or fall back locally.
 - **Unacked tasks**: task entries whose consumers never send `ResultAck` remain in memory until the same task id is reserved again or the process restarts.
-- **Local builds do not consume slots**: `nexus-rustc` local execution does not go through `Provider::reserve`; concurrency is mainly controlled by cargo/the wrapper. Capacity sampling only reflects load after the fact.
+- **Local builds use the local pool**: `Coordinator` places local work through `Provider::reserve` and a lease before execution. Capacity sampling still reflects actual load after the fact.
 - **Single-connection assumption**: the server accepts multiple NexusNet connections, but `AppState` holds one control handle; the newest connection wins, and an older disconnect cannot clear it.
-- **Toolchain selection**: consumers pass the action manifest's `toolchain_id` and `target` in `Reserve`. Providers reject mismatches and check that the target standard library is installed. This is a local compatibility check, not a security boundary.
+- **Toolchain selection**: consumers use advertised provider capabilities for prefiltering; providers do the authoritative toolchain/target check after the full bundle arrives. This is a local compatibility check, not a security boundary.
 - **Trust boundary**: remote compilation executes the submitter's rustc arguments and externs (including proc-macros), which is equivalent to running code on the provider; the consumer only verifies output hashes and does not independently validate the compile result. Deploy only on trusted networks with NexusNet authentication enabled.
 - **Discovery**: providers are found automatically through NexusNet `discover_providers`; there is no static peer list. An empty/failed discovery result clears the current provider views and retries after 30 seconds; a normal but insufficient result retries after 1 hour.
 - **Cache granularity**: the action digest hashes the entire `CARGO_MANIFEST_DIR` (excluding `target`, `.git`, and `node_modules`), so changes to non-build files also invalidate the cache; full-tree hashing and bundle construction are expensive for large packages.
