@@ -257,6 +257,47 @@ struct RuntimeServices {
     task_socket: PathBuf,
 }
 
+struct ServerTasks {
+    cache_sweeper: Option<JoinHandle<()>>,
+    pool: Option<JoinHandle<()>>,
+    task_service: Option<JoinHandle<()>>,
+    task_socket: PathBuf,
+}
+
+impl ServerTasks {
+    async fn shutdown(&mut self) {
+        if let Some(task) = self.cache_sweeper.take() {
+            task.abort();
+        }
+        if let Some(mut task) = self.pool.take()
+            && tokio::time::timeout(Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+        }
+        if let Some(task) = self.task_service.take() {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&self.task_socket);
+    }
+}
+
+impl Drop for ServerTasks {
+    fn drop(&mut self) {
+        if let Some(task) = self.cache_sweeper.take() {
+            task.abort();
+        }
+        if let Some(task) = self.pool.take() {
+            task.abort();
+        }
+        if let Some(task) = self.task_service.take() {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&self.task_socket);
+    }
+}
+
 async fn run_server(
     listener: TcpListener,
     services: RuntimeServices,
@@ -286,6 +327,12 @@ async fn run_server(
     ));
     let task_service = bind_task_service(&task_socket, coordinator, cache.clone(), workspace);
 
+    let mut tasks = ServerTasks {
+        cache_sweeper: Some(cache_sweep_task),
+        pool: Some(pool_task),
+        task_service,
+        task_socket: task_socket.clone(),
+    };
     let mut connections = JoinSet::new();
     let result: Result<(), String> = loop {
         tokio::select! {
@@ -325,19 +372,8 @@ async fn run_server(
     };
 
     drop(listener);
-    cache_sweep_task.abort();
-    let mut pool_task = pool_task;
-    if tokio::time::timeout(Duration::from_secs(3), &mut pool_task)
-        .await
-        .is_err()
-    {
-        pool_task.abort();
-    }
-    if let Some(task) = task_service {
-        task.abort();
-    }
+    tasks.shutdown().await;
     connections.shutdown().await;
-    let _ = std::fs::remove_file(&task_socket);
     result
 }
 
