@@ -42,7 +42,7 @@ async fn main() -> std::io::Result<()> {
     };
     let config_snapshot = config_handle.snapshot();
     for warning in config_snapshot.warnings() {
-        LogStruct::new(LogLevel::Warning, "配置警告", warning).emit();
+        LogStruct::new(LogLevel::Warning, "配置警告", warning.to_string()).emit();
     }
     let address = format!("127.0.0.1:{}", config_handle.port());
     let listener = TcpListener::bind(&address).await?;
