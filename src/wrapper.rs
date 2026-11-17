@@ -440,6 +440,7 @@ mod tests {
         client
             .download_outputs(Hash32([1; 32]), &[output], &dir)
             .unwrap();
+        client.ack(Hash32([1; 32])).unwrap();
         server.join().unwrap();
 
         assert_eq!(fs::read(dir.join("libdemo.rlib")).unwrap(), data);
@@ -469,7 +470,7 @@ mod tests {
         let data = b"rlib bytes".to_vec();
         let output = output("libdemo.rlib", &data, 0o644);
         let (client, server) = UnixStream::pair().unwrap();
-        let server = serve_hit(server, output.clone(), b"wrong".to_vec(), false);
+        let server = serve_hit(server, output.clone(), vec![b'x'; data.len()], false);
 
         let mut client = TaskSocketClient { stream: client };
         let error = client
