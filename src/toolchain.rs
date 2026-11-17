@@ -76,6 +76,9 @@ fn doctor(args: &[String]) -> Result<(), String> {
 
     let config_path = config_path.unwrap_or_else(paths::config_path);
     let config = load_service_config(&config_path)?;
+    for warning in config.warnings() {
+        println!("doctor: warning: {warning}");
+    }
 
     for entry in configured_toolchains(&config) {
         let rustc = entry.rustc.trim();
@@ -156,9 +159,10 @@ pub fn resolve_rustc(
 }
 
 fn load_service_config(path: &Path) -> Result<ServiceConfig, String> {
-    let text =
-        fs::read_to_string(path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    toml::from_str(&text).map_err(|error| format!("parse {}: {error}", path.display()))
+    if !path.exists() {
+        return Err(format!("read {}: file not found", path.display()));
+    }
+    ServiceConfig::try_from_toml_file(path, false).map_err(|error| error.to_string())
 }
 
 fn check_rustc(rustc: &str) -> Result<String, String> {
@@ -442,24 +446,11 @@ fn run(command: &mut Command) -> Result<Output, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = env::temp_dir().join(format!(
-            "nexuscompile-toolchain-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::test_support::TempDir;
 
     #[test]
-    fn configure_preserves_existing_content() {
-        let root = temp_dir();
+    fn configure_preserves_existing_and_creates_node_table() {
+        let root = TempDir::new("toolchain-existing");
         let path = root.join("config.toml");
         fs::write(
             &path,
@@ -482,14 +473,8 @@ mod tests {
         assert!(text.contains("rustc = \"/opt/rust/bin/rustc\""));
         assert_eq!(text.matches("rustc =").count(), 1);
 
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn configure_creates_node_table() {
-        let root = temp_dir();
+        let root = TempDir::new("toolchain-new");
         let path = root.join("config.toml");
-
         configure(&[
             "--config".into(),
             path.display().to_string(),
@@ -499,15 +484,13 @@ mod tests {
         .unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("[node]"));
+        assert!(text.contains("[node]"), "case: creates node table");
         assert!(text.contains("rustc = \"/opt/rust/bin/rustc\""));
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn configure_toolchains_writes_registry() {
-        let root = temp_dir();
+        let root = TempDir::new("toolchain");
         let config = root.join("config.toml");
         let state = root.join("state");
         fs::write(
@@ -531,29 +514,27 @@ mod tests {
         assert_eq!(parsed.node.toolchains[0].target, "x86_64-unknown-linux-gnu");
         assert_eq!(parsed.node.toolchains[1].channel, "1.99.0");
         assert!(parsed.node.toolchains[1].target.is_empty());
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn state_rejects_malformed_lines() {
-        let root = temp_dir();
+    fn state_and_resolver_validation() {
+        let root = TempDir::new("toolchain-state");
         let state = root.join("state");
         fs::write(&state, "stable|/opt/stable/bin/rustc\n").unwrap();
-        assert!(read_toolchain_state(&state).is_err());
-        fs::remove_dir_all(root).unwrap();
-    }
+        assert!(read_toolchain_state(&state).is_err(), "case: malformed state");
 
-    #[test]
-    fn resolver_matches_default_toolchain() {
         let config = ServiceConfig::default();
         let id = toolchain_id(Path::new("rustc"), "").unwrap();
-        assert_eq!(resolve_rustc(&config, &id, "").unwrap(), "rustc");
-        assert!(resolve_rustc(&config, "not-a-toolchain", "").is_err());
-    }
+        assert_eq!(
+            resolve_rustc(&config, &id, "").unwrap(),
+            "rustc",
+            "case: default"
+        );
+        assert!(
+            resolve_rustc(&config, "not-a-toolchain", "").is_err(),
+            "case: unknown"
+        );
 
-    #[test]
-    fn resolver_uses_configured_toolchain_list() {
         let mut config = ServiceConfig::default();
         config.node.toolchains = vec![
             ToolchainEntry {
@@ -567,7 +548,10 @@ mod tests {
                 target: String::new(),
             },
         ];
-        let id = toolchain_id(Path::new("rustc"), "").unwrap();
-        assert_eq!(resolve_rustc(&config, &id, "").unwrap(), "rustc");
+        assert_eq!(
+            resolve_rustc(&config, &id, "").unwrap(),
+            "rustc",
+            "case: configured list"
+        );
     }
 }

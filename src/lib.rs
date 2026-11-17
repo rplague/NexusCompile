@@ -2,6 +2,7 @@ pub mod capacity;
 pub mod compile;
 pub mod compile_protocol;
 pub mod config;
+pub mod config_cli;
 pub mod connection;
 pub mod control;
 pub mod local_protocol;
@@ -22,3 +23,5 @@ pub mod workspace;
 
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod test_support;

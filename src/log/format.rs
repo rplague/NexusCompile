@@ -51,16 +51,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn journald_single_line_with_prefix_and_collapsed_newlines() {
+    fn journald_formatting() {
         let entry = LogStruct::new(LogLevel::Error, "topic", "line1\nline2");
         let line = render_journald(&entry);
-        assert_eq!(line, "<3>[!] topic: line1 line2");
-        assert!(!line.contains('\n'));
-    }
+        assert_eq!(line, "<3>[!] topic: line1 line2", "case: multiline");
+        assert!(!line.contains('\n'), "case: single line");
 
-    #[test]
-    fn journald_empty_content() {
         let entry = LogStruct::new(LogLevel::Debug, "topic", "");
-        assert_eq!(render_journald(&entry), "<7>[+] topic");
+        assert_eq!(render_journald(&entry), "<7>[+] topic", "case: empty");
     }
 }

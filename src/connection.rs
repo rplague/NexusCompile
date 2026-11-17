@@ -441,11 +441,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handshake_ok() {
+    async fn handshake_validation() {
         let (port, _srv) = spawn_server().await;
         let mut stream = connect(port).await;
         let (mut r, mut w) = stream.split();
-
         protocol::write_frame(
             &mut w,
             &Message::Hello {
@@ -454,38 +453,33 @@ mod tests {
         )
         .await
         .unwrap();
-
         match protocol::read_frame(&mut r).await.unwrap() {
             Message::Hello { version } => assert_eq!(version, PROTOCOL_VERSION),
             other => panic!("expected hello, got {}", other.kind()),
         }
-    }
 
-    #[tokio::test]
-    async fn handshake_version_mismatch_closes() {
         let (port, srv) = spawn_server().await;
         let mut stream = connect(port).await;
         let (mut r, mut w) = stream.split();
-
         protocol::write_frame(&mut w, &Message::Hello { version: 999 })
             .await
             .unwrap();
-
-        assert!(protocol::read_frame(&mut r).await.is_err());
+        assert!(
+            protocol::read_frame(&mut r).await.is_err(),
+            "case: version mismatch"
+        );
         srv.await.unwrap();
-    }
 
-    #[tokio::test]
-    async fn handshake_non_hello_closes() {
         let (port, srv) = spawn_server().await;
         let mut stream = connect(port).await;
         let (mut r, mut w) = stream.split();
-
         protocol::write_frame(&mut w, &Message::ListServices { id: Uuid::new_v4() })
             .await
             .unwrap();
-
-        assert!(protocol::read_frame(&mut r).await.is_err());
+        assert!(
+            protocol::read_frame(&mut r).await.is_err(),
+            "case: non-hello first frame"
+        );
         srv.await.unwrap();
     }
 

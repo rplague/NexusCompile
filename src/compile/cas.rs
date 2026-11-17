@@ -188,50 +188,33 @@ impl Cas {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("nexuscompile-cas-{}-{unique}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+    use crate::test_support::TempDir;
 
     #[test]
-    fn put_get_and_deduplicate() {
-        let root = temp_dir();
-        let cas = Cas::new(&root);
+    fn roundtrip_dedup_and_integrity() {
+        let root = TempDir::new("cas");
+        let cas = Cas::new(root.path());
+
         let first = cas.put_bytes(b"hello").unwrap();
         let second = cas.put_bytes(b"hello").unwrap();
         assert_eq!(first, second);
         assert_eq!(cas.get_bytes(&first.hash).unwrap(), b"hello");
         assert!(cas.has(&first.hash));
-        fs::remove_dir_all(root).unwrap();
-    }
 
-    #[test]
-    fn materialize_verifies_and_copies() {
-        let root = temp_dir();
-        let cas = Cas::new(&root);
         let blob = cas.put_bytes(b"payload").unwrap();
         let target = root.join("out/file.rlib");
         cas.materialize(&blob.hash, &target, 0o644).unwrap();
         assert_eq!(fs::read(target).unwrap(), b"payload");
-        fs::remove_dir_all(root).unwrap();
-    }
 
-    #[test]
-    fn corrupt_blob_is_rejected() {
-        let root = temp_dir();
-        let cas = Cas::new(&root);
-        let blob = cas.put_bytes(b"payload").unwrap();
         fs::write(cas.blob_path(&blob.hash), b"broken").unwrap();
-        assert!(cas.get_bytes(&blob.hash).is_err());
+        assert!(cas.get_bytes(&blob.hash).is_err(), "case: get_bytes");
         assert!(!cas.has(&blob.hash));
-        fs::remove_dir_all(root).unwrap();
+
+        fs::write(cas.blob_path(&blob.hash), b"broken").unwrap();
+        assert!(
+            cas.materialize(&blob.hash, &root.join("out/bad.rlib"), 0o644)
+                .is_err(),
+            "case: materialize"
+        );
     }
 }

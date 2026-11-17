@@ -214,87 +214,39 @@ fn read_meminfo() -> io::Result<(u64, u64)> {
 mod tests {
     use super::*;
 
-    fn sample(used_cores: f32, mem_total_mb: u64, mem_available_mb: u64) -> CapacitySample {
-        CapacitySample {
-            total_cores: 4.0,
-            used_cores,
-            mem_total_mb,
-            mem_available_mb,
+    #[test]
+    fn capacity_table() {
+        let cases = [
+            ("usage_percent", 4.0, 1.2, 8192, 4096, 80, 3, 1, true),
+            ("idle", 16.0, 0.0, 16384, 16384, 80, 6, 6, true),
+            ("memory_limit", 8.0, 0.0, 8192, 1024, 80, 0, 0, false),
+            ("zero_capacity", 1.0, 1.0, 1024, 0, 80, 0, 0, false),
+            ("fifty_percent", 8.0, 4.0, 32768, 16384, 100, 8, 4, true),
+        ];
+
+        for (name, total_cores, used_cores, mem_total_mb, mem_available_mb, percent, max, free, accepting) in cases {
+            let sample = CapacitySample {
+                total_cores,
+                used_cores,
+                mem_total_mb,
+                mem_available_mb,
+            };
+            let snapshot = calculate_capacity(&sample, 0, percent);
+            assert_eq!(snapshot.max_slots, max, "case: {name}");
+            assert_eq!(snapshot.free_slots, free, "case: {name}");
+            assert_eq!(snapshot.accepting, accepting, "case: {name}");
         }
-    }
 
-    #[test]
-    fn computes_capacity_from_usage_percent() {
-        let sample = sample(1.2, 8192, 4096);
-        let snapshot = calculate_capacity(&sample, 0, 80);
-        assert_eq!(snapshot.max_slots, 3);
-        assert_eq!(snapshot.free_slots, 1);
-        assert!(snapshot.accepting);
-    }
-
-    #[test]
-    fn idle_capacity_equals_max_slots() {
-        let sample = CapacitySample {
-            total_cores: 16.0,
-            used_cores: 0.0,
-            mem_total_mb: 16384,
-            mem_available_mb: 16384,
-        };
-        let snapshot = calculate_capacity(&sample, 0, 80);
-        assert_eq!(snapshot.max_slots, 6);
-        assert_eq!(snapshot.free_slots, 6);
-    }
-
-    #[test]
-    fn memory_limit_reduces_free_slots() {
-        let sample = CapacitySample {
-            total_cores: 8.0,
-            used_cores: 0.0,
-            mem_total_mb: 8192,
-            mem_available_mb: 1024,
-        };
-        let snapshot = calculate_capacity(&sample, 0, 80);
-        assert_eq!(snapshot.free_slots, 0);
-        assert!(!snapshot.accepting);
-    }
-
-    #[test]
-    fn zero_capacity_is_not_accepting() {
-        let sample = CapacitySample {
-            total_cores: 1.0,
-            used_cores: 1.0,
-            mem_total_mb: 1024,
-            mem_available_mb: 0,
-        };
-        let snapshot = calculate_capacity(&sample, 0, 80);
-        assert_eq!(snapshot.max_slots, 0);
-        assert_eq!(snapshot.free_slots, 0);
-        assert!(!snapshot.accepting);
-    }
-
-    #[test]
-    fn percent_is_clamped_to_100() {
         let sample = CapacitySample {
             total_cores: 4.0,
             used_cores: 0.0,
             mem_total_mb: 16384,
             mem_available_mb: 16384,
         };
-        let clamped = calculate_capacity(&sample, 0, 120);
-        let full = calculate_capacity(&sample, 0, 100);
-        assert_eq!(clamped, full);
-    }
-
-    #[test]
-    fn fifty_percent_usage_leaves_half_the_slots() {
-        let sample = CapacitySample {
-            total_cores: 8.0,
-            used_cores: 4.0,
-            mem_total_mb: 32768,
-            mem_available_mb: 16384,
-        };
-        let snapshot = calculate_capacity(&sample, 0, 100);
-        assert_eq!(snapshot.max_slots, 8);
-        assert_eq!(snapshot.free_slots, 4);
+        assert_eq!(
+            calculate_capacity(&sample, 0, 120),
+            calculate_capacity(&sample, 0, 100),
+            "case: percent clamp"
+        );
     }
 }

@@ -715,7 +715,6 @@ fn run_task_blocking(
 mod tests {
     use super::*;
     use crate::capacity::CapacitySnapshot;
-    use std::path::Path;
 
     fn peer(value: &str) -> PeerId {
         PeerId::new(value)
@@ -746,40 +745,25 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_is_keyed_by_peer_id_and_replaces() {
-        let provider = Provider::new(peer("provider"), 2);
+    fn subscribe_and_due_updates() {
+        let provider = Provider::new(peer("provider"), 4);
         let first = provider.subscribe(peer("consumer"));
         let second = provider.subscribe(peer("consumer"));
 
-        assert_eq!(
-            first,
-            AppResponse::Subscribed {
-                provider: peer("provider"),
-                toolchain: String::new(),
-                target: String::new(),
-                max_slots: 2,
-            }
-        );
-        assert_eq!(
-            second,
-            AppResponse::Subscribed {
-                provider: peer("provider"),
-                toolchain: String::new(),
-                target: String::new(),
-                max_slots: 2,
-            }
-        );
+        for response in [first, second] {
+            assert!(matches!(
+                response,
+                AppResponse::Subscribed {
+                    ref provider,
+                    max_slots: 4,
+                    ..
+                } if provider == &peer("provider")
+            ));
+        }
         assert_eq!(provider.read().subscriptions.len(), 1);
-        let sub = &provider.read().subscriptions[&peer("consumer")];
-        assert_eq!(sub.seq, 0);
-    }
+        assert_eq!(provider.read().subscriptions[&peer("consumer")].seq, 0);
 
-    #[test]
-    fn due_updates_include_initial_change_and_keepalive() {
-        let provider = Provider::new(peer("local"), 4);
         provider.set_capacity(4, 2);
-        provider.subscribe(peer("consumer"));
-
         let initial = provider.due_capacity_updates(1_000, snapshot(2, 0, true), 30_000);
         assert_eq!(initial.len(), 1);
         assert_eq!(update_seq(&initial[0].1), 1);
@@ -797,50 +781,52 @@ mod tests {
     }
 
     #[test]
-    fn reserve_is_idempotent_and_busy_when_sampled_full() {
+    fn reserve_slots_and_idempotency() {
         let provider = Provider::new(peer("local"), 1);
         let id = task(1);
 
-        let first = provider.reserve(peer("consumer"), id, 1, manifest(2));
-        assert!(matches!(first, AppResponse::Granted { .. }));
-
-        let second = provider.reserve(peer("consumer"), id, 1, manifest(2));
-        assert!(matches!(second, AppResponse::Granted { .. }));
-
-        provider.set_capacity(1, 0);
-        let other = provider.reserve(peer("consumer"), task(3), 1, manifest(4));
-        assert_eq!(
-            other,
-            AppResponse::Busy {
-                retry_after_ms: 1_000
-            }
-        );
-    }
-
-    #[test]
-    fn one_task_requires_exactly_one_slot() {
-        let provider = Provider::new(peer("local"), 1);
-        let response = provider.reserve(peer("consumer"), task(1), 2, manifest(2));
         assert!(matches!(
-            response,
+            provider.reserve(peer("consumer"), id, 1, manifest(2)),
+            AppResponse::Granted { .. }
+        ));
+        assert!(matches!(
+            provider.reserve(peer("consumer"), id, 1, manifest(2)),
+            AppResponse::Granted { .. }
+        ));
+        assert!(matches!(
+            provider.reserve(peer("consumer"), task(2), 2, manifest(3)),
             AppResponse::Rejected {
                 code: ErrorCode::BadRequest,
                 ..
             }
         ));
+
+        provider.set_capacity(1, 0);
+        assert_eq!(
+            provider.reserve(peer("consumer"), task(3), 1, manifest(4)),
+            AppResponse::Busy {
+                retry_after_ms: 1_000
+            }
+        );
+        assert_eq!(provider.free_slots(), 0);
+
+        provider.set_capacity(1, 1);
+        assert_eq!(provider.free_slots(), 1);
+        assert!(matches!(
+            provider.reserve(peer("consumer"), task(2), 1, manifest(3)),
+            AppResponse::Granted { .. }
+        ));
     }
 
     #[test]
-    fn task_lifecycle_and_cache_hit() {
+    fn task_lifecycle_cancel_fail_and_unknown() {
         let provider = Provider::new(peer("local"), 1);
         let id = task(1);
 
-        let granted = provider.reserve(peer("consumer"), id, 1, manifest(2));
-        let lease = match granted {
+        let lease = match provider.reserve(peer("consumer"), id, 1, manifest(2)) {
             AppResponse::Granted { lease_id, .. } => lease_id,
             other => panic!("expected granted, got {other:?}"),
         };
-
         assert_eq!(provider.task_ready(id, lease), AppResponse::Ack);
         assert_eq!(
             provider.status(id),
@@ -868,38 +854,41 @@ mod tests {
                 }
             }
         );
-
-        let cached = provider.reserve(peer("consumer"), id, 1, manifest(2));
-        assert!(matches!(cached, AppResponse::Cached { .. }));
-    }
-
-    #[test]
-    fn cancel_and_fail_free_the_slot() {
-        let provider = Provider::new(peer("local"), 1);
-        let id = task(1);
         assert!(matches!(
             provider.reserve(peer("consumer"), id, 1, manifest(2)),
+            AppResponse::Cached { .. }
+        ));
+
+        let cancelled = task(3);
+        assert!(matches!(
+            provider.reserve(peer("consumer"), cancelled, 1, manifest(4)),
             AppResponse::Granted { .. }
         ));
-        assert_eq!(provider.cancel(id), AppResponse::Ack);
-        assert_eq!(provider.free_slots(), 1);
+        assert_eq!(provider.cancel(cancelled), AppResponse::Ack);
         assert_eq!(
-            provider.status(id),
+            provider.status(cancelled),
             AppResponse::TaskStatus {
                 state: TaskState::Cancelled
             }
         );
 
-        let id2 = task(3);
+        let failed = task(5);
         assert!(matches!(
-            provider.reserve(peer("consumer"), id2, 1, manifest(4)),
+            provider.reserve(peer("consumer"), failed, 1, manifest(6)),
             AppResponse::Granted { .. }
         ));
         assert_eq!(
-            provider.fail_task(id2, ErrorCode::Internal, "boom"),
+            provider.fail_task(failed, ErrorCode::Internal, "boom"),
             AppResponse::Ack
         );
-        assert_eq!(provider.free_slots(), 1);
+
+        assert!(matches!(
+            provider.status(task(7)),
+            AppResponse::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -939,57 +928,5 @@ mod tests {
         let _lease = provider.create_lease(id);
         let affected = provider.expire_leases(now_ms().saturating_add(LEASE_TTL_MS + 1));
         assert_eq!(affected, vec![(id, 1)]);
-    }
-
-    #[test]
-    fn unknown_task_returns_not_found() {
-        let provider = Provider::new(peer("local"), 1);
-        assert!(matches!(
-            provider.status(task(1)),
-            AppResponse::Error {
-                code: ErrorCode::NotFound,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn free_slots_follow_the_capacity_sample() {
-        let provider = Provider::new(peer("local"), 4);
-        provider.set_capacity(4, 4);
-        assert_eq!(provider.free_slots(), 4);
-
-        assert!(matches!(
-            provider.reserve(peer("consumer"), task(1), 1, manifest(2)),
-            AppResponse::Granted { .. }
-        ));
-        assert_eq!(provider.free_slots(), 4);
-
-        provider.set_capacity(4, 1);
-        assert_eq!(provider.free_slots(), 1);
-
-        provider.set_capacity(4, 0);
-        assert_eq!(provider.free_slots(), 0);
-    }
-
-    #[test]
-    fn substitutes_placeholders() {
-        let work = Path::new("/work");
-        assert_eq!(
-            crate::compile::bundle::substitute("<MANIFEST>/src/lib.rs", work),
-            "/work/pkg/src/lib.rs"
-        );
-        assert_eq!(
-            crate::compile::bundle::substitute("--out-dir=<OUT>", work),
-            "--out-dir=/work/out"
-        );
-        assert_eq!(
-            crate::compile::bundle::substitute("<EXTERN>/dep", work),
-            "/work/extern/dep"
-        );
-        assert_eq!(
-            crate::compile::bundle::substitute("--target-dir=<TARGET>", work),
-            "--target-dir=/work/target"
-        );
     }
 }

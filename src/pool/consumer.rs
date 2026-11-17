@@ -176,17 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn record_subscribed_sets_slots() {
-        let consumer = Consumer::new();
-        consumer.record_subscribed(peer("p"), 4);
-        let view = &consumer.providers()[0];
-        assert_eq!(view.max_slots, 4);
-    }
-
-    #[test]
-    fn capacity_updates_respect_sequence() {
+    fn capacity_updates_and_subscription() {
         let consumer = Consumer::new();
         consumer.record_subscribed(peer("provider"), 4);
+        assert_eq!(consumer.providers()[0].max_slots, 4);
 
         assert_eq!(
             consumer.apply_capacity(peer("provider"), 2, 3, 0, true),
@@ -201,23 +194,27 @@ mod tests {
             AppResponse::Ack
         );
         assert_eq!(consumer.providers()[0].free_slots, 3);
+
+        assert!(matches!(
+            consumer.apply_capacity(peer("missing"), 1, 0, 0, false),
+            AppResponse::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn providers_expire_after_ttl() {
+    fn expiry_and_cooldown() {
         let consumer = Consumer::new();
         consumer.record_pending(peer("provider"));
         let expired = consumer.expire_providers(now_ms().saturating_add(61_000), 60_000);
         assert_eq!(expired, vec![peer("provider")]);
         assert!(consumer.providers().is_empty());
-    }
 
-    #[test]
-    fn cooldown_hides_provider_and_is_not_reset_by_subscribe() {
         let consumer = Consumer::new();
         consumer.record_subscribed(peer("provider"), 4);
         consumer.cool_down_provider(&peer("provider"), 60_000);
-
         assert!(consumer.providers().is_empty());
         assert_eq!(consumer.visible_max_slots(), 0);
 
@@ -227,17 +224,5 @@ mod tests {
         consumer.clear_cooldown(&peer("provider"));
         assert_eq!(consumer.providers().len(), 1);
         assert_eq!(consumer.visible_max_slots(), 4);
-    }
-
-    #[test]
-    fn unknown_provider_returns_not_found() {
-        let consumer = Consumer::new();
-        assert!(matches!(
-            consumer.apply_capacity(peer("missing"), 1, 0, 0, false),
-            AppResponse::Error {
-                code: ErrorCode::NotFound,
-                ..
-            }
-        ));
     }
 }

@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_roundtrip() {
+    fn all_messages_and_hash32_roundtrip() {
         let consumer = PeerId::new("12D3KooWtest");
         let task_id = TaskId(Hash32([7; 32]));
         let lease_id = LeaseId::new();
@@ -319,14 +319,8 @@ mod tests {
         roundtrip_request(AppRequest::Status { task_id });
         roundtrip_request(AppRequest::Cancel { task_id });
         roundtrip_request(AppRequest::ResultAck { lease_id });
-    }
 
-    #[test]
-    fn responses_roundtrip() {
         let provider = PeerId::new("12D3KooWprovider");
-        let task_id = TaskId(Hash32([7; 32]));
-        let lease_id = LeaseId::new();
-
         roundtrip_response(AppResponse::Subscribed {
             provider,
             toolchain: "rustc-1".into(),
@@ -362,15 +356,11 @@ mod tests {
             code: ErrorCode::NotFound,
             message: "missing".into(),
         });
-    }
 
-    #[test]
-    fn hash32_uses_cbor_bytes() {
         let hash = Hash32([0xAB; 32]);
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(&hash, &mut bytes).unwrap();
-        // CBOR bstr(32) header is 0x58 0x20.
-        assert_eq!(&bytes[..2], &[0x58, 0x20]);
+        assert_eq!(&bytes[..2], &[0x58, 0x20], "case: hash32 wire format");
         let decoded: Hash32 = ciborium::de::from_reader(bytes.as_slice()).unwrap();
         assert_eq!(decoded, hash);
     }

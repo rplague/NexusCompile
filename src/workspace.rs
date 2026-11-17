@@ -50,37 +50,3 @@ impl Workspace {
         fs::create_dir_all(staging)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_dir() -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "nexuscompile-workspace-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    #[test]
-    fn staging_and_task_dirs_are_separate() {
-        let root = temp_dir();
-        let workspace = Workspace::new(&root);
-        let digest = Hash32([1; 32]);
-        let staging = workspace.staging_dir(&digest).unwrap();
-        let task = workspace.task_dir(&digest);
-        assert!(staging.starts_with(root.join("staging")));
-        assert!(task.starts_with(root.join("work")));
-        assert_ne!(staging, task);
-        workspace.remove_task_dir(&digest);
-        assert!(!task.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-}

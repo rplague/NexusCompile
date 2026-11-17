@@ -124,7 +124,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn request_roundtrip() {
+    fn request_and_response_roundtrip() {
         let request = LocalRequest::new(
             "/tmp/project",
             "/usr/bin/rustc",
@@ -135,10 +135,7 @@ mod tests {
         write_message(&mut bytes, &request).unwrap();
         let decoded: LocalRequest = read_message(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, request);
-    }
 
-    #[test]
-    fn response_roundtrip_with_bytes() {
         let response = LocalResponse::new(LocalBody::Compiled {
             action_digest: Hash32([7; 32]),
             exit_code: 1,

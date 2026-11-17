@@ -23,3 +23,11 @@ Description: 要由 nexusnet 下载的 Rust 编译链:
  stable also installs the previous two minor releases; an exact version
  installs only that version.
  Toolchains are downloaded to /var/lib/@PKG@/toolchains as @USER@.
+
+Template: @PKG@/config_error
+Type: note
+Description: NexusCompile 配置检查失败 / NexusCompile config check failed
+ ${ERROR}
+ 服务已停止并禁用。请修复 /etc/@PKG@/config.toml 后运行：
+ systemctl enable --now @PKG@
+ The service has been stopped and disabled.

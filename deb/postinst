@@ -19,6 +19,9 @@ TOOLCHAIN_ROOT="${DATA_DIR}/toolchains"
 TOOLCHAIN_REGISTRY="${TOOLCHAIN_ROOT}/rust/state"
 TOOLCHAIN_HELPER="/usr/lib/${PKG}/install-toolchain"
 TOOLCHAIN_CONFIG="/etc/${PKG}/config.toml"
+CONFIG_SCHEMA_FILE="/etc/${PKG}/config.schema"
+CURRENT_SCHEMA=@CONFIG_SCHEMA@
+BREAKING_BELOW=@BREAKING_BELOW@
 MARKER="${DATA_DIR}/onboarding-in-progress"
 SOCKET="/run/${PKG}/nexus.sock"
 CARGO_BIN="/usr/bin/${BIN_NAME}"
@@ -58,6 +61,56 @@ ensure_persistent_journal() {
         chmod 2755 /var/log/journal 2>/dev/null || true
         systemctl restart systemd-journald >/dev/null 2>&1 || true
     fi
+}
+
+read_installed_schema() {
+    if [ ! -f "${CONFIG_SCHEMA_FILE}" ]; then
+        printf '0'
+        return 0
+    fi
+    _value="$(cat "${CONFIG_SCHEMA_FILE}" 2>/dev/null || printf '0')"
+    case "${_value}" in
+        ''|*[!0-9]*) printf '0' ;;
+        *) printf '%s' "${_value}" ;;
+    esac
+}
+
+write_installed_schema() {
+    printf '%s\n' "$1" > "${CONFIG_SCHEMA_FILE}" || return 1
+    chown "${USER_NAME}":"${USER_NAME}" "${CONFIG_SCHEMA_FILE}" 2>/dev/null || true
+    chmod 0644 "${CONFIG_SCHEMA_FILE}" 2>/dev/null || true
+}
+
+config_fail() {
+    _message="$1"
+    echo "NexusCompile: ${_message}" >&2
+    db_subst "@PKG@/config_error" ERROR "${_message}" || true
+    db_input critical "@PKG@/config_error" || true
+    db_go || true
+    db_stop 2>/dev/null || true
+    systemctl disable --now "${UNIT_NAME}" >/dev/null 2>&1 || true
+    exit 1
+}
+
+ensure_config() {
+    if [ -f "${TOOLCHAIN_CONFIG}" ]; then
+        return 0
+    fi
+    "${CARGO_BIN}" config-defaults --config "${TOOLCHAIN_CONFIG}"
+}
+
+ensure_schema() {
+    _installed="$(read_installed_schema)"
+    if [ "${_installed}" -lt "${BREAKING_BELOW}" ]; then
+        config_fail "现有配置 schema ${_installed} 低于最低兼容版本 ${BREAKING_BELOW}；请运行 dpkg-reconfigure ${PKG} 后重试。"
+    fi
+    if [ "${_installed}" -gt "${CURRENT_SCHEMA}" ]; then
+        config_fail "现有配置 schema ${_installed} 高于当前程序支持的 ${CURRENT_SCHEMA}；请升级 NexusCompile。"
+    fi
+    if ! "${CARGO_BIN}" config-check --config "${TOOLCHAIN_CONFIG}"; then
+        config_fail "配置检查失败：${TOOLCHAIN_CONFIG}；请修复后运行 sudo dpkg --configure -a。"
+    fi
+    write_installed_schema "${CURRENT_SCHEMA}" || config_fail "写入 ${CONFIG_SCHEMA_FILE} 失败。"
 }
 
 normalized_users() {
@@ -213,6 +266,12 @@ case "$1" in
         TOOLCHAIN_CHANNEL="${RET:-stable}"
         TOOLCHAIN_CHANNEL="$(printf '%s' "${TOOLCHAIN_CHANNEL}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         [ -n "${TOOLCHAIN_CHANNEL}" ] || TOOLCHAIN_CHANNEL=stable
+
+        if ! ensure_config; then
+            config_fail "无法创建默认配置 ${TOOLCHAIN_CONFIG}；请检查 ${CARGO_BIN} 是否可用。"
+        fi
+        ensure_schema
+
         db_stop 2>/dev/null || true
 
         if ! install_toolchain "${TOOLCHAIN_CHANNEL}"; then

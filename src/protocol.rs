@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn request_reply_round_trip() {
+    fn all_messages_round_trip() {
         let id = Uuid::new_v4();
         round_trip(Message::Request {
             id,
@@ -364,11 +364,6 @@ mod tests {
             result: None,
             error: Some(SidecarError::new("timeout", "too slow")),
         });
-    }
-
-    #[test]
-    fn control_ops_round_trip() {
-        let id = Uuid::new_v4();
         round_trip(Message::Hello {
             version: PROTOCOL_VERSION,
         });
@@ -412,6 +407,23 @@ mod tests {
             peer: "12D3KooW".into(),
             payload: vec![1, 2, 3],
         });
+
+        let ip = PublicIpInfo {
+            ipv4: Some("1.2.3.4".into()),
+            ipv6: None,
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&ip, &mut bytes).unwrap();
+        assert_eq!(decode_result::<PublicIpInfo>(&bytes).unwrap(), ip);
+
+        let who = WhoamiInfo {
+            peer_id: "12D3KooW".into(),
+            name: "n".into(),
+            description: "d".into(),
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&who, &mut bytes).unwrap();
+        assert_eq!(decode_result::<WhoamiInfo>(&bytes).unwrap(), who);
     }
 
     #[test]
@@ -425,29 +437,5 @@ mod tests {
     #[test]
     fn malformed_body_rejected() {
         assert!(matches!(decode_frame(&[0xff]), Err(FrameError::Decode(_))));
-    }
-
-    #[test]
-    fn result_payloads_round_trip() {
-        fn enc<T: Serialize>(v: &T) -> Vec<u8> {
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(v, &mut buf).unwrap();
-            buf
-        }
-
-        let ip = PublicIpInfo {
-            ipv4: Some("1.2.3.4".into()),
-            ipv6: None,
-        };
-        let decoded: PublicIpInfo = decode_result(&enc(&ip)).unwrap();
-        assert_eq!(decoded, ip);
-
-        let who = WhoamiInfo {
-            peer_id: "12D3KooW".into(),
-            name: "n".into(),
-            description: "d".into(),
-        };
-        let decoded: WhoamiInfo = decode_result(&enc(&who)).unwrap();
-        assert_eq!(decoded, who);
     }
 }
