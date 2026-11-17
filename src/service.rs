@@ -49,7 +49,11 @@ pub async fn handle_service_request(
     )
     .emit();
 
-    handle_app_payload(payload, app)
+    let app = app.clone();
+    let payload = payload.to_vec();
+    tokio::task::spawn_blocking(move || handle_app_payload(&payload, &app))
+        .await
+        .map_err(|error| SidecarError::new("internal", format!("service task failed: {error}")))?
 }
 
 /// Decode, dispatch, and encode one application request.
