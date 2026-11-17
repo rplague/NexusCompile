@@ -585,10 +585,14 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 
 ```bash
 cargo fmt -- --check
-cargo test --verbose
+cargo test --lib
+cargo test
 cargo build --release
 ./deploy/build-deb.sh
 ```
+
+`cargo test --lib` runs the fast unit suite. `cargo test` also runs the
+end-to-end tests that invoke the local `rustc`.
 
 ## Current limitations and security boundary
 
