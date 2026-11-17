@@ -555,6 +555,14 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 
 > This backend shares the `nexusnet` account with NexusNet and can therefore read the node's keypair and configuration. It is intended only for trusted backends; use a dedicated account if isolation is required.
 
+## Runtime lifecycle
+
+- The server loop reports fatal listener failures to `main`; the process no longer waits for a signal after the loop has exited.
+- Shutdown is bounded: server and pool tasks are aborted after their grace period, and the task socket is removed on both normal and aborted exits.
+- Control requests are cancellation-safe: pending replies are removed when a call times out or its future is dropped.
+- File logging runs on a dedicated writer thread; `LogStruct::emit` never performs blocking file I/O on a Tokio worker.
+- Service dispatch moves cache/workspace filesystem work to the blocking pool.
+
 ## Module map
 
 | Module | Responsibility |
