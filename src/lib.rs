@@ -21,7 +21,6 @@ pub mod task_blob;
 pub mod toolchain;
 pub mod util;
 pub mod workspace;
-pub mod wrapper;
 
 #[cfg(test)]
 mod e2e;
