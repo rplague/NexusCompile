@@ -1,11 +1,10 @@
 pub mod capacity;
-pub mod cli;
 pub mod compile;
 pub mod compile_protocol;
 pub mod config;
-pub mod config_cli;
 pub mod connection;
 pub mod control;
+pub mod installer;
 pub mod local_protocol;
 pub mod local_task;
 pub mod local_task_protocol;
@@ -16,13 +15,11 @@ pub mod protocol;
 pub mod remote;
 pub mod runtime;
 pub mod service;
-pub mod setup;
 pub mod state;
 pub mod task_blob;
 pub mod toolchain;
 pub mod util;
 pub mod workspace;
-pub mod wrapper;
 
 #[cfg(test)]
 mod e2e;

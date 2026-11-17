@@ -2,9 +2,10 @@
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
@@ -63,6 +64,9 @@ fn doctor(args: &[String]) -> Result<(), String> {
         match args[index].as_str() {
             "--skip-socket" => skip_socket = true,
             "--config" => {
+                if config_path.is_some() {
+                    return Err("duplicate --config".into());
+                }
                 index += 1;
                 config_path = args.get(index).map(PathBuf::from);
                 if config_path.is_none() {
@@ -240,8 +244,17 @@ fn check_socket() -> Result<(), String> {
 }
 
 fn check_writable_dir(path: &Path, label: &str) -> Result<(), String> {
-    let marker = path.join(format!(".doctor-{}", std::process::id()));
-    fs::write(&marker, b"ok")
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let marker = path.join(format!(".doctor-{}-{nonce}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .map_err(|error| format!("write {label} {}: {error}", path.display()))?;
+    file.write_all(b"ok")
         .map_err(|error| format!("write {label} {}: {error}", path.display()))?;
     let _ = fs::remove_file(marker);
     Ok(())
@@ -255,6 +268,9 @@ fn configure(args: &[String]) -> Result<(), String> {
     while index < args.len() {
         match args[index].as_str() {
             "--config" => {
+                if config_path.is_some() {
+                    return Err("duplicate --config".into());
+                }
                 index += 1;
                 config_path = args.get(index).map(PathBuf::from);
                 if config_path.is_none() {
@@ -262,6 +278,9 @@ fn configure(args: &[String]) -> Result<(), String> {
                 }
             }
             "--rustc" => {
+                if rustc.is_some() {
+                    return Err("duplicate --rustc".into());
+                }
                 index += 1;
                 rustc = args.get(index).cloned();
                 if rustc.is_none() {
@@ -283,7 +302,7 @@ fn configure(args: &[String]) -> Result<(), String> {
     let original_permissions = fs::metadata(&config_path)
         .ok()
         .map(|metadata| metadata.permissions());
-    let node = table_mut(&mut document, "node");
+    let node = table_mut(&mut document, "node")?;
     node["rustc"] = value(rustc.trim());
     node.remove("toolchains");
     write_config_atomic(&config_path, &document.to_string(), original_permissions)
@@ -297,6 +316,9 @@ fn configure_toolchains(args: &[String]) -> Result<(), String> {
     while index < args.len() {
         match args[index].as_str() {
             "--config" => {
+                if config_path.is_some() {
+                    return Err("duplicate --config".into());
+                }
                 index += 1;
                 config_path = args.get(index).map(PathBuf::from);
                 if config_path.is_none() {
@@ -304,6 +326,9 @@ fn configure_toolchains(args: &[String]) -> Result<(), String> {
                 }
             }
             "--state" => {
+                if state_path.is_some() {
+                    return Err("duplicate --state".into());
+                }
                 index += 1;
                 state_path = args.get(index).map(PathBuf::from);
                 if state_path.is_none() {
@@ -367,7 +392,7 @@ fn write_toolchains(path: &Path, entries: &[ToolchainEntry]) -> Result<(), Strin
     let original_permissions = fs::metadata(path)
         .ok()
         .map(|metadata| metadata.permissions());
-    let node = table_mut(&mut document, "node");
+    let node = table_mut(&mut document, "node")?;
     node["rustc"] = value(entries[0].rustc.clone());
 
     let mut array = ArrayOfTables::new();
@@ -393,13 +418,13 @@ fn load(path: &Path) -> Result<DocumentMut, String> {
     }
 }
 
-fn table_mut<'a>(document: &'a mut DocumentMut, name: &str) -> &'a mut Table {
+fn table_mut<'a>(document: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table, String> {
     if !document.contains_key(name) {
         document.insert(name, Item::Table(Table::new()));
     }
     document[name]
         .as_table_mut()
-        .expect("managed config table must be a table")
+        .ok_or_else(|| format!("config key {name:?} must be a table"))
 }
 
 fn write_config_atomic(
@@ -460,6 +485,35 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("[node]"), "case: creates node table");
         assert!(text.contains("rustc = \"/opt/rust/bin/rustc\""));
+    }
+
+    #[test]
+    fn configure_rejects_non_table_node_without_modifying() {
+        let root = TempDir::new("toolchain-non-table");
+        let path = root.join("config.toml");
+        let original = "node = 1\n";
+        fs::write(&path, original).unwrap();
+
+        let error = configure(&[
+            "--config".into(),
+            path.display().to_string(),
+            "--rustc".into(),
+            "/opt/rust/bin/rustc".into(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("must be a table"), "error: {error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        let duplicate = configure(&[
+            "--config".into(),
+            path.display().to_string(),
+            "--rustc".into(),
+            "/a".into(),
+            "--rustc".into(),
+            "/b".into(),
+        ]);
+        assert!(duplicate.is_err(), "case: duplicate rustc");
     }
 
     #[test]

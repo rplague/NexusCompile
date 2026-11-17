@@ -559,12 +559,11 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 
 | Module | Responsibility |
 |---|---|
-| **main** | Process entry point: CLI dispatch, signal handling and runtime delegation |
-| **cli** | Installer command dispatcher (`config-*`, `setup-user`, toolchain commands) |
+| **main** | Process entry point: installer dispatch, signal handling and runtime delegation |
 | **runtime** | Startup, listener/accept loop, task lifecycle and graceful shutdown (`RuntimeHandle`) |
 | **state** | Shared `AppState` (provider, consumer, cache, workspace, config, control handle) |
-| **config** | Split into `model` / `load` / `validate` / `handle`; read-only TOML loading, warnings and `ConfigHandle` |
-| **config_cli** | Installer-facing `config-defaults` / `config-check` commands |
+| **config** | `config.rs` / `config/load.rs`: read-only TOML loading, warnings and `ConfigHandle` |
+| **installer** | Installer-facing `config-defaults` / `config-check` and `setup-user` / `unsetup-user` commands |
 | **paths** | Path resolution anchored by environment variables, with current-directory fallback for local runs |
 | **log** | Leveled logging split into `log/format.rs` and `log/file.rs`: terminal output, file rotation (gz at 10 MB), journald mode |
 | **protocol** | sidecar v2 contract: `Message`, control result payloads, frame encoding/decoding |
@@ -575,8 +574,7 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | **task_blob** | Task bundle chunk I/O and task-directory cleanup |
 | **local_protocol** | Shared local request/response and framing types |
 | **local_task** | Task socket, bundle ingestion, output delivery |
-| **wrapper** | `nexus-rustc` implementation: typed socket client, staged output commit, rustc fallback |
-| **nexus-rustc** (bin) | Thin cargo `RUSTC_WRAPPER` entry point |
+| **nexus-rustc** (bin) | `RUSTC_WRAPPER` implementation: typed socket client, staged output commit, rustc fallback |
 | **compile** | Compile primitives: `executor` (local staging), `manifest` (digest), `bundle`, `cache`, `cas`, and `hash` |
 | **remote** | Consumer `Coordinator` over `remote/transfer.rs` (bundle upload, task polling, result import) |
 | **pool** | `Provider` (capacity/subscriptions/tasks/leases), `Consumer` (provider views), and `runtime` scheduling |

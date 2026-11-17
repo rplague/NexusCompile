@@ -1,4 +1,4 @@
-//! Per-user Cargo configuration used by the package installer.
+//! Installer-facing service configuration and per-user Cargo configuration.
 
 use std::fs;
 use std::io;
@@ -6,8 +6,14 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
 
+use crate::config::{ConfigErrorKind, ServiceConfig};
+use crate::paths;
+
 pub const WRAPPER_PATH: &str = "/usr/bin/nexus-rustc";
 pub const DEFAULT_SOCKET: &str = "/run/nexuscompile/nexus.sock";
+
+const EXIT_USAGE: i32 = 2;
+const EXIT_IO: i32 = 4;
 
 const MANAGED_SOCKET_PREFIX: &str = "/run/nexuscompile/";
 const BACKUP_SUFFIX: &str = ".nexuscompile.bak";
@@ -42,68 +48,144 @@ impl CliCommand {
     }
 }
 
-/// Result of parsing the first CLI argument.
+/// Installer command failure with a process exit code.
 #[derive(Debug)]
-enum CliParse {
-    NotSetup,
-    MissingConfig(&'static str),
-    Command(CliCommand),
+struct InstallerError {
+    code: i32,
+    message: String,
 }
 
-/// Handle `NexusCompile setup-user ...` / `unsetup-user ...`.
-///
-/// Returns `None` when the arguments are not a setup command so `main` can
-/// continue starting the server.
-pub fn run_cli(args: &[String]) -> Option<i32> {
-    let command = match parse_cli(args) {
-        CliParse::NotSetup => return None,
-        CliParse::MissingConfig(name) => {
-            eprintln!("{name}: missing --config <path>");
-            return Some(2);
+impl InstallerError {
+    fn usage(message: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_USAGE,
+            message: message.into(),
         }
-        CliParse::Command(command) => command,
+    }
+
+    fn io(message: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_IO,
+            message: message.into(),
+        }
+    }
+}
+
+/// Handle all installer commands.
+///
+/// Returns `None` when the arguments are not an installer command so `main`
+/// can continue starting the server.
+pub fn run_cli(args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str) {
+        Some("config-defaults") => Some(report("config", run_defaults(&args[1..]))),
+        Some("config-check") => Some(report("config", run_check(&args[1..]))),
+        _ => run_setup_cli(args),
+    }
+}
+
+fn report(prefix: &str, result: Result<(), InstallerError>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{prefix}: {}", error.message);
+            error.code
+        }
+    }
+}
+
+fn run_setup_cli(args: &[String]) -> Option<i32> {
+    let command = match parse_cli(args) {
+        Ok(Some(command)) => command,
+        Ok(None) => return None,
+        Err(error) => {
+            eprintln!("installer: {}", error.message);
+            return Some(error.code);
+        }
     };
 
     Some(match command.execute() {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("{}: {error}", command.name());
-            1
+            EXIT_IO
         }
     })
 }
 
-fn parse_cli(args: &[String]) -> CliParse {
-    match args.first().map(String::as_str) {
-        Some("setup-user") => {
-            let Some(config) = argument_value(args, "--config") else {
-                return CliParse::MissingConfig("setup-user");
-            };
-            let socket =
-                argument_value(args, "--socket").unwrap_or_else(|| DEFAULT_SOCKET.to_owned());
-            CliParse::Command(CliCommand::SetupUser {
-                config: PathBuf::from(config),
-                socket,
-            })
-        }
-        Some("unsetup-user") => {
-            let Some(config) = argument_value(args, "--config") else {
-                return CliParse::MissingConfig("unsetup-user");
-            };
-            CliParse::Command(CliCommand::UnsetupUser {
-                config: PathBuf::from(config),
-            })
-        }
-        _ => CliParse::NotSetup,
+fn parse_cli(args: &[String]) -> Result<Option<CliCommand>, InstallerError> {
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+
+    match command {
+        "setup-user" => parse_setup_user(&args[1..]).map(Some),
+        "unsetup-user" => parse_unsetup_user(&args[1..]).map(Some),
+        _ => Ok(None),
     }
 }
 
-/// Return the first value that follows an exact flag match.
-fn argument_value(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|argument| argument == name)
-        .and_then(|index| args.get(index + 1))
-        .cloned()
+fn parse_setup_user(args: &[String]) -> Result<CliCommand, InstallerError> {
+    let mut config = None;
+    let mut socket = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                if config.is_some() {
+                    return Err(InstallerError::usage("duplicate --config"));
+                }
+                config = Some(PathBuf::from(flag_value(args, &mut index, "--config")?));
+            }
+            "--socket" => {
+                if socket.is_some() {
+                    return Err(InstallerError::usage("duplicate --socket"));
+                }
+                socket = Some(flag_value(args, &mut index, "--socket")?.to_owned());
+            }
+            other => return Err(InstallerError::usage(format!("unknown argument: {other}"))),
+        }
+        index += 1;
+    }
+
+    let config = config.ok_or_else(|| InstallerError::usage("missing --config <path>"))?;
+    Ok(CliCommand::SetupUser {
+        config,
+        socket: socket.unwrap_or_else(|| DEFAULT_SOCKET.to_owned()),
+    })
+}
+
+fn parse_unsetup_user(args: &[String]) -> Result<CliCommand, InstallerError> {
+    let mut config = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                if config.is_some() {
+                    return Err(InstallerError::usage("duplicate --config"));
+                }
+                config = Some(PathBuf::from(flag_value(args, &mut index, "--config")?));
+            }
+            other => return Err(InstallerError::usage(format!("unknown argument: {other}"))),
+        }
+        index += 1;
+    }
+
+    let config = config.ok_or_else(|| InstallerError::usage("missing --config <path>"))?;
+    Ok(CliCommand::UnsetupUser { config })
+}
+
+fn flag_value<'a>(
+    args: &'a [String],
+    index: &mut usize,
+    flag: &str,
+) -> Result<&'a str, InstallerError> {
+    *index += 1;
+    args.get(*index)
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| InstallerError::usage(format!("{flag} requires a non-empty value")))
 }
 
 /// A parsed Cargo config together with its origin path and permissions.
@@ -144,8 +226,12 @@ impl CargoConfigFile {
             return Ok(());
         }
 
-        fs::copy(&self.path, backup)?;
-        Ok(())
+        let bytes = fs::read(&self.path)?;
+        match crate::util::fs::write_atomic_new(&backup, &bytes, self.permissions.clone()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -265,6 +351,72 @@ fn file_name(path: &Path) -> &str {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn run_defaults(args: &[String]) -> Result<(), InstallerError> {
+    let path = parse_config_arg(args)?;
+
+    match ServiceConfig::default().save_to_new_file(&path) {
+        Ok(()) => {
+            println!("config: wrote {}", path.display());
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            println!("config: keeping existing {}", path.display());
+            Ok(())
+        }
+        Err(error) => Err(InstallerError::io(format!(
+            "write {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn run_check(args: &[String]) -> Result<(), InstallerError> {
+    let path = parse_config_arg(args)?;
+
+    if !path.exists() {
+        return Err(InstallerError::io(format!(
+            "no config at {}",
+            path.display()
+        )));
+    }
+
+    match ServiceConfig::try_from_toml_file(&path, false) {
+        Ok(config) => {
+            for warning in config.warnings() {
+                println!("config: warning: {warning}");
+            }
+            println!("config: ok {}", path.display());
+            Ok(())
+        }
+        Err(error) if error.kind == ConfigErrorKind::Io => {
+            Err(InstallerError::io(error.to_string()))
+        }
+        Err(error) => Err(InstallerError::usage(error.to_string())),
+    }
+}
+
+fn parse_config_arg(args: &[String]) -> Result<PathBuf, InstallerError> {
+    let mut config = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                if config.is_some() {
+                    return Err(InstallerError::usage("duplicate --config"));
+                }
+                config = Some(PathBuf::from(flag_value(args, &mut index, "--config")?));
+            }
+            other => {
+                return Err(InstallerError::usage(format!("unknown argument: {other}")));
+            }
+        }
+        index += 1;
+    }
+
+    Ok(config.unwrap_or_else(paths::config_path))
 }
 
 #[cfg(test)]
@@ -402,16 +554,8 @@ RUST_BACKTRACE = "1"
 
     #[test]
     fn cli_contract() {
-        assert!(matches!(parse_cli(&[]), CliParse::NotSetup));
-        assert!(matches!(parse_cli(&["doctor".into()]), CliParse::NotSetup));
-        assert!(matches!(
-            parse_cli(&["setup-user".into()]),
-            CliParse::MissingConfig("setup-user")
-        ));
-        assert!(matches!(
-            parse_cli(&["unsetup-user".into()]),
-            CliParse::MissingConfig("unsetup-user")
-        ));
+        assert_eq!(run_cli(&[]), None);
+        assert_eq!(run_cli(&["doctor".into()]), None);
         assert_eq!(run_cli(&["setup-user".into()]), Some(2));
         assert_eq!(run_cli(&["unsetup-user".into()]), Some(2));
 
@@ -420,7 +564,7 @@ RUST_BACKTRACE = "1"
             "--config".into(),
             "/tmp/config.toml".into(),
         ]) {
-            CliParse::Command(CliCommand::SetupUser { socket, .. }) => {
+            Ok(Some(CliCommand::SetupUser { socket, .. })) => {
                 assert_eq!(socket, DEFAULT_SOCKET);
             }
             other => panic!("unexpected parse result: {other:?}"),
@@ -432,7 +576,76 @@ RUST_BACKTRACE = "1"
                 "--config".into(),
                 "/tmp/config.toml".into(),
             ]),
-            CliParse::Command(CliCommand::UnsetupUser { .. })
+            Ok(Some(CliCommand::UnsetupUser { .. }))
         ));
+
+        for args in [
+            vec!["setup-user", "--config", "/tmp/config.toml", "--unknown"],
+            vec!["setup-user", "--config", "/tmp/config.toml", "--socket"],
+            vec!["setup-user", "--config", "/tmp/config.toml", "--socket", ""],
+            vec!["setup-user", "--config", "/tmp/a", "--config", "/tmp/b"],
+            vec!["unsetup-user", "--config", "/tmp/a", "--config", "/tmp/b"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            assert_eq!(run_cli(&args), Some(2), "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn config_defaults_does_not_overwrite_existing() {
+        let dir = TempDir::new("config-cli-defaults");
+        let path = dir.join("config.toml");
+        fs::write(&path, "# existing\n").unwrap();
+        let args = vec![
+            "config-defaults".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# existing\n");
+
+        let missing = dir.join("new.toml");
+        let args = vec![
+            "config-defaults".to_string(),
+            "--config".to_string(),
+            missing.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0));
+        assert!(missing.is_file());
+
+        let duplicate = vec![
+            "config-defaults".to_string(),
+            "--config".to_string(),
+            missing.display().to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(run_cli(&duplicate), Some(2));
+    }
+
+    #[test]
+    fn config_check_exit_codes() {
+        let dir = TempDir::new("config-cli-check");
+        let path = dir.join("config.toml");
+        fs::write(&path, "port = 6100\n").unwrap();
+        let args = vec![
+            "config-check".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0), "case: valid");
+
+        fs::write(&path, "[node\n").unwrap();
+        assert_eq!(run_cli(&args), Some(2), "case: invalid");
+
+        let missing = dir.join("missing.toml");
+        let args = vec![
+            "config-check".to_string(),
+            "--config".to_string(),
+            missing.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(4), "case: missing");
+
+        assert_eq!(run_cli(&["not-a-config-command".to_string()]), None);
     }
 }

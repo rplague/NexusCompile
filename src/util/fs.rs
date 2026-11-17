@@ -49,6 +49,39 @@ pub fn write_atomic(
     result
 }
 
+/// Write `bytes` only when `path` does not exist yet.
+///
+/// The temporary file is written first, then hard-linked into place so an
+/// existing target is never replaced, even if another process creates it
+/// between the existence check and the commit.
+pub fn write_atomic_new(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<fs::Permissions>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp = temp_path(path);
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&temp, permissions)?;
+        }
+        fs::hard_link(&temp, path)
+    })();
+
+    let _ = fs::remove_file(&temp);
+    result
+}
+
 fn temp_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -93,5 +126,20 @@ mod tests {
 
         assert!(write_atomic(&path, b"data", None).is_err());
         assert_eq!(fs::read_to_string(&blocker).unwrap(), "file");
+    }
+
+    #[test]
+    fn atomic_write_new_does_not_replace_existing() {
+        let dir = TempDir::new("util-fs-new");
+        let path = dir.join("config.toml");
+        fs::write(&path, "old").unwrap();
+
+        let error = write_atomic_new(&path, b"new", None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+
+        let missing = dir.join("new.toml");
+        write_atomic_new(&missing, b"created", None).unwrap();
+        assert_eq!(fs::read_to_string(&missing).unwrap(), "created");
     }
 }
