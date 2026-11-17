@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
@@ -29,7 +29,7 @@ use crate::service::Dispatch;
 /// `dispatcher.query_timeout_secs` (60s by default).
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(60);
 
-type PendingMap = Arc<Mutex<HashMap<Uuid, oneshot::Sender<Result<Vec<u8>, SidecarError>>>>>;
+type PendingMap = Arc<StdMutex<HashMap<Uuid, oneshot::Sender<Result<Vec<u8>, SidecarError>>>>>;
 
 struct Shared {
     writer: Mutex<OwnedWriteHalf>,
@@ -43,13 +43,34 @@ pub struct BackendClient {
     timeout: Duration,
 }
 
+struct PendingGuard {
+    pending: PendingMap,
+    id: Uuid,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.id);
+        }
+    }
+}
+
 impl BackendClient {
     async fn call(&self, id: Uuid, msg: Message) -> Result<Vec<u8>, SidecarError> {
         let (tx, rx) = oneshot::channel();
-        self.shared.pending.lock().await.insert(id, tx);
+        let guard = PendingGuard {
+            pending: self.shared.pending.clone(),
+            id,
+        };
+        self.shared
+            .pending
+            .lock()
+            .map_err(|_| SidecarError::new("internal", "pending lock poisoned"))?
+            .insert(id, tx);
 
         if let Err(e) = write_msg(&self.shared.writer, &msg).await {
-            self.shared.pending.lock().await.remove(&id);
+            drop(guard);
             return Err(SidecarError::new("io_error", e));
         }
 
@@ -58,7 +79,7 @@ impl BackendClient {
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(SidecarError::new("node_gone", "response channel closed")),
             Err(_) => {
-                self.shared.pending.lock().await.remove(&id);
+                drop(guard);
                 Err(SidecarError::new("timeout", "control command timed out"))
             }
         }
@@ -231,7 +252,7 @@ impl BackendClient {
         Self {
             shared: Arc::new(Shared {
                 writer: Mutex::new(writer),
-                pending: Arc::new(Mutex::new(HashMap::new())),
+                pending: Arc::new(StdMutex::new(HashMap::new())),
             }),
             timeout,
         }
@@ -241,8 +262,12 @@ impl BackendClient {
         write_msg(&self.shared.writer, msg).await
     }
 
-    pub(crate) async fn take_pending(&self, id: Uuid) -> Option<PendingSender> {
-        self.shared.pending.lock().await.remove(&id)
+    pub(crate) fn take_pending(&self, id: Uuid) -> Option<PendingSender> {
+        self.shared
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(&id))
     }
 }
 
@@ -290,34 +315,37 @@ pub async fn handle_connection<D: Dispatch>(stream: TcpStream, dispatch: D) -> s
     let control: Arc<dyn ControlPlane> = Arc::new(client.clone());
     dispatch.on_connected(control.clone());
 
-    // Start the read loop before issuing control calls: replies can only be
-    // correlated while the loop is draining the socket.
-    let read_client = client.clone();
-    let read_dispatch = dispatch.clone();
-    let read_control = control.clone();
-    let read_task = tokio::spawn(async move {
-        read_loop(read_half, read_client, read_dispatch, read_control).await;
-    });
+    let mut read_future = Box::pin(read_loop(
+        read_half,
+        client.clone(),
+        dispatch.clone(),
+        control.clone(),
+    ));
 
-    match client.whoami().await {
-        Ok(info) => {
-            LogStruct::new(
-                LogLevel::Important,
-                "节点身份",
-                format!("{} ({})", info.peer_id, info.name),
-            )
-            .emit();
-            dispatch.on_whoami(&info);
+    tokio::select! {
+        _ = &mut read_future => {}
+        result = client.whoami() => {
+            match result {
+                Ok(info) => {
+                    LogStruct::new(
+                        LogLevel::Important,
+                        "节点身份",
+                        format!("{} ({})", info.peer_id, info.name),
+                    )
+                    .emit();
+                    dispatch.on_whoami(&info);
+                }
+                Err(e) => LogStruct::new(
+                    LogLevel::Warning,
+                    "节点身份查询失败",
+                    format!("{}: {}", e.code, e.message),
+                )
+                .emit(),
+            }
+            let _ = read_future.await;
         }
-        Err(e) => LogStruct::new(
-            LogLevel::Warning,
-            "节点身份查询失败",
-            format!("{}: {}", e.code, e.message),
-        )
-        .emit(),
     }
 
-    let _ = read_task.await;
     dispatch.on_disconnected(&control);
     Ok(())
 }
@@ -329,74 +357,98 @@ async fn read_loop<D: Dispatch>(
     dispatch: D,
     control: Arc<dyn ControlPlane>,
 ) {
+    const MAX_INFLIGHT_REQUESTS: usize = 64;
+    let mut requests = tokio::task::JoinSet::new();
     loop {
-        match protocol::read_frame(&mut read_half).await {
-            Ok(Message::Request {
-                id,
-                service,
-                payload,
-            }) => {
-                let client = client.clone();
-                let dispatch = dispatch.clone();
-                let control = control.clone();
-                tokio::spawn(async move {
-                    let reply = match dispatch.handle(&service, &payload, control.as_ref()).await {
-                        Ok(result) => Message::Reply {
-                            id,
-                            ok: true,
-                            result: Some(result),
-                            error: None,
-                        },
-                        Err(e) => Message::Reply {
-                            id,
-                            ok: false,
-                            result: None,
-                            error: Some(e),
-                        },
-                    };
-                    if let Err(e) = client.write(&reply).await {
-                        LogStruct::new(LogLevel::Critical, "回复写入失败", e).emit();
+        tokio::select! {
+            frame = protocol::read_frame(&mut read_half) => {
+                match frame {
+                    Ok(Message::Request {
+                        id,
+                        service,
+                        payload,
+                    }) => {
+                        if requests.len() >= MAX_INFLIGHT_REQUESTS {
+                            let _ = requests.join_next().await;
+                        }
+                        let client = client.clone();
+                        let dispatch = dispatch.clone();
+                        let control = control.clone();
+                        requests.spawn(async move {
+                            let reply = match dispatch.handle(&service, &payload, control.as_ref()).await {
+                                Ok(result) => Message::Reply {
+                                    id,
+                                    ok: true,
+                                    result: Some(result),
+                                    error: None,
+                                },
+                                Err(e) => Message::Reply {
+                                    id,
+                                    ok: false,
+                                    result: None,
+                                    error: Some(e),
+                                },
+                            };
+                            if let Err(e) = client.write(&reply).await {
+                                LogStruct::new(LogLevel::Critical, "回复写入失败", e).emit();
+                            }
+                        });
                     }
-                });
-            }
-            Ok(Message::Reply {
-                id,
-                ok,
-                result,
-                error,
-            }) => {
-                let sender = client.take_pending(id).await;
-                match sender {
-                    Some(tx) => {
-                        let outcome = if ok {
-                            Ok(result.unwrap_or_default())
-                        } else {
-                            Err(error.unwrap_or_else(|| {
-                                SidecarError::new("backend_error", "unknown error")
-                            }))
-                        };
-                        let _ = tx.send(outcome);
+                    Ok(Message::Reply {
+                        id,
+                        ok,
+                        result,
+                        error,
+                    }) => {
+                        let sender = client.take_pending(id);
+                        match sender {
+                            Some(tx) => {
+                                let outcome = if ok {
+                                    Ok(result.unwrap_or_default())
+                                } else {
+                                    Err(error.unwrap_or_else(|| {
+                                        SidecarError::new("backend_error", "unknown error")
+                                    }))
+                                };
+                                let _ = tx.send(outcome);
+                            }
+                            None => {
+                                LogStruct::new(
+                                    LogLevel::Warning,
+                                    "未知响应",
+                                    format!("未匹配的 id {id}"),
+                                )
+                                .emit();
+                            }
+                        }
                     }
-                    None => {
-                        LogStruct::new(LogLevel::Warning, "未知响应", format!("未匹配的 id {id}"))
-                            .emit();
+                    Ok(other) => {
+                        LogStruct::new(
+                            LogLevel::Warning,
+                            "非预期消息",
+                            format!("节点不应发送 {}", other.kind()),
+                        )
+                        .emit();
+                    }
+                    Err(e) => {
+                        LogStruct::new(LogLevel::Warning, "连接断开", e.to_string()).emit();
+                        break;
                     }
                 }
             }
-            Ok(other) => {
-                LogStruct::new(
-                    LogLevel::Warning,
-                    "非预期消息",
-                    format!("节点不应发送 {}", other.kind()),
-                )
-                .emit();
-            }
-            Err(e) => {
-                LogStruct::new(LogLevel::Warning, "连接断开", e.to_string()).emit();
-                break;
+            Some(result) = requests.join_next(), if !requests.is_empty() => {
+                if let Err(error) = result {
+                    LogStruct::new(
+                        LogLevel::Warning,
+                        "请求任务异常",
+                        error.to_string(),
+                    )
+                    .emit();
+                }
             }
         }
     }
+    requests.shutdown().await;
 }
 
 #[cfg(test)]
@@ -438,6 +490,23 @@ mod tests {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(v, &mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn pending_guard_removes_entry_on_drop() {
+        let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
+        let id = Uuid::new_v4();
+        let (tx, _rx) = oneshot::channel();
+        pending.lock().unwrap().insert(id, tx);
+
+        {
+            let _guard = PendingGuard {
+                pending: pending.clone(),
+                id,
+            };
+        }
+
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
