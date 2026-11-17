@@ -118,9 +118,14 @@ fn toolchain_list_roundtrips() {
 
 #[test]
 fn warnings_have_stable_codes() {
-    let mut config = ServiceConfig::default();
-    config.port = 0;
-    config.subscription.ttl_secs = 0;
+    let config = ServiceConfig {
+        port: 0,
+        subscription: SubscriptionConfig {
+            ttl_secs: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
 
     let warnings = config.warnings();
     assert!(warnings.iter().any(|warning| warning.code == "port"));

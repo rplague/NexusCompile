@@ -410,16 +410,24 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ServiceConfig;
+    use crate::config::{CacheConfig, ServiceConfig, SubscriptionConfig};
     use crate::test_support::TempDir;
 
     #[tokio::test]
     async fn starts_and_shuts_down() {
         let dir = TempDir::new("runtime");
-        let mut config = ServiceConfig::default();
-        config.port = 0;
-        config.subscription.target_slots = 0;
-        config.cache.dir = dir.join("cache").display().to_string();
+        let config = ServiceConfig {
+            port: 0,
+            subscription: SubscriptionConfig {
+                target_slots: 0,
+                ..Default::default()
+            },
+            cache: CacheConfig {
+                dir: dir.join("cache").display().to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let config_path = dir.join("config.toml");
         config.save_to_file(&config_path).unwrap();
 
