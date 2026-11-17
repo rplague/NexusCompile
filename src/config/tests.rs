@@ -115,3 +115,15 @@ fn toolchain_list_roundtrips() {
     let parsed: ServiceConfig = toml::from_str(&text).unwrap();
     assert_eq!(parsed.node.toolchains, config.node.toolchains);
 }
+
+#[test]
+fn warnings_have_stable_codes() {
+    let mut config = ServiceConfig::default();
+    config.port = 0;
+    config.subscription.ttl_secs = 0;
+
+    let warnings = config.warnings();
+    assert!(warnings.iter().any(|warning| warning.code == "port"));
+    assert!(warnings.iter().any(|warning| warning.code == "ttl_secs"));
+    assert!(warnings.iter().all(|warning| !warning.message.is_empty()));
+}
