@@ -563,6 +563,14 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 - File logging runs on a dedicated writer thread; `LogStruct::emit` never performs blocking file I/O on a Tokio worker.
 - Service dispatch moves cache/workspace filesystem work to the blocking pool.
 
+## Compile task pipeline
+
+1. `nexus-rustc` builds a `TaskBundle` and sends it over the local task socket.
+2. `local_task` validates the bundle once and constructs a `TaskJob`.
+3. `Coordinator` checks the cache, then executes locally or uploads the same job remotely.
+4. Remote providers execute the same `TaskJob` through `compile::executor`; they do not re-parse bundles or rebuild manifests.
+5. `TaskResult` carries outputs, diagnostics, cache state and duration back to the transport layer.
+
 ## Module map
 
 | Module | Responsibility |
@@ -580,11 +588,11 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | **compile_protocol** | `rustc-pool` application v2: `AppRequest`, `AppResponse`, task states |
 | **service** | Decode and dispatch application requests: subscribe, reserve, blob, status, cancel, result ack |
 | **task_blob** | Task bundle chunk I/O and task-directory cleanup |
-| **local_protocol** | Shared local request/response and framing types |
-| **local_task** | Task socket, bundle ingestion, output delivery |
+| **local_task_protocol** | Local wrapper ↔ sidecar task protocol and framing helpers |
+| **local_task** | Task socket/session, TaskJob construction, output delivery |
 | **nexus-rustc** (bin) | `RUSTC_WRAPPER` implementation: typed socket client, staged output commit, rustc fallback |
-| **compile** | Compile primitives: `executor` (local staging), `manifest` (digest), `bundle`, `cache`, `cas`, and `hash` |
-| **remote** | Consumer `Coordinator` over `remote/transfer.rs` (bundle upload, task polling, result import) |
+| **compile** | Shared `TaskJob`/`TaskResult` pipeline: `bundle` (validate/materialize/prepare), `executor` (local staging), `manifest`, `cache`, `cas`, `hash` |
+| **remote** | Consumer `Coordinator`: provider routing, bundle upload, task polling and result import |
 | **pool** | `Provider` (capacity/subscriptions/tasks/leases), `Consumer` (provider views), and `runtime` scheduling |
 | **workspace** | Staging and provider task directories |
 | **capacity** | `/proc` sampling and slot calculation |
