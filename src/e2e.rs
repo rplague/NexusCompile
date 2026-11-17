@@ -90,7 +90,6 @@ mod local_remote {
             }
             other => panic!("expected cached compiled, got {other:?}"),
         }
-
     }
 
     #[tokio::test]
@@ -164,6 +163,5 @@ mod local_remote {
         assert_eq!(fs::read(out.join("libdemo.rlib")).unwrap(), payload);
         assert!(cache.cached_outputs(&digest).is_some());
         assert_eq!(mock.sent().len(), 3);
-
     }
 }

@@ -224,7 +224,18 @@ mod tests {
             ("fifty_percent", 8.0, 4.0, 32768, 16384, 100, 8, 4, true),
         ];
 
-        for (name, total_cores, used_cores, mem_total_mb, mem_available_mb, percent, max, free, accepting) in cases {
+        for (
+            name,
+            total_cores,
+            used_cores,
+            mem_total_mb,
+            mem_available_mb,
+            percent,
+            max,
+            free,
+            accepting,
+        ) in cases
+        {
             let sample = CapacitySample {
                 total_cores,
                 used_cores,

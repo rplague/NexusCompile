@@ -317,12 +317,18 @@ mod tests {
     fn rejects_unsupported_invocations_and_rewrites_out_dir() {
         let mut env = base_env();
         env.insert("CARGO_INCREMENTAL".into(), "1".into());
-        assert!(is_supported(&base_args(), &env).is_err(), "case: incremental");
+        assert!(
+            is_supported(&base_args(), &env).is_err(),
+            "case: incremental"
+        );
 
         let mut args = base_args();
         let index = args.iter().position(|arg| arg == "lib").unwrap();
         args[index] = "bin".into();
-        assert!(is_supported(&args, &base_env()).is_err(), "case: crate type");
+        assert!(
+            is_supported(&args, &base_env()).is_err(),
+            "case: crate type"
+        );
 
         let mut args = base_args();
         args.retain(|arg| arg != "--out-dir" && arg != "/tmp/out");
@@ -336,11 +342,17 @@ mod tests {
         let mut args = base_args();
         let index = args.iter().position(|arg| arg == "demo").unwrap();
         args[index] = "build_script_build".into();
-        assert!(is_supported(&args, &base_env()).is_err(), "case: build script");
+        assert!(
+            is_supported(&args, &base_env()).is_err(),
+            "case: build script"
+        );
 
         let mut args = base_args();
         args.push("--test".into());
-        assert!(is_supported(&args, &base_env()).is_err(), "case: test invocation");
+        assert!(
+            is_supported(&args, &base_env()).is_err(),
+            "case: test invocation"
+        );
 
         let staging = Path::new("/tmp/staging/out");
         let args = vec!["--out-dir".into(), "/tmp/real".into()];

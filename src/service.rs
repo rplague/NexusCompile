@@ -463,9 +463,7 @@ mod tests {
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
         match response.body {
             AppResponse::Cached {
-                task_id,
-                outputs,
-                ..
+                task_id, outputs, ..
             } => {
                 assert_eq!(task_id, cached_task, "case: cached task");
                 assert_eq!(outputs, vec![cached_output], "case: cached outputs");
@@ -476,13 +474,14 @@ mod tests {
 
         let ack_task = TaskId(Hash32([6; 32]));
         let ack_output = seed_output(&context, ack_task, b"done");
-        let lease_id = match context
-            .provider
-            .reserve(PeerId::new("consumer"), ack_task, 1, Hash32([7; 32]))
-        {
-            AppResponse::Granted { lease_id, .. } => lease_id,
-            other => panic!("expected granted, got {other:?}"),
-        };
+        let lease_id =
+            match context
+                .provider
+                .reserve(PeerId::new("consumer"), ack_task, 1, Hash32([7; 32]))
+            {
+                AppResponse::Granted { lease_id, .. } => lease_id,
+                other => panic!("expected granted, got {other:?}"),
+            };
         assert_eq!(
             context
                 .provider
