@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn roundtrip_dedup_and_integrity() {
         let root = TempDir::new("cas");
-        let cas = Cas::new(&root);
+        let cas = Cas::new(root.path());
 
         let first = cas.put_bytes(b"hello").unwrap();
         let second = cas.put_bytes(b"hello").unwrap();

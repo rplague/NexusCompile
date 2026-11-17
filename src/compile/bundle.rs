@@ -337,25 +337,10 @@ fn add_extern(cwd: &Path, value: &str, result: &mut HashMap<String, PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::TempDir;
 
-    #[test]
-    fn prepare_task_uses_package_root_for_target_cwd() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "nexuscompile-bundle-{}-{unique}",
-            std::process::id()
-        ));
-        let work = root.join("work");
-        fs::create_dir_all(work.join("pkg/src")).unwrap();
-        fs::create_dir_all(work.join("out")).unwrap();
-        fs::create_dir_all(work.join("extern")).unwrap();
-        fs::write(work.join("pkg/src/lib.rs"), "pub fn f() {}\n").unwrap();
-
-        let manifest = ActionManifest {
+    fn manifest() -> ActionManifest {
+        ActionManifest {
             schema: crate::compile::manifest::MANIFEST_SCHEMA,
             toolchain_id: String::new(),
             target: String::new(),
@@ -377,19 +362,69 @@ mod tests {
             inputs: Vec::new(),
             outputs: Vec::new(),
             incremental: false,
-        };
-        let bundle = TaskBundle {
-            schema: BUNDLE_SCHEMA,
-            manifest,
+        }
+    }
+
+    fn bundle(schema: u16, path: &str) -> TaskBundle {
+        TaskBundle {
+            schema,
+            manifest: manifest(),
             files: vec![BundleFile {
-                path: "pkg/src/lib.rs".into(),
+                path: path.into(),
                 mode: 0o644,
                 data: b"pub fn f() {}\n".to_vec(),
             }],
-        };
-        let prepared = prepare_task(&bundle, &work).unwrap();
+        }
+    }
+
+    #[test]
+    fn prepare_task_and_substitute() {
+        let root = TempDir::new("bundle");
+        let work = root.join("work");
+        fs::create_dir_all(work.join("pkg/src")).unwrap();
+        fs::create_dir_all(work.join("out")).unwrap();
+        fs::create_dir_all(work.join("extern")).unwrap();
+        fs::write(work.join("pkg/src/lib.rs"), "pub fn f() {}\n").unwrap();
+
+        let prepared = prepare_task(&bundle(BUNDLE_SCHEMA, "pkg/src/lib.rs"), &work).unwrap();
         assert_eq!(prepared.cwd, work.join("pkg"));
         assert_eq!(prepared.out_dir, work.join("out"));
-        fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(
+            substitute("<MANIFEST>/src/lib.rs", &work),
+            work.join("pkg/src/lib.rs").display().to_string()
+        );
+        assert_eq!(
+            substitute("--out-dir=<OUT>", &work),
+            format!("--out-dir={}", work.join("out").display())
+        );
+        assert_eq!(
+            substitute("<EXTERN>/dep", &work),
+            work.join("extern/dep").display().to_string()
+        );
+        assert_eq!(
+            substitute("--target-dir=<TARGET>", &work),
+            format!("--target-dir={}", work.join("target").display())
+        );
+    }
+
+    #[test]
+    fn bundle_rejects_unsafe_paths_and_schema() {
+        let root = TempDir::new("bundle-unsafe");
+        let work = root.join("work");
+        fs::create_dir_all(&work).unwrap();
+
+        for path in ["../escape", "/tmp/escape", "a/../../escape"] {
+            assert!(
+                materialize_bundle(&bundle(BUNDLE_SCHEMA, path), &work).is_err(),
+                "case: {path}"
+            );
+            assert!(!work.join("escape").exists(), "case: {path} escaped");
+        }
+
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&bundle(BUNDLE_SCHEMA + 1, "pkg/src/lib.rs"), &mut bytes)
+            .unwrap();
+        assert!(decode_bundle(&bytes).is_err(), "case: unsupported schema");
     }
 }

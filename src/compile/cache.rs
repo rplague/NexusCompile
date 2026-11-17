@@ -552,13 +552,19 @@ mod tests {
         let cache = cache(&root, 10 * 1024 * 1024);
         let workspace = crate::workspace::Workspace::new(cache.root());
         let staging = workspace.staging_dir(&Hash32([9; 32])).unwrap();
-        let outputs = vec![OutputFile {
-            path: "../escape".into(),
-            hash: Hash32([1; 32]),
-            size: 1,
-            mode: 0o644,
-        }];
-        assert!(cache.materialize_outputs(&outputs, &staging).is_err());
+
+        for path in ["../escape", "/tmp/escape", "a/../../escape"] {
+            let outputs = vec![OutputFile {
+                path: path.into(),
+                hash: Hash32([1; 32]),
+                size: 1,
+                mode: 0o644,
+            }];
+            assert!(
+                cache.materialize_outputs(&outputs, &staging).is_err(),
+                "case: {path}"
+            );
+        }
     }
 
     #[test]

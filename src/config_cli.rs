@@ -99,3 +99,59 @@ fn parse_config_arg(args: &[String]) -> Result<PathBuf, i32> {
 
     Ok(config.unwrap_or_else(paths::config_path))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TempDir;
+    use std::fs;
+
+    #[test]
+    fn config_defaults_does_not_overwrite_existing() {
+        let dir = TempDir::new("config-cli-defaults");
+        let path = dir.join("config.toml");
+        fs::write(&path, "# existing\n").unwrap();
+        let args = vec![
+            "config-defaults".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# existing\n");
+
+        let missing = dir.join("new.toml");
+        let args = vec![
+            "config-defaults".to_string(),
+            "--config".to_string(),
+            missing.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0));
+        assert!(missing.is_file());
+    }
+
+    #[test]
+    fn config_check_exit_codes() {
+        let dir = TempDir::new("config-cli-check");
+        let path = dir.join("config.toml");
+        fs::write(&path, "port = 6100\n").unwrap();
+        let args = vec![
+            "config-check".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(0), "case: valid");
+
+        fs::write(&path, "[node\n").unwrap();
+        assert_eq!(run_cli(&args), Some(2), "case: invalid");
+
+        let missing = dir.join("missing.toml");
+        let args = vec![
+            "config-check".to_string(),
+            "--config".to_string(),
+            missing.display().to_string(),
+        ];
+        assert_eq!(run_cli(&args), Some(4), "case: missing");
+
+        assert_eq!(run_cli(&["not-a-config-command".to_string()]), None);
+    }
+}

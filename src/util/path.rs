@@ -32,3 +32,35 @@ pub fn safe_relative(path: &str) -> Option<PathBuf> {
 pub fn safe_join(base: &Path, relative: &str) -> Option<PathBuf> {
     safe_relative(relative).map(|path| base.join(path))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_relative_and_join_table() {
+        let cases = [
+            ("a/b", Some("a/b")),
+            ("a/./b", Some("a/b")),
+            ("../x", None),
+            ("a/../../b", None),
+            ("/abs", None),
+            (".", None),
+            ("", None),
+        ];
+
+        for (input, expected) in cases {
+            let actual = safe_relative(input);
+            assert_eq!(
+                actual.as_deref(),
+                expected.map(Path::new),
+                "case: {input:?}"
+            );
+            assert_eq!(
+                safe_join(Path::new("/base"), input).is_some(),
+                expected.is_some(),
+                "case: join {input:?}"
+            );
+        }
+    }
+}
