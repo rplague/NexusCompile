@@ -232,7 +232,18 @@ impl ServiceConfig {
     pub fn save_to_file(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let serialized = toml::to_string_pretty(self)
             .map_err(|error| ConfigError::io(format!("serialize config: {error}")))?;
-        write_atomic(path.as_ref(), &serialized)
+        crate::util::fs::write_atomic(path.as_ref(), serialized.as_bytes(), None)
+            .map_err(|error| ConfigError::io(format!("write {}: {error}", path.as_ref().display())))
+    }
+
+    /// Cache root, using the path resolver when `cache.dir` is empty.
+    pub fn cache_dir(&self) -> PathBuf {
+        let dir = self.cache.dir.trim();
+        if dir.is_empty() {
+            paths::cache_path()
+        } else {
+            PathBuf::from(dir)
+        }
     }
 
     /// Non-fatal configuration warnings. These do not reject the file.
@@ -283,35 +294,6 @@ impl ServiceConfig {
         }
 
         warnings
-    }
-}
-
-fn write_atomic(path: &Path, content: &str) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .map_err(|error| ConfigError::io(format!("create {}: {error}", parent.display())))?;
-    }
-
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let temp = path.with_file_name(format!(".{file_name}.tmp"));
-
-    fs::write(&temp, content)
-        .map_err(|error| ConfigError::io(format!("write {}: {error}", temp.display())))?;
-
-    match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(ConfigError::io(format!(
-                "rename {}: {error}",
-                path.display()
-            )))
-        }
     }
 }
 

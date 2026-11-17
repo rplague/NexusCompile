@@ -210,11 +210,7 @@ async fn main() -> std::io::Result<()> {
 }
 
 fn open_cache(config: &ServiceConfig) -> Arc<ResultCache> {
-    let cache_dir = if config.cache.dir.trim().is_empty() {
-        paths::cache_path()
-    } else {
-        std::path::PathBuf::from(&config.cache.dir)
-    };
+    let cache_dir = config.cache_dir();
     match ResultCache::open(
         &cache_dir,
         config.cache.result_cache_mb.saturating_mul(1024 * 1024),
