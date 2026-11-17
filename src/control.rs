@@ -106,3 +106,58 @@ pub async fn send(
         .map_err(|e| SidecarError::new("decode_error", e.to_string()))?;
     Ok(envelope.body)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compile_protocol::{AppRequest, AppResponse, Hash32, TaskId};
+    use crate::test_support::MockControl;
+
+    #[tokio::test]
+    async fn send_and_connection_lifecycle() {
+        let mock = Arc::new(MockControl::new(vec![Ok(AppResponse::Busy {
+            retry_after_ms: 25,
+        })]));
+        let handle = new_control_handle();
+        *handle.write().unwrap() = Some(mock.clone());
+
+        let peer = PeerId::new("12D3KooWpeer");
+        let response = send(
+            &handle,
+            "rustc-pool",
+            &peer,
+            AppRequest::Status {
+                task_id: TaskId(Hash32([1; 32])),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response, AppResponse::Busy { retry_after_ms: 25 });
+        let sent = mock.sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, peer);
+
+        let empty = new_control_handle();
+        let error = send(
+            &empty,
+            "rustc-pool",
+            &PeerId::new("peer"),
+            AppRequest::Status {
+                task_id: TaskId(Hash32([2; 32])),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "not_connected", "case: no connection");
+
+        let first: Arc<dyn ControlPlane> = Arc::new(MockControl::new(vec![]));
+        let second: Arc<dyn ControlPlane> = Arc::new(MockControl::new(vec![]));
+        set(&handle, Some(first.clone()));
+        set(&handle, Some(second.clone()));
+        clear_if(&handle, &first);
+        assert!(current(&handle).is_some(), "case: old disconnect");
+
+        clear_if(&handle, &second);
+        assert!(current(&handle).is_none(), "case: current disconnect");
+    }
+}

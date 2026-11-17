@@ -449,8 +449,8 @@ mod tests {
     use crate::test_support::TempDir;
 
     #[test]
-    fn configure_preserves_existing_content() {
-        let root = TempDir::new("toolchain");
+    fn configure_preserves_existing_and_creates_node_table() {
+        let root = TempDir::new("toolchain-existing");
         let path = root.join("config.toml");
         fs::write(
             &path,
@@ -473,13 +473,8 @@ mod tests {
         assert!(text.contains("rustc = \"/opt/rust/bin/rustc\""));
         assert_eq!(text.matches("rustc =").count(), 1);
 
-    }
-
-    #[test]
-    fn configure_creates_node_table() {
-        let root = TempDir::new("toolchain");
+        let root = TempDir::new("toolchain-new");
         let path = root.join("config.toml");
-
         configure(&[
             "--config".into(),
             path.display().to_string(),
@@ -489,9 +484,8 @@ mod tests {
         .unwrap();
 
         let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("[node]"));
+        assert!(text.contains("[node]"), "case: creates node table");
         assert!(text.contains("rustc = \"/opt/rust/bin/rustc\""));
-
     }
 
     #[test]
@@ -520,27 +514,27 @@ mod tests {
         assert_eq!(parsed.node.toolchains[0].target, "x86_64-unknown-linux-gnu");
         assert_eq!(parsed.node.toolchains[1].channel, "1.99.0");
         assert!(parsed.node.toolchains[1].target.is_empty());
-
     }
 
     #[test]
-    fn state_rejects_malformed_lines() {
-        let root = TempDir::new("toolchain");
+    fn state_and_resolver_validation() {
+        let root = TempDir::new("toolchain-state");
         let state = root.join("state");
         fs::write(&state, "stable|/opt/stable/bin/rustc\n").unwrap();
-        assert!(read_toolchain_state(&state).is_err());
-    }
+        assert!(read_toolchain_state(&state).is_err(), "case: malformed state");
 
-    #[test]
-    fn resolver_matches_default_toolchain() {
         let config = ServiceConfig::default();
         let id = toolchain_id(Path::new("rustc"), "").unwrap();
-        assert_eq!(resolve_rustc(&config, &id, "").unwrap(), "rustc");
-        assert!(resolve_rustc(&config, "not-a-toolchain", "").is_err());
-    }
+        assert_eq!(
+            resolve_rustc(&config, &id, "").unwrap(),
+            "rustc",
+            "case: default"
+        );
+        assert!(
+            resolve_rustc(&config, "not-a-toolchain", "").is_err(),
+            "case: unknown"
+        );
 
-    #[test]
-    fn resolver_uses_configured_toolchain_list() {
         let mut config = ServiceConfig::default();
         config.node.toolchains = vec![
             ToolchainEntry {
@@ -554,7 +548,10 @@ mod tests {
                 target: String::new(),
             },
         ];
-        let id = toolchain_id(Path::new("rustc"), "").unwrap();
-        assert_eq!(resolve_rustc(&config, &id, "").unwrap(), "rustc");
+        assert_eq!(
+            resolve_rustc(&config, &id, "").unwrap(),
+            "rustc",
+            "case: configured list"
+        );
     }
 }

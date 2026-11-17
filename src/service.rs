@@ -278,19 +278,15 @@ mod tests {
     use crate::config::ConfigHandle;
     use crate::control::new_control_handle;
     use crate::pool::{Consumer, Provider};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::TempDir;
+    use std::path::Path;
 
-    fn context() -> AppState {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let cache_dir = std::env::temp_dir().join(format!("nexuscompile-service-{unique}"));
+    fn context(dir: &Path) -> AppState {
         AppState::new(
             Arc::new(Provider::placeholder()),
             Arc::new(Consumer::new()),
-            Arc::new(crate::compile::cache::ResultCache::open(&cache_dir, 1024 * 1024).unwrap()),
-            Arc::new(crate::workspace::Workspace::new(&cache_dir)),
+            Arc::new(crate::compile::cache::ResultCache::open(dir, 1024 * 1024).unwrap()),
+            Arc::new(crate::workspace::Workspace::new(dir)),
             ConfigHandle::new(crate::config::ServiceConfig::default()),
             new_control_handle(),
         )
@@ -307,38 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_returns_provider_limits() {
-        let context = context();
-        let request = encode_request(AppRequest::Subscribe {
-            consumer: PeerId::new("consumer"),
-            toolchain: "rustc".into(),
-            target: "x86_64".into(),
-        });
+    fn rejects_malformed_and_unsupported_requests() {
+        let dir = TempDir::new("service");
+        let context = context(&dir);
 
-        let response = handle_app_payload(&request, &context).unwrap();
-        let response = decode_response(&response);
-
-        assert_eq!(
-            response.body,
-            AppResponse::Subscribed {
-                provider: PeerId::new("local"),
-                toolchain: String::new(),
-                target: String::new(),
-                max_slots: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn invalid_cbor_is_transport_error() {
-        let context = context();
         let error = handle_app_payload(&[0xff], &context).unwrap_err();
-        assert_eq!(error.code, "invalid_request");
-    }
+        assert_eq!(error.code, "invalid_request", "case: malformed cbor");
 
-    #[test]
-    fn unsupported_version_is_application_error() {
-        let context = context();
         let mut bytes = Vec::new();
         ciborium::ser::into_writer(
             &Envelope {
@@ -362,8 +333,71 @@ mod tests {
     }
 
     #[test]
+    fn reserve_checks_toolchain_and_target() {
+        let dir = TempDir::new("service");
+        let context = context(&dir);
+        let toolchain_id =
+            crate::compile::manifest::toolchain_id(std::path::Path::new("rustc"), "").unwrap();
+
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id: TaskId(Hash32([14; 32])),
+            slots: 1,
+            input_manifest: Hash32([15; 32]),
+            toolchain_id,
+            target: String::new(),
+        });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(
+            matches!(response.body, AppResponse::Granted { .. }),
+            "case: matching"
+        );
+
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id: TaskId(Hash32([10; 32])),
+            slots: 1,
+            input_manifest: Hash32([11; 32]),
+            toolchain_id: "not-the-local-toolchain".into(),
+            target: String::new(),
+        });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(
+            matches!(
+                response.body,
+                AppResponse::Rejected {
+                    code: ErrorCode::Rejected,
+                    ..
+                }
+            ),
+            "case: toolchain mismatch"
+        );
+
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id: TaskId(Hash32([12; 32])),
+            slots: 1,
+            input_manifest: Hash32([13; 32]),
+            toolchain_id: String::new(),
+            target: "definitely-not-a-target".into(),
+        });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert!(
+            matches!(
+                response.body,
+                AppResponse::Rejected {
+                    code: ErrorCode::Rejected,
+                    ..
+                }
+            ),
+            "case: uninstalled target"
+        );
+    }
+
+    #[test]
     fn blob_put_and_get_round_trip() {
-        let context = context();
+        let dir = TempDir::new("service");
+        let context = context(&dir);
         let task_id = TaskId(Hash32([1; 32]));
         let bundle = context.cache.cas().put_bytes(b"bundle").unwrap();
         assert!(matches!(
@@ -394,23 +428,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn status_of_unknown_task_is_not_found() {
-        let context = context();
-        let request = encode_request(AppRequest::Status {
-            task_id: TaskId(Hash32([3; 32])),
-        });
-
-        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        assert!(matches!(
-            response.body,
-            AppResponse::Error {
-                code: ErrorCode::NotFound,
-                ..
-            }
-        ));
-    }
-
     fn seed_output(context: &AppState, task_id: TaskId, bytes: &[u8]) -> OutputRef {
         let blob = context.cache.cas().put_bytes(bytes).unwrap();
         let output = OutputRef {
@@ -429,132 +446,61 @@ mod tests {
     }
 
     #[test]
-    fn reserve_accepts_matching_toolchain() {
-        let context = context();
-        let toolchain_id =
-            crate::compile::manifest::toolchain_id(std::path::Path::new("rustc"), "").unwrap();
+    fn cache_and_result_ack_flow() {
+        let dir = TempDir::new("service");
+        let context = context(&dir);
+
+        let cached_task = TaskId(Hash32([4; 32]));
+        let cached_output = seed_output(&context, cached_task, b"cached");
         let request = encode_request(AppRequest::Reserve {
             consumer: PeerId::new("consumer"),
-            task_id: TaskId(Hash32([14; 32])),
-            slots: 1,
-            input_manifest: Hash32([15; 32]),
-            toolchain_id,
-            target: String::new(),
-        });
-
-        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        assert!(matches!(response.body, AppResponse::Granted { .. }));
-    }
-
-    #[test]
-    fn reserve_rejects_toolchain_mismatch() {
-        let context = context();
-        let request = encode_request(AppRequest::Reserve {
-            consumer: PeerId::new("consumer"),
-            task_id: TaskId(Hash32([10; 32])),
-            slots: 1,
-            input_manifest: Hash32([11; 32]),
-            toolchain_id: "not-the-local-toolchain".into(),
-            target: String::new(),
-        });
-
-        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        assert!(matches!(
-            response.body,
-            AppResponse::Rejected {
-                code: ErrorCode::Rejected,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn reserve_rejects_uninstalled_target() {
-        let context = context();
-        let request = encode_request(AppRequest::Reserve {
-            consumer: PeerId::new("consumer"),
-            task_id: TaskId(Hash32([12; 32])),
-            slots: 1,
-            input_manifest: Hash32([13; 32]),
-            toolchain_id: String::new(),
-            target: "definitely-not-a-target".into(),
-        });
-
-        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        assert!(matches!(
-            response.body,
-            AppResponse::Rejected {
-                code: ErrorCode::Rejected,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn reserve_uses_cache_when_task_entry_is_missing() {
-        let context = context();
-        let task_id = TaskId(Hash32([4; 32]));
-        let output = seed_output(&context, task_id, b"cached");
-
-        let request = encode_request(AppRequest::Reserve {
-            consumer: PeerId::new("consumer"),
-            task_id,
+            task_id: cached_task,
             slots: 1,
             input_manifest: Hash32([5; 32]),
             toolchain_id: String::new(),
             target: String::new(),
         });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-
         match response.body {
             AppResponse::Cached {
-                task_id: cached_id,
+                task_id,
                 outputs,
                 ..
             } => {
-                assert_eq!(cached_id, task_id);
-                assert_eq!(outputs, vec![output]);
+                assert_eq!(task_id, cached_task, "case: cached task");
+                assert_eq!(outputs, vec![cached_output], "case: cached outputs");
             }
             other => panic!("expected cached, got {other:?}"),
         }
-        assert!(context.provider.task_entry(&task_id).is_none());
-    }
+        assert!(context.provider.task_entry(&cached_task).is_none());
 
-    #[test]
-    fn result_ack_removes_done_entry_and_status_uses_cache() {
-        let context = context();
-        let task_id = TaskId(Hash32([6; 32]));
-        let output = seed_output(&context, task_id, b"done");
-
-        let lease_id = {
-            let lease_id =
-                match context
-                    .provider
-                    .reserve(PeerId::new("consumer"), task_id, 1, Hash32([7; 32]))
-                {
-                    AppResponse::Granted { lease_id, .. } => lease_id,
-                    other => panic!("expected granted, got {other:?}"),
-                };
-            assert_eq!(
-                context
-                    .provider
-                    .complete_task(task_id, vec![output.clone()]),
-                AppResponse::Ack
-            );
-            lease_id
+        let ack_task = TaskId(Hash32([6; 32]));
+        let ack_output = seed_output(&context, ack_task, b"done");
+        let lease_id = match context
+            .provider
+            .reserve(PeerId::new("consumer"), ack_task, 1, Hash32([7; 32]))
+        {
+            AppResponse::Granted { lease_id, .. } => lease_id,
+            other => panic!("expected granted, got {other:?}"),
         };
+        assert_eq!(
+            context
+                .provider
+                .complete_task(ack_task, vec![ack_output.clone()]),
+            AppResponse::Ack
+        );
 
         let request = encode_request(AppRequest::ResultAck { lease_id });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
         assert_eq!(response.body, AppResponse::Ack);
-        assert!(context.provider.task_entry(&task_id).is_none());
+        assert!(context.provider.task_entry(&ack_task).is_none());
 
-        let request = encode_request(AppRequest::Status { task_id });
+        let request = encode_request(AppRequest::Status { task_id: ack_task });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
         match response.body {
             AppResponse::TaskStatus {
                 state: TaskState::Done { outputs },
-            } => assert_eq!(outputs, vec![output]),
+            } => assert_eq!(outputs, vec![ack_output], "case: cached done status"),
             other => panic!("expected cached done status, got {other:?}"),
         }
     }

@@ -482,104 +482,68 @@ mod tests {
     }
 
     #[test]
-    fn store_and_materialize_cache_hit() {
-        let root = TempDir::new("cache");
-        let cache = cache(&root, 10 * 1024 * 1024);
-        let digest = store_payload(&cache, 1, b"compiled bytes");
-
-        let out = root.join("out");
-        let hit = cache.lookup_and_materialize(&digest, &out).unwrap();
-        assert_eq!(hit.outputs.len(), 1);
-        assert_eq!(
-            fs::read(out.join("libdemo.rlib")).unwrap(),
-            b"compiled bytes"
-        );
-        assert!(cache.total_bytes() > 0);
-    }
-
-    #[test]
-    fn ttl_survives_reopen_and_resets() {
+    fn store_reopen_and_materialize() {
         let root = TempDir::new("cache");
         let digest = {
             let cache = cache(&root, 10 * 1024 * 1024);
-            store_payload(&cache, 2, b"persistent")
+            let digest = store_payload(&cache, 1, b"compiled bytes");
+            let out = root.join("out");
+            let hit = cache.lookup_and_materialize(&digest, &out).unwrap();
+            assert_eq!(hit.outputs.len(), 1);
+            assert_eq!(
+                fs::read(out.join("libdemo.rlib")).unwrap(),
+                b"compiled bytes"
+            );
+            assert!(cache.total_bytes() > 0);
+            digest
         };
+
         let reopened = cache(&root, 10 * 1024 * 1024);
         assert!(
             reopened
-                .lookup_and_materialize(&digest, &root.join("out2"))
+                .lookup_and_materialize(&digest, &root.join("out-reopen"))
                 .is_some()
         );
     }
 
     #[test]
-    fn respects_quota_and_evicts_unpinned_entries() {
-        let root = TempDir::new("cache");
-        let cache = cache(&root, 10);
-        let first = store_payload(&cache, 3, b"123456");
-        let second = store_payload(&cache, 4, b"abcdef");
-        assert!(cache.total_bytes() <= 10);
+    fn quota_and_pin_eviction() {
+        let quota_root = TempDir::new("cache-quota");
+        let quota = cache(&quota_root, 10);
+        let first = store_payload(&quota, 3, b"123456");
+        let second = store_payload(&quota, 4, b"abcdef");
+        assert!(quota.total_bytes() <= 10);
         let hits = [
-            cache.lookup_and_materialize(&first, &root.join("out3")),
-            cache.lookup_and_materialize(&second, &root.join("out4")),
+            quota.lookup_and_materialize(&first, &quota_root.join("out3")),
+            quota.lookup_and_materialize(&second, &quota_root.join("out4")),
         ]
         .into_iter()
         .flatten()
         .count();
         assert_eq!(hits, 1);
-    }
 
-    #[test]
-    fn cached_outputs_peek_validates_blobs() {
-        let root = TempDir::new("cache");
-        let cache = cache(&root, 10 * 1024 * 1024);
-        let digest = store_payload(&cache, 6, b"peek");
-
-        let outputs = cache.cached_outputs(&digest).unwrap();
-        assert_eq!(outputs.len(), 1);
-
-        let blobs: Vec<PathBuf> = fs::read_dir(cache.cas.blobs_dir())
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .collect();
-        for blob in blobs {
-            fs::remove_file(blob).unwrap();
-        }
-
-        assert!(cache.cached_outputs(&digest).is_none());
+        let pin_root = TempDir::new("cache-pin");
+        let pin = cache(&pin_root, 10);
+        let pinned = store_payload(&pin, 7, b"123456");
+        assert!(pin.pin(&pinned));
+        let second = store_payload(&pin, 8, b"abcdef");
+        assert!(pin.total_bytes() <= 10);
         assert!(
-            cache
-                .lookup_and_materialize(&digest, &root.join("out"))
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn pinned_entry_survives_quota_eviction() {
-        let root = TempDir::new("cache");
-        let cache = cache(&root, 10);
-        let pinned = store_payload(&cache, 7, b"123456");
-        assert!(cache.pin(&pinned));
-        let second = store_payload(&cache, 8, b"abcdef");
-        assert!(cache.total_bytes() <= 10);
-        assert!(
-            cache
-                .lookup_and_materialize(&pinned, &root.join("out-pinned"))
+            pin.lookup_and_materialize(&pinned, &pin_root.join("out-pinned"))
                 .is_some()
         );
-        cache.release(&pinned);
-        let third = store_payload(&cache, 9, b"ghijkl");
+        pin.release(&pinned);
+        let third = store_payload(&pin, 9, b"ghijkl");
         let hits = [
-            cache.lookup_and_materialize(&pinned, &root.join("out-pinned-2")),
-            cache.lookup_and_materialize(&second, &root.join("out-second")),
-            cache.lookup_and_materialize(&third, &root.join("out-third")),
+            pin.lookup_and_materialize(&pinned, &pin_root.join("out-pinned-2")),
+            pin.lookup_and_materialize(&second, &pin_root.join("out-second")),
+            pin.lookup_and_materialize(&third, &pin_root.join("out-third")),
         ]
         .into_iter()
         .flatten()
         .count();
         assert!(hits <= 1);
-        assert!(cache.total_bytes() <= 10);
+        assert!(pin.total_bytes() <= 10);
     }
 
     #[test]
@@ -598,10 +562,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_blob_invalidates_entry() {
+    fn blob_validation_invalidates_entry() {
         let root = TempDir::new("cache");
         let cache = cache(&root, 10 * 1024 * 1024);
         let digest = store_payload(&cache, 5, b"gone");
+
+        let outputs = cache.cached_outputs(&digest).unwrap();
+        assert_eq!(outputs.len(), 1);
+
         let blobs: Vec<PathBuf> = fs::read_dir(cache.cas.blobs_dir())
             .unwrap()
             .flatten()
@@ -610,9 +578,11 @@ mod tests {
         for blob in blobs {
             fs::remove_file(blob).unwrap();
         }
+
+        assert!(cache.cached_outputs(&digest).is_none());
         assert!(
             cache
-                .lookup_and_materialize(&digest, &root.join("out5"))
+                .lookup_and_materialize(&digest, &root.join("out-missing"))
                 .is_none()
         );
     }

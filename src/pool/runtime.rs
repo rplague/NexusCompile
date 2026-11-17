@@ -459,7 +459,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subscribes_until_target_capacity_is_visible() {
+    async fn subscribes_until_target_and_removes_failed_provider() {
         let provider = Arc::new(Provider::new(PeerId::new("self"), 1));
         let consumer = Arc::new(Consumer::new());
         let node = NodeConfig::default();
@@ -508,13 +508,9 @@ mod tests {
         );
         let views = consumer.providers();
         assert_eq!(views.len(), 2);
-    }
 
-    #[tokio::test]
-    async fn failed_subscribe_removes_pending_provider() {
         let provider = Arc::new(Provider::new(PeerId::new("self"), 0));
         let consumer = Arc::new(Consumer::new());
-        let node = NodeConfig::default();
         let subscription = SubscriptionConfig {
             target_slots: 1,
             ..SubscriptionConfig::default()
@@ -543,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_discovery_clears_views_and_retries_after_30s() {
+    async fn empty_discovery_clears_views_and_retries_after_30s_and_intervals() {
         let provider = Arc::new(Provider::new(PeerId::new("self"), 1));
         let consumer = Arc::new(Consumer::new());
         consumer.record_subscribed(PeerId::new("old"), 2);
@@ -573,10 +569,7 @@ mod tests {
         assert!(!discovery_due(&discovery, last + 29_999, 1));
         assert!(discovery_due(&discovery, last + 30_000, 1));
         assert!(discovery_due(&discovery, last + 59 * 60_000, 1));
-    }
 
-    #[test]
-    fn discovery_intervals_follow_capacity_and_abnormal_state() {
         let mut discovery = DiscoveryState::default();
         assert!(discovery_due(&discovery, 1_000, 1));
 

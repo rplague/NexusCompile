@@ -396,7 +396,7 @@ mod tests {
     use crate::test_support::TempDir;
 
     #[test]
-    fn legacy_port_only_config_uses_defaults() {
+    fn legacy_config_uses_defaults_without_rewriting() {
         let config: ServiceConfig = toml::from_str("port = 5100").unwrap();
         assert_eq!(config.port, 5100);
         assert_eq!(config.service_name, "rustc-pool");
@@ -408,10 +408,7 @@ mod tests {
         assert_eq!(config.subscription.target_reevaluate_secs, 5);
         assert_eq!(config.cache.result_cache_mb, 512);
         assert!(config.cache.dir.is_empty());
-    }
 
-    #[test]
-    fn legacy_fields_are_ignored_without_rewriting() {
         let root = TempDir::new("config");
         let path = root.join("config.toml");
         let original = r#"# keep me
@@ -446,10 +443,8 @@ result_cache_mb = 128
         assert_eq!(config.subscription.target_slots, 12);
         assert_eq!(config.cache.dir, "/tmp/cache");
         assert_eq!(config.cache.result_cache_mb, 128);
-
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!root.join("config.toml.bak").exists());
-
     }
 
     #[test]
@@ -464,39 +459,33 @@ result_cache_mb = 128
         let created = ServiceConfig::try_from_toml_file(&path, true).unwrap();
         assert_eq!(created.port, 5100);
         assert!(path.is_file());
-
     }
 
     #[test]
-    fn invalid_toml_is_a_parse_error_without_rename() {
-        let root = TempDir::new("config");
+    fn invalid_config_does_not_replace_or_rename() {
+        let root = TempDir::new("config-invalid");
         let path = root.join("config.toml");
         let original = "[node\n";
         fs::write(&path, original).unwrap();
 
         let error = ServiceConfig::try_from_toml_file(&path, true).unwrap_err();
-        assert_eq!(error.kind, ConfigErrorKind::Parse);
+        assert_eq!(error.kind, ConfigErrorKind::Parse, "case: parse error");
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!root.join("config.toml.bak").exists());
 
-    }
-
-    #[test]
-    fn reload_keeps_old_config_on_parse_error() {
-        let root = TempDir::new("config");
+        let root = TempDir::new("config-reload");
         let path = root.join("config.toml");
         fs::write(&path, "port = 6100\n").unwrap();
         let handle = ConfigHandle::try_from_toml_file(&path, true).unwrap();
         assert_eq!(handle.port(), 6100);
 
         fs::write(&path, "port = [\n").unwrap();
-        assert!(handle.reload_from_file().is_err());
+        assert!(handle.reload_from_file().is_err(), "case: reload bad");
         assert_eq!(handle.port(), 6100);
 
         fs::write(&path, "port = 6200\n").unwrap();
         handle.reload_from_file().unwrap();
-        assert_eq!(handle.port(), 6200);
-
+        assert_eq!(handle.port(), 6200, "case: reload good");
     }
 
     #[test]
