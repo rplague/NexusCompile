@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::compile_protocol::{AppResponse, PeerId};
+use crate::control::new_control_handle;
 use crate::test_support::MockControl;
 
 #[cfg(test)]
@@ -58,7 +59,7 @@ mod local_remote {
 
     #[test]
     fn local_compile_then_cache_hit() {
-        let (root, cache_dir, request) = project("local");
+        let (_root, cache_dir, request) = project("local");
         let cache = ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap();
         let workspace = Workspace::new(&cache_dir);
 
@@ -94,7 +95,7 @@ mod local_remote {
 
     #[tokio::test]
     async fn remote_cached_result_is_imported() {
-        let (root, cache_dir, request) = project("remote");
+        let (_root, cache_dir, request) = project("remote");
         let cache = Arc::new(ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap());
         let workspace = Arc::new(Workspace::new(&cache_dir));
 
