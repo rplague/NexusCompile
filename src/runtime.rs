@@ -12,8 +12,7 @@ use tokio::sync::{Mutex, watch};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::capacity::{
-    CapacitySample, CapacitySnapshot, CapacitySource, FixedSource, LinuxProcSource,
-    calculate_capacity,
+    CapacitySample, CapacitySource, FixedSource, LinuxProcSource, calculate_capacity,
 };
 use crate::compile::cache::ResultCache;
 use crate::compile_protocol::PeerId;
@@ -51,6 +50,7 @@ pub enum RuntimeError {
     Config(ConfigError),
     Bind { address: String, source: io::Error },
     Io(io::Error),
+    Server(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -59,6 +59,7 @@ impl fmt::Display for RuntimeError {
             Self::Config(error) => write!(f, "配置加载失败: {error}"),
             Self::Bind { address, source } => write!(f, "绑定 {address} 失败: {source}"),
             Self::Io(error) => write!(f, "{error}"),
+            Self::Server(message) => write!(f, "服务运行失败: {message}"),
         }
     }
 }
@@ -79,6 +80,7 @@ impl From<io::Error> for RuntimeError {
 
 struct RuntimeInner {
     shutdown_tx: watch::Sender<bool>,
+    server_done_rx: watch::Receiver<Option<Result<(), String>>>,
     server_task: Mutex<Option<JoinHandle<()>>>,
     config: ConfigHandle,
     local_addr: SocketAddr,
@@ -100,13 +102,17 @@ impl RuntimeHandle {
     }
 
     /// Wait until the server loop exits on its own.
-    ///
-    /// This consumes the stored join handle; a subsequent `shutdown` can still
-    /// signal the runtime but cannot await the same server task again.
-    pub async fn wait(&self) {
-        let task = self.inner.server_task.lock().await.take();
-        if let Some(task) = task {
-            let _ = task.await;
+    pub async fn wait(&self) -> Result<(), RuntimeError> {
+        let mut done = self.inner.server_done_rx.clone();
+        loop {
+            if let Some(result) = done.borrow().clone() {
+                return result.map_err(RuntimeError::Server);
+            }
+            if done.changed().await.is_err() {
+                return Err(RuntimeError::Server(
+                    "server task ended without a result".into(),
+                ));
+            }
         }
     }
 
@@ -114,8 +120,18 @@ impl RuntimeHandle {
     pub async fn shutdown(&self) {
         let _ = self.inner.shutdown_tx.send(true);
         let task = self.inner.server_task.lock().await.take();
-        if let Some(task) = task {
-            let _ = tokio::time::timeout(Duration::from_secs(8), task).await;
+        if let Some(mut task) = task
+            && tokio::time::timeout(Duration::from_secs(8), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            LogStruct::new(
+                LogLevel::Warning,
+                "服务关闭超时",
+                "server task did not stop within 8s; aborted",
+            )
+            .emit();
         }
     }
 }
@@ -123,6 +139,9 @@ impl RuntimeHandle {
 impl Drop for RuntimeInner {
     fn drop(&mut self) {
         let _ = self.shutdown_tx.send(true);
+        if let Some(task) = self.server_task.get_mut().take() {
+            task.abort();
+        }
     }
 }
 
@@ -144,15 +163,18 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
     let local_addr = listener.local_addr()?;
 
     let mut source = capacity_source();
-    let initial = source
-        .sample()
-        .map(|sample| calculate_capacity(&sample, 0, config.node.max_usage_percent))
-        .unwrap_or(CapacitySnapshot {
-            max_slots: 0,
-            free_slots: 0,
-            queue_len: 0,
-            accepting: false,
-        });
+    let initial = match source.sample() {
+        Ok(sample) => calculate_capacity(&sample, 0, config.node.max_usage_percent),
+        Err(error) => {
+            LogStruct::new(
+                LogLevel::Warning,
+                "初始容量采样失败",
+                format!("{error}; 使用回退容量"),
+            )
+            .emit();
+            calculate_capacity(&fallback_sample(), 0, config.node.max_usage_percent)
+        }
+    };
 
     let provider = Arc::new(Provider::new(PeerId::new("local"), initial.max_slots));
     provider.set_capacity(initial.max_slots, initial.free_slots);
@@ -194,6 +216,7 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
     ));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (done_tx, done_rx) = watch::channel(None);
     let services = RuntimeServices {
         app,
         coordinator,
@@ -207,11 +230,14 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
         source,
         task_socket: options.task_socket,
     };
-    let server_task = tokio::spawn(run_server(listener, services, shutdown_rx));
-
+    let server_task = tokio::spawn(async move {
+        let result = run_server(listener, services, shutdown_rx).await;
+        let _ = done_tx.send(Some(result));
+    });
     Ok(RuntimeHandle {
         inner: Arc::new(RuntimeInner {
             shutdown_tx,
+            server_done_rx: done_rx,
             server_task: Mutex::new(Some(server_task)),
             config: config_handle,
             local_addr,
@@ -237,7 +263,7 @@ async fn run_server(
     listener: TcpListener,
     services: RuntimeServices,
     mut shutdown_rx: watch::Receiver<bool>,
-) {
+) -> Result<(), String> {
     let RuntimeServices {
         app,
         coordinator,
@@ -270,7 +296,7 @@ async fn run_server(
     );
 
     let mut connections = JoinSet::new();
-    loop {
+    let result: Result<(), String> = loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -294,7 +320,7 @@ async fn run_server(
                     }
                     Err(error) => {
                         LogStruct::new(LogLevel::Critical, "监听失败", error.to_string()).emit();
-                        break;
+                        break Err(format!("listener accept failed: {error}"));
                     }
                 }
             }
@@ -303,18 +329,25 @@ async fn run_server(
                     LogStruct::new(LogLevel::Warning, "连接任务异常", error.to_string()).emit();
                 }
             }
-            _ = shutdown_rx.changed() => break,
+            _ = shutdown_rx.changed() => break Ok(()),
         }
-    }
+    };
 
     drop(listener);
     cache_sweep_task.abort();
-    let _ = tokio::time::timeout(Duration::from_secs(3), pool_task).await;
+    let mut pool_task = pool_task;
+    if tokio::time::timeout(Duration::from_secs(3), &mut pool_task)
+        .await
+        .is_err()
+    {
+        pool_task.abort();
+    }
     if let Some(task) = task_service {
         task.abort();
     }
     connections.shutdown().await;
-    let _ = std::fs::remove_file(task_socket);
+    let _ = std::fs::remove_file(&task_socket);
+    result
 }
 
 fn spawn_cache_sweeper(cache: Arc<ResultCache>) -> JoinHandle<()> {
@@ -373,13 +406,17 @@ fn capacity_source() -> Box<dyn CapacitySource + Send> {
                 format!("{error}; 使用固定回退容量"),
             )
             .emit();
-            Box::new(FixedSource::new(CapacitySample {
-                total_cores: 1.0,
-                used_cores: 0.0,
-                mem_total_mb: 1024,
-                mem_available_mb: 512,
-            }))
+            Box::new(FixedSource::new(fallback_sample()))
         }
+    }
+}
+
+fn fallback_sample() -> CapacitySample {
+    CapacitySample {
+        total_cores: 2.0,
+        used_cores: 0.0,
+        mem_total_mb: 4096,
+        mem_available_mb: 4096,
     }
 }
 
@@ -463,5 +500,14 @@ mod tests {
         handle.shutdown().await;
         handle.shutdown().await;
         assert!(!socket.exists(), "shutdown removes the task socket");
+        assert!(handle.wait().await.is_ok(), "wait observes clean shutdown");
+    }
+
+    #[test]
+    fn fallback_capacity_has_one_slot() {
+        let snapshot = calculate_capacity(&fallback_sample(), 0, 80);
+        assert_eq!(snapshot.max_slots, 1);
+        assert_eq!(snapshot.free_slots, 1);
+        assert!(snapshot.accepting);
     }
 }

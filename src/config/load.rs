@@ -13,6 +13,11 @@ pub struct LoadedConfig {
     pub missing: bool,
 }
 
+fn parse_config(path: &Path, content: &str) -> Result<ServiceConfig, ConfigError> {
+    toml::from_str::<ServiceConfig>(content)
+        .map_err(|error| ConfigError::parse(format!("parse {}: {error}", path.display())))
+}
+
 impl ServiceConfig {
     /// Load a configuration file without logging or terminating the process.
     pub fn load_or_create(
@@ -22,16 +27,11 @@ impl ServiceConfig {
         let path = path.as_ref();
 
         match fs::read_to_string(path) {
-            Ok(content) => {
-                let config = toml::from_str::<ServiceConfig>(&content).map_err(|error| {
-                    ConfigError::parse(format!("parse {}: {error}", path.display()))
-                })?;
-                Ok(LoadedConfig {
-                    config,
-                    created: false,
-                    missing: false,
-                })
-            }
+            Ok(content) => Ok(LoadedConfig {
+                config: parse_config(path, &content)?,
+                created: false,
+                missing: false,
+            }),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if !create_if_missing {
                     return Ok(LoadedConfig {
@@ -42,12 +42,27 @@ impl ServiceConfig {
                 }
 
                 let config = ServiceConfig::default();
-                config.save_to_file(path)?;
-                Ok(LoadedConfig {
-                    config,
-                    created: true,
-                    missing: false,
-                })
+                match config.save_to_new_file(path) {
+                    Ok(()) => Ok(LoadedConfig {
+                        config,
+                        created: true,
+                        missing: false,
+                    }),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        let content = fs::read_to_string(path).map_err(|error| {
+                            ConfigError::io(format!("read {}: {error}", path.display()))
+                        })?;
+                        Ok(LoadedConfig {
+                            config: parse_config(path, &content)?,
+                            created: false,
+                            missing: false,
+                        })
+                    }
+                    Err(error) => Err(ConfigError::io(format!(
+                        "create {}: {error}",
+                        path.display()
+                    ))),
+                }
             }
             Err(error) => Err(ConfigError::io(format!("read {}: {error}", path.display()))),
         }

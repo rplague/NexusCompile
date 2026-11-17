@@ -1,7 +1,7 @@
 use std::error::Error;
 
 use nexuscompile::log::{LogLevel, LogStruct};
-use nexuscompile::runtime::{RuntimeHandle, RuntimeOptions};
+use nexuscompile::runtime::RuntimeOptions;
 
 fn run_from_args(args: &[String]) -> Option<i32> {
     nexuscompile::installer::run_cli(args).or_else(|| nexuscompile::toolchain::run_cli(args))
@@ -22,12 +22,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    wait_for_exit(&handle).await;
-    handle.shutdown().await;
+    let server = handle.wait();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => {
+            if let Err(error) = &result {
+                LogStruct::new(LogLevel::Critical, "服务退出", error.to_string()).emit();
+            }
+            handle.shutdown().await;
+            nexuscompile::log::flush();
+            result?;
+        }
+        _ = wait_for_signal() => {
+            handle.shutdown().await;
+            nexuscompile::log::flush();
+        }
+    }
     Ok(())
 }
 
-async fn wait_for_exit(_handle: &RuntimeHandle) {
+async fn wait_for_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

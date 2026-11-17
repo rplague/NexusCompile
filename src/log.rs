@@ -6,6 +6,8 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::thread;
 
 use chrono::Local;
 use colored::{ColoredString, Colorize};
@@ -48,6 +50,7 @@ fn log_mode() -> LogMode {
     })
 }
 
+#[derive(Clone, Copy)]
 pub enum LogLevel {
     Important,
     Debug,
@@ -99,6 +102,58 @@ pub struct LogStruct {
     content: String,
 }
 
+struct LogRecord {
+    level: LogLevel,
+    topic: String,
+    content: String,
+    time: String,
+}
+
+enum LogCommand {
+    Record(LogRecord),
+    Flush(SyncSender<()>),
+}
+
+struct Logger {
+    tx: SyncSender<LogCommand>,
+}
+
+static LOGGER: OnceLock<Logger> = OnceLock::new();
+
+impl Logger {
+    fn spawn() -> Self {
+        let (tx, rx) = sync_channel(1024);
+        thread::Builder::new()
+            .name("nexus-log".into())
+            .spawn(move || {
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        LogCommand::Record(record) => {
+                            log_record(record.level, record.topic, record.content, record.time)
+                        }
+                        LogCommand::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .expect("spawn log writer");
+        Self { tx }
+    }
+}
+
+fn logger() -> &'static Logger {
+    LOGGER.get_or_init(Logger::spawn)
+}
+
+/// Drain queued log records before process shutdown.
+pub fn flush() {
+    let (ack, wait) = sync_channel(1);
+    if logger().tx.send(LogCommand::Flush(ack)).is_ok() {
+        let _ = wait.recv();
+    }
+}
+
 impl LogStruct {
     pub fn new(level: LogLevel, topic: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -109,10 +164,22 @@ impl LogStruct {
     }
 
     pub fn emit(&self) {
-        if log_mode() == LogMode::File {
-            maybe_check_and_roll();
+        let record = LogRecord {
+            level: self.level,
+            topic: self.topic.clone(),
+            content: self.content.clone(),
+            time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        match logger().tx.try_send(LogCommand::Record(record)) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(LogCommand::Record(record))) => {
+                // Logging must never block an async worker. On overload, keep
+                // the stream copy and report the dropped file record.
+                write_stream(&record.level, &render_stream(self, Some(&record.time)));
+                eprintln!("nexus-log: queue full; file log dropped");
+            }
+            Err(TrySendError::Full(LogCommand::Flush(_))) => {}
         }
-        log(self)
     }
 }
 
@@ -368,15 +435,19 @@ fn error_entry(topic: &str, content: &str) {
     log_onlycli(&entry);
 }
 
-fn log(info: &LogStruct) {
+fn log_record(level: LogLevel, topic: String, content: String, time: String) {
+    let info = LogStruct {
+        level,
+        topic,
+        content,
+    };
     match log_mode() {
         LogMode::Journald => {
-            write_stream(&info.level, &render_journald(info));
+            write_stream(&info.level, &render_journald(&info));
         }
         LogMode::File => {
-            let time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            write_stream(&info.level, &render_stream(info, Some(&time)));
-
+            maybe_check_and_roll();
+            write_stream(&info.level, &render_stream(&info, Some(&time)));
             let file_text =
                 format::format_entry(info.level.as_str(), Some(&time), &info.topic, &info.content);
             append_file(&file_text);
