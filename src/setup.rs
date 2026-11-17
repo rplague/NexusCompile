@@ -168,8 +168,8 @@ impl CargoConfigFile {
 /// or if an existing `[build]` / `[env]` key is not a table.
 pub fn setup_user(path: &Path, socket: &str) -> io::Result<()> {
     let mut config = CargoConfigFile::load(path)?;
-    config.ensure_backup()?;
     apply_managed_settings(&mut config.document, socket)?;
+    config.ensure_backup()?;
     config.persist()
 }
 
