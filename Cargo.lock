@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "NexusCompile"
-version = "0.1.4-11171"
+version = "0.1.4-11172"
 dependencies = [
  "async-trait",
  "chrono",
