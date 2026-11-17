@@ -5,7 +5,6 @@ pub mod config;
 pub mod connection;
 pub mod control;
 pub mod installer;
-pub mod local_protocol;
 pub mod local_task;
 pub mod local_task_protocol;
 pub mod log;

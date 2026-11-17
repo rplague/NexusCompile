@@ -17,11 +17,11 @@ use nexuscompile::compile::executor;
 use nexuscompile::compile::hash::hash_bytes;
 use nexuscompile::compile::manifest::collect_manifest;
 use nexuscompile::compile_protocol::{Hash32, OutputRef};
-use nexuscompile::local_protocol::{read_message, write_message};
 use nexuscompile::local_task_protocol::{
     LOCAL_TASK_PROTOCOL_VERSION, LocalTaskRequest, LocalTaskRequestBody, LocalTaskResponse,
     LocalTaskResponseBody, TASK_CHUNK_SIZE,
 };
+use nexuscompile::local_task_protocol::{read_message, write_message};
 use nexuscompile::paths;
 use nexuscompile::util::args;
 use nexuscompile::util::path::{resolve_path, safe_join};
