@@ -222,7 +222,6 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
         coordinator,
         cache,
         workspace,
-        config_handle: config_handle.clone(),
         control,
         provider,
         consumer,
@@ -250,7 +249,6 @@ struct RuntimeServices {
     coordinator: Arc<Coordinator>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
-    config_handle: ConfigHandle,
     control: ControlHandle,
     provider: Arc<Provider>,
     consumer: Arc<Consumer>,
@@ -269,7 +267,6 @@ async fn run_server(
         coordinator,
         cache,
         workspace,
-        config_handle,
         control,
         provider,
         consumer,
@@ -287,13 +284,7 @@ async fn run_server(
         shutdown_rx.clone(),
         source,
     ));
-    let task_service = bind_task_service(
-        &task_socket,
-        coordinator,
-        cache.clone(),
-        workspace,
-        config_handle,
-    );
+    let task_service = bind_task_service(&task_socket, coordinator, cache.clone(), workspace);
 
     let mut connections = JoinSet::new();
     let result: Result<(), String> = loop {
@@ -365,7 +356,6 @@ fn bind_task_service(
     coordinator: Arc<Coordinator>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
-    config_handle: ConfigHandle,
 ) -> Option<JoinHandle<()>> {
     match local_task::bind(socket) {
         Ok(listener) => {
@@ -380,7 +370,6 @@ fn bind_task_service(
                 coordinator,
                 cache,
                 workspace,
-                config_handle,
                 tokio::runtime::Handle::current(),
             )))
         }

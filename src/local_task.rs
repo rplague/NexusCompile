@@ -10,19 +10,17 @@ use std::time::Duration;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 
-use crate::compile::bundle::{TaskBundle, decode_bundle, materialize_bundle};
+use crate::compile::bundle::TaskJob;
 use crate::compile::cache::ResultCache;
-use crate::compile::hash::{hash_file, hex_hash};
+use crate::compile::hash::hex_hash;
 use crate::compile_protocol::Hash32;
-use crate::config::ConfigHandle;
-use crate::local_protocol::{self, LocalRequest};
+use crate::local_task_protocol;
 use crate::local_task_protocol::{
     LOCAL_TASK_PROTOCOL_VERSION, LocalTaskRequest, LocalTaskRequestBody, LocalTaskResponse,
     LocalTaskResponseBody,
 };
 use crate::log::{LogLevel, LogStruct, log_task_error};
 use crate::remote::Coordinator;
-use crate::toolchain::resolve_rustc;
 use crate::workspace::Workspace;
 
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -65,7 +63,6 @@ pub async fn run(
     coordinator: Arc<Coordinator>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
-    config: ConfigHandle,
     handle: Handle,
 ) {
     loop {
@@ -74,11 +71,9 @@ pub async fn run(
                 let coordinator = coordinator.clone();
                 let cache = cache.clone();
                 let workspace = workspace.clone();
-                let config = config.clone();
                 let handle = handle.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Err(error) =
-                        handle_stream(stream, coordinator, cache, workspace, config, handle)
+                    if let Err(error) = handle_stream(stream, coordinator, cache, workspace, handle)
                     {
                         LogStruct::new(LogLevel::Warning, "本地任务请求失败", error.to_string())
                             .emit();
@@ -113,16 +108,15 @@ fn handle_stream(
     coordinator: Arc<Coordinator>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
-    config: ConfigHandle,
     handle: Handle,
 ) -> io::Result<()> {
     let mut stream = prepare_stream(stream)?;
     let mut session: Option<Session> = None;
 
     loop {
-        let request: LocalTaskRequest = local_protocol::read_message(&mut stream)?;
+        let request: LocalTaskRequest = local_task_protocol::read_message(&mut stream)?;
         if request.v != LOCAL_TASK_PROTOCOL_VERSION {
-            local_protocol::write_message(
+            local_task_protocol::write_message(
                 &mut stream,
                 &LocalTaskResponse::error("unsupported_version", "unsupported task protocol"),
             )?;
@@ -136,7 +130,7 @@ fn handle_stream(
                     Some(outputs) => LocalTaskResponseBody::Hit { outputs },
                     None => LocalTaskResponseBody::Miss,
                 };
-                local_protocol::write_message(&mut stream, &LocalTaskResponse::new(body))?;
+                local_task_protocol::write_message(&mut stream, &LocalTaskResponse::new(body))?;
             }
             LocalTaskRequestBody::Start {
                 task_id,
@@ -144,7 +138,7 @@ fn handle_stream(
                 bundle_len,
             } => {
                 if session.is_some() {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "task already started"),
                     )?;
@@ -169,7 +163,7 @@ fn handle_stream(
                     bundle,
                     received: 0,
                 });
-                local_protocol::write_message(
+                local_task_protocol::write_message(
                     &mut stream,
                     &LocalTaskResponse::new(LocalTaskResponseBody::Ack),
                 )?;
@@ -180,21 +174,21 @@ fn handle_stream(
                 data,
             } => {
                 let Some(current) = session.as_mut() else {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "task not started"),
                     )?;
                     return Ok(());
                 };
                 if current.task_id != task_id {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "task id mismatch"),
                     )?;
                     return Ok(());
                 }
                 if offset != current.received {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "non-contiguous bundle chunk"),
                     )?;
@@ -202,7 +196,7 @@ fn handle_stream(
                 }
                 let next = current.received.saturating_add(data.len() as u64);
                 if next > current.bundle_len {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "bundle chunk overflow"),
                     )?;
@@ -211,28 +205,28 @@ fn handle_stream(
                 current.bundle.seek(SeekFrom::Start(offset))?;
                 current.bundle.write_all(&data)?;
                 current.received = next;
-                local_protocol::write_message(
+                local_task_protocol::write_message(
                     &mut stream,
                     &LocalTaskResponse::new(LocalTaskResponseBody::Ack),
                 )?;
             }
             LocalTaskRequestBody::Ready { task_id } => {
                 let Some(current) = session.take() else {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "task not started"),
                     )?;
                     return Ok(());
                 };
                 if current.task_id != task_id {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "task id mismatch"),
                     )?;
                     return Ok(());
                 }
                 if current.received != current.bundle_len {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "incomplete bundle"),
                     )?;
@@ -240,8 +234,6 @@ fn handle_stream(
                 }
                 let response = process_task(
                     &coordinator,
-                    &cache,
-                    &config,
                     &handle,
                     current.task_id,
                     &current.task_dir,
@@ -252,7 +244,7 @@ fn handle_stream(
                 if let LocalTaskResponseBody::Error { code, message } = &response.body {
                     log_task_error("local-task", &hex_hash(&current.task_id), code, message);
                 }
-                local_protocol::write_message(&mut stream, &response)?;
+                local_task_protocol::write_message(&mut stream, &response)?;
                 if matches!(response.body, LocalTaskResponseBody::Done { .. }) {
                     // Keep the task directory until the wrapper acknowledges.
                     session = Some(Session {
@@ -278,7 +270,7 @@ fn handle_stream(
                 if let Some(current) = session.as_ref()
                     && current.task_id != task_id
                 {
-                    local_protocol::write_message(
+                    local_task_protocol::write_message(
                         &mut stream,
                         &LocalTaskResponse::error("invalid_state", "task id mismatch"),
                     )?;
@@ -286,7 +278,7 @@ fn handle_stream(
                 }
                 match cache.read_chunk(&hash, offset, len as usize) {
                     Ok(data) => {
-                        local_protocol::write_message(
+                        local_task_protocol::write_message(
                             &mut stream,
                             &LocalTaskResponse::new(LocalTaskResponseBody::Chunk {
                                 hash,
@@ -296,7 +288,7 @@ fn handle_stream(
                         )?;
                     }
                     Err(error) => {
-                        local_protocol::write_message(
+                        local_task_protocol::write_message(
                             &mut stream,
                             &LocalTaskResponse::error("output_error", error.to_string()),
                         )?;
@@ -307,7 +299,7 @@ fn handle_stream(
             LocalTaskRequestBody::Ack { task_id } => {
                 if let Some(current) = session.take() {
                     if current.task_id != task_id {
-                        local_protocol::write_message(
+                        local_task_protocol::write_message(
                             &mut stream,
                             &LocalTaskResponse::error("invalid_state", "task id mismatch"),
                         )?;
@@ -315,7 +307,7 @@ fn handle_stream(
                     }
                     let _ = fs::remove_dir_all(&current.task_dir);
                 }
-                local_protocol::write_message(
+                local_task_protocol::write_message(
                     &mut stream,
                     &LocalTaskResponse::new(LocalTaskResponseBody::Ack),
                 )?;
@@ -325,11 +317,8 @@ fn handle_stream(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn process_task(
     coordinator: &Coordinator,
-    cache: &ResultCache,
-    config: &ConfigHandle,
     handle: &Handle,
     task_id: Hash32,
     task_dir: &Path,
@@ -337,107 +326,31 @@ fn process_task(
     bundle_hash: Hash32,
     bundle_len: u64,
 ) -> LocalTaskResponse {
-    let metadata = match fs::metadata(bundle_path) {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            return LocalTaskResponse::error("bundle_error", format!("read bundle: {error}"));
-        }
-    };
-    if metadata.len() != bundle_len {
-        return LocalTaskResponse::error("bundle_error", "bundle size mismatch");
-    }
-    let (actual_hash, _) = match hash_file(bundle_path) {
-        Ok(hash) => hash,
-        Err(error) => {
-            return LocalTaskResponse::error("bundle_error", format!("hash bundle: {error}"));
-        }
-    };
-    if actual_hash != bundle_hash {
-        return LocalTaskResponse::error("bundle_error", "bundle hash mismatch");
-    }
-    let bytes = match fs::read(bundle_path) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return LocalTaskResponse::error("bundle_error", format!("read bundle: {error}"));
-        }
-    };
-    let bundle: TaskBundle = match decode_bundle(&bytes) {
-        Ok(bundle) => bundle,
-        Err(error) => return LocalTaskResponse::error("bundle_error", error),
-    };
-    let digest = match bundle.manifest.digest() {
-        Ok(digest) => digest,
-        Err(error) => return LocalTaskResponse::error("manifest_error", error.to_string()),
-    };
-    if digest != task_id {
-        return LocalTaskResponse::error("manifest_error", "manifest digest mismatch");
-    }
-
-    let work = task_dir.join("work");
-    let work_out = work.join("out");
-    let work_extern = work.join("extern");
-    let result = fs::create_dir_all(&work)
-        .and_then(|_| materialize_bundle(&bundle, &work))
-        .and_then(|_| fs::create_dir_all(&work_out))
-        .and_then(|_| fs::create_dir_all(&work_extern))
-        .and_then(|_| fs::create_dir_all(work.join("target")));
-    if let Err(error) = result {
-        return LocalTaskResponse::error("bundle_error", format!("materialize bundle: {error}"));
-    }
-
-    let config = config.snapshot();
-    let rustc = match resolve_rustc(
-        &config,
-        &bundle.manifest.toolchain_id,
-        &bundle.manifest.target,
+    let job = match TaskJob::from_bundle_file(
+        bundle_path,
+        task_id,
+        bundle_hash,
+        bundle_len,
+        &task_dir.join("work"),
     ) {
-        Ok(rustc) => rustc,
-        Err(error) => return LocalTaskResponse::error("toolchain_error", error),
+        Ok(job) => job,
+        Err(error) => return LocalTaskResponse::error(error.code, error.message),
     };
-    let prepared = match crate::compile::bundle::prepare_task(&bundle, &work) {
-        Ok(prepared) => prepared,
-        Err(error) => return LocalTaskResponse::error("bundle_error", error),
-    };
-    let request = LocalRequest::new(
-        prepared.cwd.to_string_lossy(),
-        rustc,
-        prepared.args,
-        prepared.env.into_iter().collect(),
-    );
 
-    let response = handle.block_on(coordinator.execute(&request));
-    let outputs = match response.body {
-        crate::local_protocol::LocalBody::Compiled {
-            exit_code,
-            stdout,
-            stderr,
-            ..
-        } => {
-            if exit_code != 0 {
-                let _ = fs::remove_dir_all(&work);
-                return LocalTaskResponse::new(LocalTaskResponseBody::Failed {
-                    exit_code,
-                    stdout,
-                    stderr,
-                });
-            }
-            match cache.collect_outputs(&work_out) {
-                Ok(outputs) if !outputs.is_empty() => outputs,
-                Ok(_) => {
-                    let _ = fs::remove_dir_all(&work);
-                    return LocalTaskResponse::error("output_error", "rustc produced no outputs");
-                }
-                Err(error) => {
-                    let _ = fs::remove_dir_all(&work);
-                    return LocalTaskResponse::error("output_error", error.to_string());
-                }
-            }
-        }
-        crate::local_protocol::LocalBody::Error { code, message } => {
-            let _ = fs::remove_dir_all(&work);
-            return LocalTaskResponse::error(code, message);
-        }
+    let result = match handle.block_on(coordinator.execute(job)) {
+        Ok(result) => result,
+        Err(error) => return LocalTaskResponse::error(error.code, error.message),
     };
-    let _ = fs::remove_dir_all(&work);
-    LocalTaskResponse::new(LocalTaskResponseBody::Done { outputs })
+
+    if result.exit_code != 0 {
+        return LocalTaskResponse::new(LocalTaskResponseBody::Failed {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        });
+    }
+
+    LocalTaskResponse::new(LocalTaskResponseBody::Done {
+        outputs: result.outputs,
+    })
 }
