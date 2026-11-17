@@ -559,9 +559,11 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 
 | Module | Responsibility |
 |---|---|
-| **main** | Entry point: configuration, listener, accept loop, result-cache setup, graceful shutdown |
+| **main** | Process entry point: CLI dispatch, signal handling and runtime delegation |
+| **cli** | Installer command dispatcher (`config-*`, `setup-user`, toolchain commands) |
+| **runtime** | Startup, listener/accept loop, task lifecycle and graceful shutdown (`RuntimeHandle`) |
 | **state** | Shared `AppState` (provider, consumer, cache, workspace, config, control handle) |
-| **config** | Read-only `config.toml` loading, warnings, and `ConfigHandle` |
+| **config** | Split into `model` / `load` / `validate` / `handle`; read-only TOML loading, warnings and `ConfigHandle` |
 | **config_cli** | Installer-facing `config-defaults` / `config-check` commands |
 | **paths** | Path resolution anchored by environment variables, with current-directory fallback for local runs |
 | **log** | Leveled logging split into `log/format.rs` and `log/file.rs`: terminal output, file rotation (gz at 10 MB), journald mode |
@@ -573,7 +575,8 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | **task_blob** | Task bundle chunk I/O and task-directory cleanup |
 | **local_protocol** | Shared local request/response and framing types |
 | **local_task** | Task socket, bundle ingestion, output delivery |
-| **nexus-rustc** (bin) | cargo `RUSTC_WRAPPER` entry point |
+| **wrapper** | `nexus-rustc` implementation: typed socket client, staged output commit, rustc fallback |
+| **nexus-rustc** (bin) | Thin cargo `RUSTC_WRAPPER` entry point |
 | **compile** | Compile primitives: `executor` (local staging), `manifest` (digest), `bundle`, `cache`, `cas`, and `hash` |
 | **remote** | Consumer `Coordinator` over `remote/transfer.rs` (bundle upload, task polling, result import) |
 | **pool** | `Provider` (capacity/subscriptions/tasks/leases), `Consumer` (provider views), and `runtime` scheduling |

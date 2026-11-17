@@ -11,7 +11,6 @@ pub const DEFAULT_SOCKET: &str = "/run/nexuscompile/nexus.sock";
 
 const MANAGED_SOCKET_PREFIX: &str = "/run/nexuscompile/";
 const BACKUP_SUFFIX: &str = ".nexuscompile.bak";
-const TEMP_SUFFIX: &str = ".nexuscompile.tmp";
 
 const BUILD_TABLE: &str = "build";
 const ENV_TABLE: &str = "env";
@@ -150,9 +149,9 @@ impl CargoConfigFile {
     }
 
     fn persist(&self) -> io::Result<()> {
-        write_atomic(
+        crate::util::fs::write_atomic(
             &self.path,
-            &self.document.to_string(),
+            self.document.to_string().as_bytes(),
             self.permissions.clone(),
         )
     }
@@ -169,8 +168,8 @@ impl CargoConfigFile {
 /// or if an existing `[build]` / `[env]` key is not a table.
 pub fn setup_user(path: &Path, socket: &str) -> io::Result<()> {
     let mut config = CargoConfigFile::load(path)?;
-    config.ensure_backup()?;
     apply_managed_settings(&mut config.document, socket)?;
+    config.ensure_backup()?;
     config.persist()
 }
 
@@ -254,40 +253,8 @@ fn managed_table_mut<'a>(document: &'a mut DocumentMut, name: &str) -> io::Resul
         .ok_or_else(|| invalid_data(format!("managed Cargo config key {name:?} must be a table")))
 }
 
-/// Write `content` through a sibling temporary file and atomically replace
-/// `path`, preserving the original permissions when known.
-fn write_atomic(
-    path: &Path,
-    content: &str,
-    permissions: Option<fs::Permissions>,
-) -> io::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
-
-    let temp = temp_path(path);
-    let result = fs::write(&temp, content)
-        .and_then(|()| match permissions {
-            Some(permissions) => fs::set_permissions(&temp, permissions),
-            None => Ok(()),
-        })
-        .and_then(|()| fs::rename(&temp, path));
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-
-    result
-}
-
 fn backup_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{}{BACKUP_SUFFIX}", file_name(path)))
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!(".{}{TEMP_SUFFIX}", file_name(path)))
 }
 
 fn file_name(path: &Path) -> &str {
@@ -335,8 +302,12 @@ retry = 2
         assert_eq!(second.matches("rustc-wrapper").count(), 1);
         assert_eq!(second.matches("NEXUSCOMPILE_SOCKET").count(), 1);
 
-        fs::write(&path, "# changed
-").unwrap();
+        fs::write(
+            &path,
+            "# changed
+",
+        )
+        .unwrap();
         setup_user(&path, DEFAULT_SOCKET).unwrap();
         assert_eq!(
             fs::read_to_string(backup_path(&path)).unwrap(),
@@ -376,7 +347,10 @@ RUST_BACKTRACE = "1"
         assert!(!text.contains("rustc-wrapper"), "case: managed wrapper");
         assert!(!text.contains("incremental"), "case: managed incremental");
         assert!(!text.contains("CARGO_INCREMENTAL"), "case: managed env");
-        assert!(!text.contains("NEXUSCOMPILE_SOCKET"), "case: managed socket");
+        assert!(
+            !text.contains("NEXUSCOMPILE_SOCKET"),
+            "case: managed socket"
+        );
         assert!(text.contains("jobs = 4"));
         assert!(text.contains("RUST_BACKTRACE"));
 

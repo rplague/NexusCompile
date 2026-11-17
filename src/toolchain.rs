@@ -215,11 +215,7 @@ fn check_tool(tool: &str) -> Result<(), String> {
 }
 
 fn check_cache(config: &ServiceConfig) -> Result<(), String> {
-    let path = if config.cache.dir.trim().is_empty() {
-        paths::cache_path()
-    } else {
-        PathBuf::from(config.cache.dir.trim())
-    };
+    let path = config.cache_dir();
     let path = if path.is_relative() {
         env::current_dir()
             .map_err(|error| format!("resolve current directory: {error}"))?
@@ -290,7 +286,7 @@ fn configure(args: &[String]) -> Result<(), String> {
     let node = table_mut(&mut document, "node");
     node["rustc"] = value(rustc.trim());
     node.remove("toolchains");
-    write_atomic(&config_path, &document.to_string(), original_permissions)
+    write_config_atomic(&config_path, &document.to_string(), original_permissions)
 }
 
 fn configure_toolchains(args: &[String]) -> Result<(), String> {
@@ -384,7 +380,7 @@ fn write_toolchains(path: &Path, entries: &[ToolchainEntry]) -> Result<(), Strin
     }
     node.insert("toolchains", Item::ArrayOfTables(array));
 
-    write_atomic(path, &document.to_string(), original_permissions)
+    write_config_atomic(path, &document.to_string(), original_permissions)
 }
 
 fn load(path: &Path) -> Result<DocumentMut, String> {
@@ -406,35 +402,13 @@ fn table_mut<'a>(document: &'a mut DocumentMut, name: &str) -> &'a mut Table {
         .expect("managed config table must be a table")
 }
 
-fn write_atomic(
+fn write_config_atomic(
     path: &Path,
     content: &str,
     permissions: Option<fs::Permissions>,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create {}: {error}", parent.display()))?;
-    }
-
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("config.toml");
-    let temp = path.with_file_name(format!(".{name}.nexuscompile.tmp"));
-    fs::write(&temp, content).map_err(|error| format!("write {}: {error}", temp.display()))?;
-    if let Some(permissions) = permissions {
-        fs::set_permissions(&temp, permissions)
-            .map_err(|error| format!("chmod {}: {error}", temp.display()))?;
-    }
-    match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(format!("rename {}: {error}", path.display()))
-        }
-    }
+    crate::util::fs::write_atomic(path, content.as_bytes(), permissions)
+        .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 fn run(command: &mut Command) -> Result<Output, String> {
@@ -521,7 +495,10 @@ mod tests {
         let root = TempDir::new("toolchain-state");
         let state = root.join("state");
         fs::write(&state, "stable|/opt/stable/bin/rustc\n").unwrap();
-        assert!(read_toolchain_state(&state).is_err(), "case: malformed state");
+        assert!(
+            read_toolchain_state(&state).is_err(),
+            "case: malformed state"
+        );
 
         let config = ServiceConfig::default();
         let id = toolchain_id(Path::new("rustc"), "").unwrap();

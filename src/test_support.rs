@@ -4,8 +4,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
@@ -22,10 +22,8 @@ pub struct TempDir {
 impl TempDir {
     pub fn new(tag: &str) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "nexuscompile-{tag}-{}-{id}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("nexuscompile-{tag}-{}-{id}", std::process::id()));
         fs::create_dir_all(&path).expect("create temp dir");
         Self { path }
     }
