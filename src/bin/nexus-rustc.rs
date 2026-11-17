@@ -401,10 +401,8 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let id = TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "nexuscompile-{tag}-{}-{id}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("nexuscompile-{tag}-{}-{id}", std::process::id()));
             fs::create_dir_all(&path).unwrap();
             Self { path }
         }

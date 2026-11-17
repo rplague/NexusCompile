@@ -410,9 +410,7 @@ fn parse_config_arg(args: &[String]) -> Result<PathBuf, InstallerError> {
                 config = Some(PathBuf::from(flag_value(args, &mut index, "--config")?));
             }
             other => {
-                return Err(InstallerError::usage(format!(
-                    "unknown argument: {other}"
-                )));
+                return Err(InstallerError::usage(format!("unknown argument: {other}")));
             }
         }
         index += 1;
