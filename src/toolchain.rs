@@ -189,20 +189,12 @@ pub fn capabilities(config: &ServiceConfig) -> Vec<ToolchainCapability> {
                 return None;
             }
             let configured_target = entry.target.trim();
+            // The advertised id and target must come from the same string the
+            // client hashes: the configured target, empty for a host build.
             let info = toolchain_info(Path::new(rustc), configured_target).ok()?;
-            let effective_target = if configured_target.is_empty() {
-                info.host.clone()
-            } else {
-                configured_target.to_string()
-            };
-            let info = if effective_target == configured_target {
-                info
-            } else {
-                toolchain_info(Path::new(rustc), &effective_target).ok()?
-            };
             Some(ToolchainCapability {
                 id: info.id,
-                target: effective_target,
+                target: configured_target.to_string(),
             })
         })
         .collect()
@@ -646,5 +638,22 @@ mod tests {
             "rustc",
             "case: configured list"
         );
+    }
+
+    #[test]
+    fn capabilities_use_the_configured_target_for_the_id() {
+        let mut config = ServiceConfig::default();
+        config.node.toolchains = vec![ToolchainEntry {
+            channel: "stable".into(),
+            rustc: "rustc".into(),
+            target: String::new(),
+        }];
+
+        let caps = capabilities(&config);
+        assert_eq!(caps.len(), 1);
+        // The client hashes an empty target for a host build, so the advertised
+        // id must be computed the same way.
+        assert_eq!(caps[0].id, toolchain_id(Path::new("rustc"), "").unwrap());
+        assert_eq!(caps[0].target, "");
     }
 }
