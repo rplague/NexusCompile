@@ -25,23 +25,6 @@ pub fn execute_job(
     source: TaskSource,
 ) -> Result<TaskResult, TaskError> {
     let digest_prefix = &hex_hash(&job.task_id)[..8];
-    if let Some(cached) = cache.lookup_and_materialize(&job.task_id, &job.prepared.out_dir) {
-        LogStruct::new(
-            LogLevel::Debug,
-            "缓存命中",
-            format!("action={digest_prefix}"),
-        )
-        .emit();
-        return Ok(TaskResult {
-            action_digest: job.task_id,
-            exit_code: 0,
-            cache_hit: true,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            duration_ms: 0,
-            outputs: cached.outputs,
-        });
-    }
 
     let staging = workspace
         .staging_dir(&job.task_id)

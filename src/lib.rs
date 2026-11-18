@@ -13,6 +13,7 @@ pub mod pool;
 pub mod protocol;
 pub mod remote;
 pub mod runtime;
+pub mod scheduler;
 pub mod service;
 pub mod state;
 pub mod task_blob;

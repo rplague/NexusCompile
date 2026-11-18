@@ -7,6 +7,7 @@ use crate::compile_protocol::PeerId;
 use crate::config::{ConfigHandle, ServiceConfig};
 use crate::control::{self, ControlHandle, ControlPlane};
 use crate::pool::{Consumer, Provider};
+use crate::scheduler::TaskQueue;
 use crate::workspace::Workspace;
 
 /// Shared state handed to the connection, pool runtime, and local compiler.
@@ -18,6 +19,7 @@ pub struct AppState {
     pub workspace: Arc<Workspace>,
     pub config: ConfigHandle,
     pub control: ControlHandle,
+    pub task_queue: Arc<TaskQueue>,
 }
 
 impl AppState {
@@ -28,6 +30,7 @@ impl AppState {
         workspace: Arc<Workspace>,
         config: ConfigHandle,
         control: ControlHandle,
+        task_queue: Arc<TaskQueue>,
     ) -> Self {
         Self {
             provider,
@@ -36,6 +39,7 @@ impl AppState {
             workspace,
             config,
             control,
+            task_queue,
         }
     }
 

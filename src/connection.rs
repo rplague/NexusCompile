@@ -660,6 +660,7 @@ mod tests {
             Arc::new(crate::workspace::Workspace::new(std::env::temp_dir())),
             crate::config::ConfigHandle::new(crate::config::ServiceConfig::default()),
             crate::control::new_control_handle(),
+            Arc::new(crate::scheduler::TaskQueue::new()),
         );
         let read_task = tokio::spawn(read_loop(
             r,

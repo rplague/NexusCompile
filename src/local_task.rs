@@ -13,6 +13,7 @@ use tokio::runtime::Handle;
 use crate::compile::bundle::TaskJob;
 use crate::compile::cache::ResultCache;
 use crate::compile::hash::hex_hash;
+use crate::compile::{TaskError, TaskResult};
 use crate::compile_protocol::Hash32;
 use crate::local_task_protocol;
 use crate::local_task_protocol::{
@@ -21,6 +22,7 @@ use crate::local_task_protocol::{
 };
 use crate::log::{LogLevel, LogStruct, log_task_error};
 use crate::remote::Coordinator;
+use crate::scheduler::{QueuedTask, TaskOrigin, TaskQueue, TaskReply};
 use crate::workspace::Workspace;
 
 const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -61,6 +63,7 @@ fn prepare_stream(stream: UnixStream) -> io::Result<std::os::unix::net::UnixStre
 pub async fn run(
     listener: UnixListener,
     coordinator: Arc<Coordinator>,
+    task_queue: Arc<TaskQueue>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
     handle: Handle,
@@ -69,11 +72,13 @@ pub async fn run(
         match listener.accept().await {
             Ok((stream, _)) => {
                 let coordinator = coordinator.clone();
+                let task_queue = task_queue.clone();
                 let cache = cache.clone();
                 let workspace = workspace.clone();
                 let handle = handle.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Err(error) = handle_stream(stream, coordinator, cache, workspace, handle)
+                    if let Err(error) =
+                        handle_stream(stream, coordinator, task_queue, cache, workspace, handle)
                     {
                         LogStruct::new(LogLevel::Warning, "本地任务请求失败", error.to_string())
                             .emit();
@@ -106,6 +111,7 @@ struct Session {
 fn handle_stream(
     stream: UnixStream,
     coordinator: Arc<Coordinator>,
+    task_queue: Arc<TaskQueue>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
     handle: Handle,
@@ -125,7 +131,9 @@ fn handle_stream(
 
         match request.body {
             LocalTaskRequestBody::Probe { task_id } => {
-                let outputs = cache.cached_outputs(&task_id);
+                let outputs = cache
+                    .lookup(&task_id)
+                    .or_else(|| handle.block_on(coordinator.import_cached(task_id)));
                 let body = match outputs {
                     Some(outputs) => LocalTaskResponseBody::Hit { outputs },
                     None => LocalTaskResponseBody::Miss,
@@ -232,15 +240,7 @@ fn handle_stream(
                     )?;
                     return Ok(());
                 }
-                let response = process_task(
-                    &coordinator,
-                    &handle,
-                    current.task_id,
-                    &current.task_dir,
-                    &current.bundle_path,
-                    current.bundle_hash,
-                    current.bundle_len,
-                );
+                let response = process_task(&task_queue, &handle, &current);
                 if let LocalTaskResponseBody::Error { code, message } = &response.body {
                     log_task_error("local-task", &hex_hash(&current.task_id), code, message);
                 }
@@ -318,39 +318,47 @@ fn handle_stream(
 }
 
 fn process_task(
-    coordinator: &Coordinator,
+    task_queue: &Arc<TaskQueue>,
     handle: &Handle,
-    task_id: Hash32,
-    task_dir: &Path,
-    bundle_path: &Path,
-    bundle_hash: Hash32,
-    bundle_len: u64,
+    session: &Session,
 ) -> LocalTaskResponse {
     let job = match TaskJob::from_bundle_file(
-        bundle_path,
-        task_id,
-        bundle_hash,
-        bundle_len,
-        &task_dir.join("work"),
+        &session.bundle_path,
+        session.task_id,
+        session.bundle_hash,
+        session.bundle_len,
+        &session.task_dir.join("work"),
     ) {
         Ok(job) => job,
         Err(error) => return LocalTaskResponse::error(error.code, error.message),
     };
 
-    let result = match handle.block_on(coordinator.execute(job)) {
-        Ok(result) => result,
-        Err(error) => return LocalTaskResponse::error(error.code, error.message),
-    };
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    task_queue.push_back(QueuedTask {
+        job,
+        origin: TaskOrigin::Local,
+        reply: TaskReply::Local(reply_tx),
+        rustc: None,
+    });
 
-    if result.exit_code != 0 {
-        return LocalTaskResponse::new(LocalTaskResponseBody::Failed {
-            exit_code: result.exit_code,
-            stdout: result.stdout,
-            stderr: result.stderr,
-        });
+    match handle.block_on(reply_rx) {
+        Ok(result) => task_result_to_local_response(result),
+        Err(_) => LocalTaskResponse::error("internal", "task scheduler stopped"),
     }
+}
 
-    LocalTaskResponse::new(LocalTaskResponseBody::Done {
-        outputs: result.outputs,
-    })
+fn task_result_to_local_response(result: Result<TaskResult, TaskError>) -> LocalTaskResponse {
+    match result {
+        Ok(result) if result.exit_code != 0 => {
+            LocalTaskResponse::new(LocalTaskResponseBody::Failed {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            })
+        }
+        Ok(result) => LocalTaskResponse::new(LocalTaskResponseBody::Done {
+            outputs: result.outputs,
+        }),
+        Err(error) => LocalTaskResponse::error(error.code, error.message),
+    }
 }

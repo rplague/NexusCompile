@@ -224,28 +224,46 @@ as a compatibility path base; the legacy `nexus.sock` server has been removed.
 try local result cache
   -> FetchCached (remote location hint; no slot)
        -> Cached -> BlobGet outputs -> ResultAck
-       -> miss/failure -> remove hint -> compile pool
+       -> miss/failure -> remove hint -> shared FIFO task queue
+  -> scheduler wakes, pulls tasks in order
+       -> LocalOrigin: local slot -> remote overflow
+            -> remote failure -> queue tail
+       -> RemoteOrigin: local slot only
+            -> local unavailable -> task failed
   -> Reserve
        -> BlobPut (upload the bundle in 1 MiB chunks)
        -> TaskReady
-       -> provider runs rustc
+       -> task enters the queue and remains Queued
+       -> scheduler assigns a local slot and runs rustc
        -> consumer polls Status
        -> BlobGet (download outputs in 1 MiB chunks)
        -> verify SHA-256 and write to the local cache
        -> ResultAck
 ```
 
+- Local and remote ingress share one ordered FIFO queue and one scheduler.
+- Local admission happens inside the scheduler loop, before a task is spawned:
+  `reserve` is synchronous there, so a batch of queued tasks cannot overdraw the
+  same `free_slots` snapshot. A local task that finds no local slot falls back to
+  a remote provider; if none accepts, it goes back to the queue tail and the loop
+  waits 100ms. A local task whose toolchain is not available on this node is
+  rejected immediately so the wrapper runs the real rustc.
+- Remote ingress is admitted at `Reserve` time: a full provider answers `Busy`
+  before any bundle is uploaded, and the consumer tries another provider.
+- Local resources and remote reservations remain two separate statistics:
+  - local: `Provider.available_slots() = free_slots - active_slots`;
+  - remote: `Consumer.ProviderView.free_slots/capabilities`.
+- `TaskReady` returning `Ack` means the task was validated and enqueued; it does not mean execution has started.
 - `TaskId` is the action digest (32 bytes); the same digest maps to the same task.
 - `Reserve` accepts only `slots = 1` and returns:
   - `Granted`: a new task, or an already queued/running task with its lease;
-  - `Cached`: existing outputs are available from the task entry or the provider result cache (blobs may have been evicted by the cache quota);
   - `Busy`: no local slot is available;
   - `Rejected`: the request is invalid.
 - By default, the consumer polls `Status` once per second with an overall timeout of 30 minutes.
 - `Done` returns the `OutputRef` list; the consumer downloads each chunk, verifies hashes, and writes to its local CAS/cache.
-- Every `Reserve` that returns a result creates a lease. `ResultAck` releases that lease's pin, removes the task directory when the last lease is gone, and deletes the `TaskEntry`. The provider result cache remains available for later hits.
-- `FetchCached` checks only the provider result cache, validates blobs, and returns `Cached` with a lease; it does not create a `TaskEntry` or consume a slot.
-- `Reserve` and `Status` fall back to the provider result cache when no `TaskEntry` exists; a cache-only `Cached` reply carries a lease and pins the cache entry until `ResultAck` or lease expiry.
+- Every `Reserve` that returns a result creates a lease. `ResultAck` removes the task directory when the last lease is gone and deletes the `TaskEntry`. The provider result cache remains available for later hits.
+- `FetchCached` is the cache-query request: it checks only the provider result cache, validates the blobs, renews the entry, and returns `Cached` with a lease. It does not create a `TaskEntry` or consume a slot.
+- `Reserve` never consults the cache; `Status` reports only the task entry.
 - `Cancel` marks the task `Cancelled` and frees the slot.
 
 `Reserve` only reserves a slot and creates a lease; it does not inspect the task. The provider side performs the full review after `TaskReady`, once the bundle has been uploaded:
@@ -264,6 +282,7 @@ If `TaskReady` review fails, the provider fails the task, removes the bundle dir
 - On Linux, reads `/proc/stat` and `/proc/meminfo`; CPU usage uses an EWMA (0.3 new value + 0.7 previous value).
 - `max_slots = floor(total * max_usage_percent)` for CPU and memory, using fixed 1.0 core / 2048 MB slots.
 - `free_slots` is the remaining headroom under the percentage cap; it is not reduced by active tasks because `/proc` usage already includes them.
+- Local admission uses `available_slots = free_slots - active_slots`; this prevents the shared queue from oversubscribing one sampling window.
 - Providers send `CapacityUpdate` to subscribers; `seq` is monotonically increasing and older sequence numbers are ignored.
 - Consumers build provider views through `Subscribe`/`Subscribed` and drop a provider if no update arrives within `ttl_secs`.
 - Providers are discovered automatically through NexusNet `discover_providers`. Discovery runs only when capacity is insufficient: every 30 seconds when visible capacity is zero or the last discovery failed, otherwise every 1 hour.
@@ -273,8 +292,8 @@ If `TaskReady` review fails, the provider fails the task, removes the bundle dir
 - `ResultCache` lives at `<cache>/actions/<digest>/manifest.cbor` and records the output list.
 - Output blobs live at `<cache>/blobs/<sha256>`; writes use a temporary file plus rename, and materialization verifies the hash again.
 - Compile staging lives at `<cache>/staging/`; provider task bundles and work dirs live at `<cache>/work/<digest>/`.
-- The quota is controlled by `result_cache_mb`; unpinned entries are reclaimed oldest-expiry first.
-- Providers pin results while a lease is outstanding, so shared consumers can download before `ResultAck`. Expired leases release their pins.
+- The quota is controlled by `result_cache_mb`; a background thread checks every 60 seconds and reclaims the oldest entries first.
+- Entries are renewed on every cache hit; expired entries are removed while a lookup runs. There is no pinning: eviction and expiry do not wait for in-flight downloads.
 
 ## NexusNet integration
 
@@ -566,7 +585,7 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 ## Runtime lifecycle
 
 - The server loop reports fatal listener failures to `main`; the process no longer waits for a signal after the loop has exited.
-- Shutdown is bounded: server and pool tasks are aborted after their grace period, and the task socket is removed on both normal and aborted exits.
+- Shutdown is bounded: server, pool, and scheduler tasks are aborted after their grace period, and the task socket is removed on both normal and aborted exits.
 - Control requests are cancellation-safe: pending replies are removed when a call times out or its future is dropped.
 - File logging runs on a dedicated writer thread; `LogStruct::emit` never performs blocking file I/O on a Tokio worker.
 - Service dispatch moves cache/workspace filesystem work to the blocking pool.
@@ -575,10 +594,13 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 
 1. `nexus-rustc` preflights the invocation, builds a `TaskBundle`, and sends it over the local task socket.
 2. `local_task` constructs a `TaskJob`, which performs the single full task review: invocation shape, bundle identity, manifest digest, and toolchain requirement.
-3. `Coordinator` checks the local cache, then remote cache hints via `FetchCached`, and only then places the task in the compile pool. Cache failures remove the hint; local execution and remote `Reserve` both use a task lease.
-4. A remote provider performs the same full review after the complete bundle arrives at `TaskReady`; it resolves the requested toolchain once and executes through `compile::executor`.
-5. `TaskResult` carries outputs, diagnostics, cache state and duration back to the transport layer.
-6. Providers advertise toolchain capabilities so the consumer can prefer matching versions; providers still verify the actual bundle before execution.
+3. `local_task` checks the local cache, then remote cache hints via `FetchCached`; on a miss it enqueues a `QueuedTask` in the shared FIFO queue.
+4. The scheduler wakes when a task arrives, assigns a local compute unit when possible, and otherwise follows the task origin:
+   - `LocalOrigin` queries remote capacity and returns a failed remote attempt to the queue tail;
+   - `RemoteOrigin` fails when no local unit is available and is never forwarded.
+5. A remote provider performs the same full review after the complete bundle arrives at `TaskReady`; it resolves the requested toolchain once and executes through `compile::executor`.
+6. `TaskResult` carries outputs, diagnostics, cache state and duration back to the transport layer.
+7. Providers advertise toolchain capabilities so the consumer can prefer matching versions; providers still verify the actual bundle before execution.
 
 ## Module map
 
@@ -602,6 +624,7 @@ Install a new `.deb` to upgrade. `apt remove` / `apt purge` do not delete `/var/
 | **nexus-rustc** (bin) | `RUSTC_WRAPPER` implementation: typed socket client, staged output commit, rustc fallback |
 | **compile** | Shared `TaskJob`/`TaskResult` pipeline: `review` (invocation/toolchain requirements), `bundle` (validate/materialize/prepare), `executor` (local staging), `manifest`, `cache`, `cas`, `hash` |
 | **remote** | Consumer `Coordinator`: local/remote cache lookup, provider routing, bundle upload, task polling and result import |
+| **scheduler** | Single ordered task queue, wake signal, and local/remote dispatch |
 | **pool** | `Provider` (capacity/subscriptions/tasks/leases), `Consumer` (provider views), and `runtime` scheduling |
 | **workspace** | Staging and provider task directories |
 | **capacity** | `/proc` sampling and slot calculation |
@@ -624,7 +647,7 @@ end-to-end tests that invoke the local `rustc`.
 
 - **Shared task lifetime**: multiple consumers can share a task lease; the first `ResultAck` removes the `TaskEntry`. Other consumers recover the result through the provider cache via `Status`; if the cache entry is evicted first, they retry or fall back locally.
 - **Unacked tasks**: task entries whose consumers never send `ResultAck` remain in memory until the same task id is reserved again or the process restarts.
-- **Local builds use the local pool**: `Coordinator` places local work through `Provider::reserve` and a lease before execution. Capacity sampling still reflects actual load after the fact.
+- **Local builds use the local pool**: the scheduler places local work through `Provider::reserve` and a lease before execution. Capacity sampling still reflects actual load after the fact.
 - **Single-connection assumption**: the server accepts multiple NexusNet connections, but `AppState` holds one control handle; the newest connection wins, and an older disconnect cannot clear it.
 - **Toolchain selection**: consumers use advertised provider capabilities for prefiltering; providers do the authoritative toolchain/target check after the full bundle arrives. This is a local compatibility check, not a security boundary.
 - **Trust boundary**: remote compilation executes the submitter's rustc arguments and externs (including proc-macros), which is equivalent to running code on the provider; the consumer only verifies output hashes and does not independently validate the compile result. Deploy only on trusted networks with NexusNet authentication enabled.

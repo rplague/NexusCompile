@@ -7,7 +7,6 @@ use tokio::time::{Duration, interval};
 
 use super::{Consumer, Provider};
 use crate::capacity::{CapacitySnapshot, CapacitySource, calculate_capacity};
-use crate::compile::cache::ResultCache;
 use crate::compile_protocol::{AppRequest, AppResponse, PeerId};
 use crate::config::{NodeConfig, ServiceConfig, SubscriptionConfig};
 use crate::control::{self, ControlHandle};
@@ -272,19 +271,14 @@ fn expire_capacity_tick(consumer: &Arc<Consumer>, subscription: &SubscriptionCon
     }
 }
 
-fn expire_leases(provider: &Arc<Provider>, cache: &Arc<ResultCache>) {
-    for (task_id, count) in provider.expire_leases(now_ms()) {
-        for _ in 0..count {
-            cache.release(&task_id.0);
-        }
-    }
+fn expire_leases(provider: &Arc<Provider>) {
+    provider.expire_leases(now_ms());
 }
 
 pub async fn run_pool(
     control: ControlHandle,
     provider: Arc<Provider>,
     consumer: Arc<Consumer>,
-    cache: Arc<ResultCache>,
     config: ServiceConfig,
     mut shutdown: watch::Receiver<bool>,
     mut source: Box<dyn CapacitySource + Send>,
@@ -340,7 +334,7 @@ pub async fn run_pool(
             }
             _ = ttl_tick.tick() => {
                 expire_capacity_tick(&consumer, &subscription);
-                expire_leases(&provider, &cache);
+                expire_leases(&provider);
             }
         }
     }

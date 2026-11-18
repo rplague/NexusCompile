@@ -12,8 +12,8 @@ use crate::compile_protocol::{
 };
 use crate::control::ControlPlane;
 use crate::log::{LogLevel, LogStruct, log_task_error};
-use crate::pool;
 use crate::protocol::{SidecarError, WhoamiInfo};
+use crate::scheduler::{QueuedTask, TaskOrigin, TaskReply};
 use crate::state::AppState;
 use crate::task_blob::TaskBlobStore;
 use crate::toolchain::resolve_toolchain;
@@ -101,23 +101,8 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
             target,
         } => {
             let _ = (toolchain_id, target);
-            if app.provider.task_entry(&task_id).is_none()
-                && let Some(outputs) = app.cache.cached_outputs(&task_id.0)
-                && app.cache.pin(&task_id.0)
-            {
-                return AppResponse::Cached {
-                    task_id,
-                    outputs,
-                    lease_id: app.provider.create_lease(task_id),
-                };
-            }
-            let response = app
-                .provider
-                .reserve(consumer, task_id, slots, input_manifest);
-            if matches!(response, AppResponse::Cached { .. }) {
-                app.cache.pin(&task_id.0);
-            }
-            response
+            app.provider
+                .reserve(consumer, task_id, slots, input_manifest)
         }
         AppRequest::TaskReady { task_id, lease_id } => {
             let Some(entry) = app.provider.task_entry(&task_id) else {
@@ -146,6 +131,9 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                     "task is not queued",
                 );
                 return AppResponse::error(ErrorCode::InvalidState, "task is not queued");
+            }
+            if app.task_queue.contains(task_id, lease_id) {
+                return AppResponse::Ack;
             }
             let task_dir = app.workspace.task_dir(&task_id.0);
             let bundle_path = task_dir.join("bundle");
@@ -185,49 +173,27 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                 }
             };
 
-            let response = app.provider.task_ready(task_id, lease_id);
-            if matches!(response, AppResponse::Ack) {
-                pool::spawn_task(
-                    app.provider.clone(),
-                    app.cache.clone(),
-                    app.workspace.clone(),
-                    job,
-                    resolved.rustc,
-                );
-            }
-            response
+            app.task_queue.push_back(QueuedTask {
+                job,
+                origin: TaskOrigin::Remote { task_id, lease_id },
+                reply: TaskReply::Remote,
+                rustc: Some(resolved.rustc),
+            });
+            AppResponse::Ack
         }
         AppRequest::FetchCached { task_id } => {
-            let Some(outputs) = app.cache.cached_outputs(&task_id.0) else {
+            let Some(outputs) = app.cache.lookup(&task_id.0) else {
                 return AppResponse::error(ErrorCode::NotFound, "cache miss");
             };
-            if !app.cache.pin(&task_id.0) {
-                return AppResponse::error(ErrorCode::NotFound, "cache miss");
-            }
             AppResponse::Cached {
                 task_id,
                 outputs,
                 lease_id: app.provider.create_lease(task_id),
             }
         }
-        AppRequest::Status { task_id } => {
-            let response = app.provider.status(task_id);
-            if let AppResponse::TaskStatus { .. } = &response {
-                return response;
-            }
-            match app.cache.cached_outputs(&task_id.0) {
-                Some(outputs) => AppResponse::TaskStatus {
-                    state: TaskState::Done { outputs },
-                },
-                None => response,
-            }
-        }
+        AppRequest::Status { task_id } => app.provider.status(task_id),
         AppRequest::Cancel { task_id } => {
-            let leases = app.provider.lease_count_for(task_id);
             let response = app.provider.cancel(task_id);
-            for _ in 0..leases {
-                app.cache.release(&task_id.0);
-            }
             TaskBlobStore::new(&app.workspace).remove_task_dir(&task_id.0);
             response
         }
@@ -235,7 +201,6 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
             let Some(task_id) = app.provider.result_ack(lease_id) else {
                 return AppResponse::error(ErrorCode::NotFound, "unknown lease");
             };
-            app.cache.release(&task_id.0);
             TaskBlobStore::new(&app.workspace).remove_task_dir(&task_id.0);
             AppResponse::Ack
         }
@@ -335,6 +300,7 @@ mod tests {
     use crate::config::ConfigHandle;
     use crate::control::new_control_handle;
     use crate::pool::{Consumer, Provider};
+    use crate::scheduler::TaskQueue;
     use crate::test_support::TempDir;
     use std::path::Path;
 
@@ -346,6 +312,7 @@ mod tests {
             Arc::new(crate::workspace::Workspace::new(dir)),
             ConfigHandle::new(crate::config::ServiceConfig::default()),
             new_control_handle(),
+            Arc::new(TaskQueue::new()),
         )
     }
 
@@ -472,6 +439,66 @@ mod tests {
     }
 
     #[test]
+    fn task_ready_enqueues_and_stays_queued() {
+        let dir = TempDir::new("service-task-ready-queue");
+        let context = context(&dir);
+        let project = dir.join("project-queue");
+        let out = project.join("out");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(project.join("src/lib.rs"), "pub fn demo() {}\n").unwrap();
+
+        let args = vec![
+            "--crate-name".into(),
+            "demo".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            "--out-dir".into(),
+            out.display().to_string(),
+            "--emit=dep-info,metadata,link".into(),
+            project.join("src/lib.rs").display().to_string(),
+        ];
+        let env = std::collections::HashMap::from([
+            ("CARGO_MANIFEST_DIR".into(), project.display().to_string()),
+            ("OUT_DIR".into(), out.display().to_string()),
+            ("CARGO_INCREMENTAL".into(), "0".into()),
+        ]);
+        let manifest =
+            crate::compile::manifest::collect_manifest(&project, Path::new("rustc"), &args, &env)
+                .unwrap();
+        let bundle =
+            crate::compile::bundle::build_bundle(&project, &args, &env, &manifest).unwrap();
+        let task_id = TaskId(manifest.digest().unwrap());
+        let bundle_hash = crate::compile::hash::hash_bytes(&bundle);
+        let task_dir = context.workspace.task_dir(&task_id.0);
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("bundle"), &bundle).unwrap();
+
+        let request = encode_request(AppRequest::Reserve {
+            consumer: PeerId::new("consumer"),
+            task_id,
+            slots: 1,
+            input_manifest: bundle_hash,
+            toolchain_id: manifest.toolchain_id.clone(),
+            target: manifest.target.clone(),
+        });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        let lease_id = match response.body {
+            AppResponse::Granted { lease_id, .. } => lease_id,
+            other => panic!("expected granted, got {other:?}"),
+        };
+
+        let request = encode_request(AppRequest::TaskReady { task_id, lease_id });
+        let response = decode_response(&handle_app_payload(&request, &context).unwrap());
+        assert_eq!(response.body, AppResponse::Ack);
+        assert_eq!(context.task_queue.len(), 1);
+        assert_eq!(
+            context.provider.task_entry(&task_id).unwrap().state,
+            TaskState::Queued
+        );
+    }
+
+    #[test]
     fn fetch_cached_does_not_create_task() {
         let dir = TempDir::new("service-fetch-cached");
         let context = context(&dir);
@@ -499,7 +526,7 @@ mod tests {
         let request = encode_request(AppRequest::ResultAck { lease_id });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
         assert_eq!(response.body, AppResponse::Ack);
-        assert!(context.cache.cached_outputs(&task_id.0).is_some());
+        assert!(context.cache.lookup(&task_id.0).is_some());
     }
 
     #[test]
@@ -571,12 +598,13 @@ mod tests {
     }
 
     #[test]
-    fn cache_and_result_ack_flow() {
+    fn reserve_ignores_cache_and_status_reports_task_only() {
         let dir = TempDir::new("service");
         let context = context(&dir);
 
+        // 缓存里有结果，Reserve 也只回答算力。
         let cached_task = TaskId(Hash32([4; 32]));
-        let cached_output = seed_output(&context, cached_task, b"cached");
+        let _ = seed_output(&context, cached_task, b"cached");
         let request = encode_request(AppRequest::Reserve {
             consumer: PeerId::new("consumer"),
             task_id: cached_task,
@@ -586,27 +614,24 @@ mod tests {
             target: String::new(),
         });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        match response.body {
-            AppResponse::Cached {
-                task_id, outputs, ..
-            } => {
-                assert_eq!(task_id, cached_task, "case: cached task");
-                assert_eq!(outputs, vec![cached_output], "case: cached outputs");
-            }
-            other => panic!("expected cached, got {other:?}"),
-        }
-        assert!(context.provider.task_entry(&cached_task).is_none());
+        assert!(
+            matches!(response.body, AppResponse::Granted { .. }),
+            "reserve must not return cached results"
+        );
+        context.provider.discard_task(cached_task);
 
+        // 任务完成并 Ack 之后，Status 不再拿缓存兜底。
         let ack_task = TaskId(Hash32([6; 32]));
         let ack_output = seed_output(&context, ack_task, b"done");
-        let lease_id =
-            match context
-                .provider
-                .reserve(PeerId::new("consumer"), ack_task, 1, Hash32([7; 32]))
-            {
-                AppResponse::Granted { lease_id, .. } => lease_id,
-                other => panic!("expected granted, got {other:?}"),
-            };
+        let lease_id = match context.provider.reserve(
+            PeerId::new("consumer"),
+            ack_task,
+            1,
+            Hash32([7; 32]),
+        ) {
+            AppResponse::Granted { lease_id, .. } => lease_id,
+            other => panic!("expected granted, got {other:?}"),
+        };
         assert_eq!(
             context
                 .provider
@@ -621,11 +646,12 @@ mod tests {
 
         let request = encode_request(AppRequest::Status { task_id: ack_task });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        match response.body {
-            AppResponse::TaskStatus {
-                state: TaskState::Done { outputs },
-            } => assert_eq!(outputs, vec![ack_output], "case: cached done status"),
-            other => panic!("expected cached done status, got {other:?}"),
-        }
+        assert!(matches!(
+            response.body,
+            AppResponse::Error {
+                code: ErrorCode::NotFound,
+                ..
+            }
+        ));
     }
 }

@@ -6,6 +6,9 @@ use crate::compile_protocol::{AppRequest, AppResponse, PeerId};
 use crate::control::new_control_handle;
 use crate::test_support::MockControl;
 
+use tokio::sync::{oneshot, watch};
+use tokio::time::{Duration, timeout};
+
 #[cfg(test)]
 mod local_remote {
     use super::*;
@@ -26,6 +29,10 @@ mod local_remote {
     use crate::workspace::Workspace;
 
     fn project(tag: &str) -> (crate::test_support::TempDir, PathBuf, TaskJob) {
+        project_with(tag, "demo")
+    }
+
+    fn project_with(tag: &str, name: &str) -> (crate::test_support::TempDir, PathBuf, TaskJob) {
         let root = crate::test_support::TempDir::new(tag);
         let project = root.join("project");
         let out = project.join("out");
@@ -34,11 +41,15 @@ mod local_remote {
         fs::create_dir_all(project.join("src")).unwrap();
         fs::create_dir_all(&out).unwrap();
         fs::create_dir_all(&generated).unwrap();
-        fs::write(project.join("src/lib.rs"), "pub fn demo() -> u32 { 7 }\n").unwrap();
+        fs::write(
+            project.join("src/lib.rs"),
+            format!("pub fn {name}() -> u32 {{ 7 }}\n"),
+        )
+        .unwrap();
 
         let args = vec![
             "--crate-name".into(),
-            "demo".into(),
+            name.into(),
             "--crate-type".into(),
             "lib".into(),
             "--edition".into(),
@@ -74,7 +85,7 @@ mod local_remote {
     }
 
     #[test]
-    fn local_compile_then_cache_hit() {
+    fn local_compile_stores_result() {
         let (_root, cache_dir, job) = project("local");
         let cache = ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap();
         let workspace = Workspace::new(&cache_dir);
@@ -84,11 +95,7 @@ mod local_remote {
         assert_eq!(first.exit_code, 0);
         assert!(!first.cache_hit);
         assert!(job.prepared.out_dir.join("libdemo.rlib").is_file());
-
-        let second =
-            executor::execute_job(&job, "rustc", &cache, &workspace, TaskSource::Local).unwrap();
-        assert_eq!(second.exit_code, 0);
-        assert!(second.cache_hit);
+        assert!(cache.lookup(&job.task_id).is_some());
     }
 
     #[tokio::test]
@@ -107,11 +114,60 @@ mod local_remote {
             new_control_handle(),
             ServiceConfig::default(),
         );
-        let result = coordinator.execute(job).await.unwrap();
+        let lease = match coordinator.admit_local(&job) {
+            crate::remote::LocalAdmission::Reserved(lease) => lease,
+            crate::remote::LocalAdmission::Busy => panic!("expected a local slot"),
+        };
+        let result = coordinator
+            .run_local_with_lease(job, "rustc".into(), lease)
+            .await
+            .unwrap();
         assert_eq!(result.exit_code, 0);
         assert!(!result.cache_hit);
-        assert!(cache.cached_outputs(&task_id.0).is_some());
+        assert!(cache.lookup(&task_id.0).is_some());
         assert!(provider.task_entry(&task_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_local_origin_from_queue() {
+        let (_root, cache_dir, job) = project("scheduler-local");
+        let cache = Arc::new(ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap());
+        let workspace = Arc::new(Workspace::new(&cache_dir));
+        let provider = Arc::new(Provider::new(PeerId::new("local"), 1));
+        let queue = Arc::new(crate::scheduler::TaskQueue::new());
+        let coordinator = Arc::new(Coordinator::new(
+            provider.clone(),
+            Arc::new(Consumer::new()),
+            cache.clone(),
+            workspace,
+            new_control_handle(),
+            ServiceConfig::default(),
+        ));
+        let scheduler = Arc::new(crate::scheduler::TaskScheduler::new(
+            queue.clone(),
+            coordinator,
+        ));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let scheduler_task = tokio::spawn(scheduler.run(shutdown_rx));
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        queue.push_back(crate::scheduler::QueuedTask {
+            job,
+            origin: crate::scheduler::TaskOrigin::Local,
+            reply: crate::scheduler::TaskReply::Local(reply_tx),
+            rustc: None,
+        });
+
+        let result = timeout(Duration::from_secs(30), reply_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert!(cache.lookup(&result.action_digest).is_some());
+
+        let _ = shutdown_tx.send(true);
+        let _ = scheduler_task.await;
     }
 
     #[tokio::test]
@@ -121,7 +177,6 @@ mod local_remote {
         let workspace = Arc::new(Workspace::new(&cache_dir));
 
         let digest = job.task_id;
-        let out_dir = job.prepared.out_dir.clone();
         let payload = b"remote cached rlib";
         let blob = cache.cas().put_bytes(payload).unwrap();
         let output = OutputRef {
@@ -162,17 +217,18 @@ mod local_remote {
             control,
             ServiceConfig::default(),
         );
-        let result = coordinator.execute(job).await.unwrap();
-        assert_eq!(result.exit_code, 0);
-        assert!(result.cache_hit);
-        assert_eq!(fs::read(out_dir.join("libdemo.rlib")).unwrap(), payload);
-        assert!(cache.cached_outputs(&digest).is_some());
+        let outputs = coordinator
+            .import_cached(digest)
+            .await
+            .expect("remote cache hit");
+        assert_eq!(outputs.len(), 1);
+        assert!(cache.lookup(&digest).is_some());
         assert_eq!(mock.sent().len(), 3);
         assert!(matches!(mock.sent()[0].1, AppRequest::FetchCached { .. }));
     }
 
     #[tokio::test]
-    async fn stale_remote_cache_falls_back_to_compute() {
+    async fn stale_remote_cache_hint_is_removed() {
         let (_root, cache_dir, job) = project("remote-cache-stale");
         let cache = Arc::new(ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap());
         let workspace = Arc::new(Workspace::new(&cache_dir));
@@ -197,9 +253,7 @@ mod local_remote {
             control,
             ServiceConfig::default(),
         );
-        let result = coordinator.execute(job).await.unwrap();
-        assert_eq!(result.exit_code, 0);
-        assert!(!result.cache_hit);
+        assert!(coordinator.import_cached(digest).await.is_none());
         assert_eq!(mock.sent().len(), 1);
         assert!(consumer.remote_cache_providers(&digest).is_empty());
     }
@@ -240,8 +294,10 @@ mod local_remote {
         let provider = Arc::new(Provider::new(PeerId::new("local"), 1));
         provider.set_capacity(1, 0);
         let consumer = Arc::new(Consumer::new());
-        consumer.record_subscribed(PeerId::new("provider"), 1);
-        consumer.apply_capacity(PeerId::new("provider"), 1, 1, 0, true);
+        let remote = PeerId::new("provider");
+        consumer.record_subscribed(remote.clone(), 1);
+        consumer.apply_capacity(remote.clone(), 1, 1, 0, true);
+        consumer.record_remote_cache(digest, &remote);
 
         let coordinator = Coordinator::new(
             provider,
@@ -251,11 +307,102 @@ mod local_remote {
             control,
             ServiceConfig::default(),
         );
-        let result = coordinator.execute(job).await.unwrap();
-        assert_eq!(result.exit_code, 0);
-        assert!(result.cache_hit);
-        assert_eq!(fs::read(out_dir.join("libdemo.rlib")).unwrap(), payload);
-        assert!(cache.cached_outputs(&digest).is_some());
+        let outputs = coordinator
+            .import_cached(digest)
+            .await
+            .expect("remote cache hit");
+        assert_eq!(outputs.len(), 1);
+        assert!(!out_dir.join("libdemo.rlib").exists());
+        assert!(cache.lookup(&digest).is_some());
         assert_eq!(mock.sent().len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slot_admission_does_not_overdraft() {
+        let (_root0, cache_dir, job0) = project_with("admit-0", "demo0");
+        let (_r1, _, job1) = project_with("admit-1", "demo1");
+        let (_r2, _, job2) = project_with("admit-2", "demo2");
+        let cache = Arc::new(ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap());
+        let workspace = Arc::new(Workspace::new(&cache_dir));
+        let provider = Arc::new(Provider::new(PeerId::new("local"), 1));
+        let queue = Arc::new(crate::scheduler::TaskQueue::new());
+        let coordinator = Arc::new(Coordinator::new(
+            provider.clone(),
+            Arc::new(Consumer::new()),
+            cache,
+            workspace,
+            new_control_handle(),
+            ServiceConfig::default(),
+        ));
+        let scheduler = Arc::new(crate::scheduler::TaskScheduler::new(queue.clone(), coordinator));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(scheduler.run(shutdown_rx));
+
+        let mut replies = Vec::new();
+        for job in [job0, job1, job2] {
+            let (tx, rx) = oneshot::channel();
+            queue.push_back(crate::scheduler::QueuedTask {
+                job,
+                origin: crate::scheduler::TaskOrigin::Local,
+                reply: crate::scheduler::TaskReply::Local(tx),
+                rustc: None,
+            });
+            replies.push(rx);
+        }
+
+        for rx in replies {
+            let result = timeout(Duration::from_secs(90), rx)
+                .await
+                .expect("scheduler stalled")
+                .expect("scheduler dropped the reply");
+            assert!(result.is_ok(), "task must not be rejected: {result:?}");
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_queue_waits_for_capacity() {
+        let (_root, cache_dir, job) = project_with("busy-wait", "demob");
+        let cache = Arc::new(ResultCache::open(&cache_dir, 32 * 1024 * 1024).unwrap());
+        let workspace = Arc::new(Workspace::new(&cache_dir));
+        let provider = Arc::new(Provider::new(PeerId::new("local"), 1));
+        provider.set_capacity(1, 0);
+        let queue = Arc::new(crate::scheduler::TaskQueue::new());
+        let coordinator = Arc::new(Coordinator::new(
+            provider.clone(),
+            Arc::new(Consumer::new()),
+            cache,
+            workspace,
+            new_control_handle(),
+            ServiceConfig::default(),
+        ));
+        let scheduler = Arc::new(crate::scheduler::TaskScheduler::new(queue.clone(), coordinator));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(scheduler.run(shutdown_rx));
+
+        let (tx, rx) = oneshot::channel();
+        queue.push_back(crate::scheduler::QueuedTask {
+            job,
+            origin: crate::scheduler::TaskOrigin::Local,
+            reply: crate::scheduler::TaskReply::Local(tx),
+            rustc: None,
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        provider.set_capacity(1, 1);
+
+        let result = timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("scheduler spun or never retried")
+            .expect("reply dropped");
+        assert!(
+            result.is_ok(),
+            "task should run after capacity returns: {result:?}"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
     }
 }

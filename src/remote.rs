@@ -10,19 +10,22 @@ use crate::compile_protocol::{
 };
 use crate::config::ServiceConfig;
 use crate::control::{self, ControlHandle};
-use crate::log::{LogLevel, LogStruct, log_task_error};
-use crate::pool::{Consumer, Placement, Provider};
+use crate::log::{LogLevel, LogStruct};
+use crate::pool::{Consumer, Provider};
 use crate::toolchain::resolve_toolchain;
 use crate::workspace::Workspace;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::{sleep, timeout};
 
-const DEFAULT_PROVIDER_COOLDOWN_MS: u64 = 30_000;
-const MIN_BUSY_COOLDOWN_MS: u64 = 1_000;
 const CACHE_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 本地容量准入的结果。`Busy` 表示「现在没有 slot」，调用方应回队等待而不是失败。
+pub(crate) enum LocalAdmission {
+    Reserved(LeaseId),
+    Busy,
+}
 
 pub struct Coordinator {
     provider: Arc<Provider>,
@@ -52,42 +55,9 @@ impl Coordinator {
         }
     }
 
-    pub async fn execute(&self, job: TaskJob) -> Result<TaskResult, TaskError> {
-        let digest = job.task_id;
-        if let Some(cached) = self
-            .cache
-            .lookup_and_materialize(&digest, &job.prepared.out_dir)
-        {
-            return Ok(TaskResult {
-                action_digest: digest,
-                exit_code: 0,
-                cache_hit: true,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-                duration_ms: 0,
-                outputs: cached.outputs,
-            });
-        }
-
-        if let Some(result) = self.try_cached(&job).await {
-            return Ok(result);
-        }
-
-        match self.place(&job) {
-            Placement::Local(rustc) => self.run_local(job, rustc).await,
-            Placement::Remote(providers) => match self.try_remote(&job, providers).await {
-                Some(result) => result,
-                None => Err(TaskError::new(
-                    "no_provider",
-                    "no remote provider accepted the task",
-                )),
-            },
-            Placement::Reject(error) => Err(error),
-        }
-    }
-
-    async fn try_cached(&self, job: &TaskJob) -> Option<TaskResult> {
-        let providers = self.consumer.remote_cache_providers(&job.task_id);
+    /// 远端缓存查询：按记录表逐个询问，命中即导入本地缓存。
+    pub(crate) async fn import_cached(&self, digest: Hash32) -> Option<Vec<OutputRef>> {
+        let providers = self.consumer.remote_cache_providers(&digest);
         if providers.is_empty() {
             return None;
         }
@@ -99,25 +69,10 @@ impl Coordinator {
         );
 
         for provider in providers {
-            match transfer
-                .fetch_cached(&provider, job.task_id, &job.prepared.out_dir)
-                .await
-            {
-                Ok(outputs) => {
-                    self.consumer.record_remote_cache(job.task_id, &provider);
-                    self.consumer.clear_cooldown(&provider);
-                    return Some(TaskResult {
-                        action_digest: job.task_id,
-                        exit_code: 0,
-                        cache_hit: true,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        duration_ms: 0,
-                        outputs,
-                    });
-                }
+            match transfer.fetch_cached(&provider, digest).await {
+                Ok(outputs) => return Some(outputs),
                 Err(error) => {
-                    self.consumer.remove_remote_cache(&job.task_id, &provider);
+                    self.consumer.remove_remote_cache(&digest, &provider);
                     LogStruct::new(
                         LogLevel::Debug,
                         "缓存",
@@ -131,15 +86,9 @@ impl Coordinator {
         None
     }
 
-    fn place(&self, job: &TaskJob) -> Placement {
-        if self.provider.free_slots() > 0
-            && let Ok(resolved) = resolve_toolchain(&self.config, &job.requirements.toolchain)
-        {
-            return Placement::Local(resolved.rustc);
-        }
-
-        let providers: Vec<_> = self
-            .consumer
+    /// 订阅视图里当前可用的远端 provider。
+    pub(crate) fn remote_candidates(&self, job: &TaskJob) -> Vec<PeerId> {
+        self.consumer
             .providers()
             .into_iter()
             .filter(|view| {
@@ -152,36 +101,45 @@ impl Coordinator {
                         }))
             })
             .map(|view| view.provider)
-            .collect();
-        if providers.is_empty() {
-            return Placement::Reject(TaskError::new(
-                "no_capacity",
-                "no local or remote capacity for task",
-            ));
-        }
-        Placement::Remote(providers)
+            .collect()
     }
 
-    async fn run_local(&self, job: TaskJob, rustc: String) -> Result<TaskResult, TaskError> {
+    /// 在调度线程内同步完成「判断 + 扣减」。
+    pub(crate) fn admit_local(&self, job: &TaskJob) -> LocalAdmission {
         let task_id = TaskId(job.task_id);
         let consumer = self.provider.provider_id();
-        let lease =
-            match self
-                .provider
-                .reserve(consumer, task_id, job.requirements.slots, job.bundle_hash)
-            {
-                crate::compile_protocol::AppResponse::Granted { lease_id, .. } => lease_id,
-                other => {
-                    return Err(TaskError::new(
-                        "reserve_error",
-                        format!("local reservation failed: {other:?}"),
-                    ));
-                }
-            };
+        match self
+            .provider
+            .reserve(consumer, task_id, job.requirements.slots, job.bundle_hash)
+        {
+            AppResponse::Granted { lease_id, .. } => LocalAdmission::Reserved(lease_id),
+            AppResponse::Cached { .. } => {
+                // 本地缓存已在 process_task 查过且未命中，这个 Done 条目不可用；
+                // 丢掉它，下一轮重新编译，避免一直拿到同一个缓存答复。
+                self.provider.discard_task(task_id);
+                LocalAdmission::Busy
+            }
+            _ => LocalAdmission::Busy,
+        }
+    }
+
+    pub(crate) async fn run_local_with_lease(
+        &self,
+        job: TaskJob,
+        rustc: String,
+        lease: LeaseId,
+    ) -> Result<TaskResult, TaskError> {
+        let task_id = TaskId(job.task_id);
         if !matches!(
             self.provider.task_ready(task_id, lease),
             crate::compile_protocol::AppResponse::Ack
         ) {
+            let _ = self.provider.fail_task(
+                task_id,
+                crate::compile_protocol::ErrorCode::Internal,
+                "local task was not ready",
+            );
+            self.provider.discard_task(task_id);
             return Err(TaskError::new("reserve_error", "local task was not ready"));
         }
 
@@ -220,23 +178,66 @@ impl Coordinator {
         result
     }
 
-    fn cool_down_provider(
+    pub(crate) fn local_rustc(&self, job: &TaskJob) -> Option<String> {
+        resolve_toolchain(&self.config, &job.requirements.toolchain)
+            .ok()
+            .map(|resolved| resolved.rustc)
+    }
+
+    pub(crate) fn task_is_queued(&self, task_id: TaskId, lease_id: LeaseId) -> bool {
+        self.provider.task_entry(&task_id).is_some_and(|entry| {
+            entry.lease_id == lease_id && matches!(entry.state, TaskState::Queued)
+        })
+    }
+
+    pub(crate) fn start_remote_local(
+        &self,
+        job: TaskJob,
+        task_id: TaskId,
+        lease_id: LeaseId,
+        rustc: String,
+    ) -> Result<tokio::task::JoinHandle<()>, TaskError> {
+        if !matches!(
+            self.provider.task_ready(task_id, lease_id),
+            crate::compile_protocol::AppResponse::Ack
+        ) {
+            return Err(TaskError::new("reserve_error", "remote task was not ready"));
+        }
+        Ok(crate::pool::spawn_task(
+            self.provider.clone(),
+            self.cache.clone(),
+            self.workspace.clone(),
+            job,
+            rustc,
+        ))
+    }
+
+    pub(crate) fn fail_remote_queued(
+        &self,
+        task_id: TaskId,
+        code: crate::compile_protocol::ErrorCode,
+        message: impl Into<String>,
+    ) {
+        let message = message.into();
+        self.provider.fail_task(task_id, code, message);
+        let _ = std::fs::remove_dir_all(self.workspace.task_dir(&task_id.0));
+    }
+
+    fn retry_provider(
         &self,
         provider: &crate::compile_protocol::PeerId,
         task: &str,
-        cooldown_ms: u64,
         reason: &str,
     ) {
-        self.consumer.cool_down_provider(provider, cooldown_ms);
-        log_task_error(
-            "remote",
-            task,
-            "provider_cooldown",
-            &format!("provider={provider} cooldown_ms={cooldown_ms} reason={reason}"),
-        );
+        LogStruct::new(
+            LogLevel::Debug,
+            "远端重试",
+            format!("provider={provider} action={task} reason={reason}"),
+        )
+        .emit();
     }
 
-    async fn try_remote(
+    pub(crate) async fn try_remote(
         &self,
         job: &TaskJob,
         providers: Vec<PeerId>,
@@ -279,72 +280,30 @@ impl Coordinator {
                     self.consumer.clear_cooldown(&provider);
                     lease_id
                 }
-                Ok(AppResponse::Cached {
-                    lease_id, outputs, ..
-                }) => {
-                    let outputs = match transfer
-                        .import_outputs(&provider, job.task_id, outputs, &job.prepared.out_dir)
-                        .await
-                    {
-                        Ok(outputs) => outputs,
-                        Err(error) => {
-                            self.consumer.remove_remote_cache(&job.task_id, &provider);
-                            self.cool_down_provider(
-                                &provider,
-                                &task,
-                                DEFAULT_PROVIDER_COOLDOWN_MS,
-                                &format!("cache_import_error message={error}"),
-                            );
-                            continue;
-                        }
-                    };
-                    self.consumer.record_remote_cache(job.task_id, &provider);
-                    self.consumer.clear_cooldown(&provider);
-                    let _ = control::send(
-                        &self.control,
-                        &self.config.service_name,
-                        &provider,
-                        AppRequest::ResultAck { lease_id },
-                    )
-                    .await;
-                    return Some(Ok(TaskResult {
-                        action_digest: job.task_id,
-                        exit_code: 0,
-                        cache_hit: true,
-                        stdout: Vec::new(),
-                        stderr: Vec::new(),
-                        duration_ms: 0,
-                        outputs,
-                    }));
-                }
-                Ok(AppResponse::Busy { retry_after_ms }) => {
-                    let cooldown_ms = retry_after_ms.max(MIN_BUSY_COOLDOWN_MS);
-                    self.cool_down_provider(&provider, &task, cooldown_ms, "reserve_busy");
+                Ok(AppResponse::Busy { .. }) => {
+                    self.retry_provider(&provider, &task, "reserve_busy");
                     continue;
                 }
                 Ok(AppResponse::Rejected { code, message }) => {
-                    self.cool_down_provider(
+                    self.retry_provider(
                         &provider,
                         &task,
-                        DEFAULT_PROVIDER_COOLDOWN_MS,
                         &format!("reserve_rejected code={code:?} message={message}"),
                     );
                     continue;
                 }
                 Ok(other) => {
-                    self.cool_down_provider(
+                    self.retry_provider(
                         &provider,
                         &task,
-                        DEFAULT_PROVIDER_COOLDOWN_MS,
                         &format!("reserve_unexpected response={other:?}"),
                     );
                     continue;
                 }
                 Err(error) => {
-                    self.cool_down_provider(
+                    self.retry_provider(
                         &provider,
                         &task,
-                        DEFAULT_PROVIDER_COOLDOWN_MS,
                         &format!("reserve_error message={error}"),
                     );
                     continue;
@@ -355,12 +314,14 @@ impl Coordinator {
                 .upload_bundle(&provider, task_id, job.bundle_hash, &job.bundle_bytes)
                 .await
             {
-                self.cool_down_provider(
+                let _ = control::send(
+                    &self.control,
+                    &self.config.service_name,
                     &provider,
-                    &task,
-                    DEFAULT_PROVIDER_COOLDOWN_MS,
-                    &format!("upload_error message={error}"),
-                );
+                    AppRequest::Cancel { task_id },
+                )
+                .await;
+                self.retry_provider(&provider, &task, &format!("upload_error message={error}"));
                 return Some(Err(TaskError::new("upload_error", error)));
             }
             match control::send(
@@ -376,19 +337,17 @@ impl Coordinator {
             {
                 Ok(AppResponse::Ack) => {}
                 Ok(other) => {
-                    self.cool_down_provider(
+                    self.retry_provider(
                         &provider,
                         &task,
-                        DEFAULT_PROVIDER_COOLDOWN_MS,
                         &format!("task_ready_rejected response={other:?}"),
                     );
                     continue;
                 }
                 Err(error) => {
-                    self.cool_down_provider(
+                    self.retry_provider(
                         &provider,
                         &task,
-                        DEFAULT_PROVIDER_COOLDOWN_MS,
                         &format!("task_ready_error message={}", error.message),
                     );
                     continue;
@@ -396,13 +355,7 @@ impl Coordinator {
             }
 
             match transfer
-                .wait_for_task(
-                    &provider,
-                    task_id,
-                    lease,
-                    job.task_id,
-                    &job.prepared.out_dir,
-                )
+                .wait_for_task(&provider, task_id, lease, job.task_id)
                 .await
             {
                 RemoteOutcome::Success(outputs) => {
@@ -447,12 +400,14 @@ impl Coordinator {
                     }));
                 }
                 RemoteOutcome::Retry => {
-                    self.cool_down_provider(
+                    let _ = control::send(
+                        &self.control,
+                        &self.config.service_name,
                         &provider,
-                        &task,
-                        DEFAULT_PROVIDER_COOLDOWN_MS,
-                        "remote_retry",
-                    );
+                        AppRequest::Cancel { task_id },
+                    )
+                    .await;
+                    self.retry_provider(&provider, &task, "remote_retry");
                     continue;
                 }
             }
@@ -496,7 +451,6 @@ impl RemoteTransfer {
         &self,
         provider: &PeerId,
         digest: Hash32,
-        out_dir: &Path,
     ) -> Result<Vec<OutputRef>, String> {
         let task_id = TaskId(digest);
         let response = timeout(
@@ -512,9 +466,7 @@ impl RemoteTransfer {
                 outputs,
                 lease_id,
             } if cached_task == task_id => {
-                let result = self
-                    .import_outputs(provider, digest, outputs, out_dir)
-                    .await;
+                let result = self.import_outputs(provider, digest, outputs).await;
                 let _ = self
                     .send(provider, AppRequest::ResultAck { lease_id })
                     .await;
@@ -559,7 +511,6 @@ impl RemoteTransfer {
         task_id: TaskId,
         lease: LeaseId,
         digest: Hash32,
-        out_dir: &Path,
     ) -> RemoteOutcome {
         let poll = async {
             loop {
@@ -567,13 +518,11 @@ impl RemoteTransfer {
                 match response {
                     Ok(AppResponse::TaskStatus { state }) => match state {
                         TaskState::Done { outputs, .. } => {
-                            let outputs = match self
-                                .import_outputs(provider, digest, outputs, out_dir)
-                                .await
-                            {
-                                Ok(outputs) => outputs,
-                                Err(_) => return RemoteOutcome::Retry,
-                            };
+                            let outputs =
+                                match self.import_outputs(provider, digest, outputs).await {
+                                    Ok(outputs) => outputs,
+                                    Err(_) => return RemoteOutcome::Retry,
+                                };
                             let _ = self
                                 .send(provider, AppRequest::ResultAck { lease_id: lease })
                                 .await;
@@ -617,7 +566,6 @@ impl RemoteTransfer {
         provider: &PeerId,
         digest: Hash32,
         outputs: Vec<OutputRef>,
-        out_dir: &Path,
     ) -> Result<Vec<OutputRef>, String> {
         for output in &outputs {
             let bytes = self
@@ -637,9 +585,6 @@ impl RemoteTransfer {
         }
         self.cache
             .store(digest, outputs.clone())
-            .map_err(|e| e.to_string())?;
-        self.cache
-            .materialize_outputs(&outputs, out_dir)
             .map_err(|e| e.to_string())?;
         Ok(outputs)
     }

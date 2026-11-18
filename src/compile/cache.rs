@@ -29,16 +29,10 @@ pub struct CachedManifest {
     pub outputs: Vec<OutputFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachedResult {
-    pub outputs: Vec<OutputFile>,
-}
-
 #[derive(Debug, Clone)]
 struct CacheEntry {
     action_digest: Hash32,
     outputs: Vec<OutputFile>,
-    pin_count: u32,
     expires_at: Instant,
 }
 
@@ -116,25 +110,18 @@ impl ResultCache {
             let entry = CacheEntry {
                 action_digest: manifest.action_digest,
                 outputs: manifest.outputs,
-                pin_count: 0,
                 expires_at: Instant::now() + RESULT_TTL,
             };
             inner.add_entry(entry);
         }
 
-        let cache = Self {
+        Ok(Self {
             root,
             cas,
             max_bytes,
             inner: Mutex::new(inner),
             enabled: max_bytes > 0,
-        };
-        {
-            let mut inner = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
-            cache.evict_to_fit_locked(&mut inner, None);
-        }
-        cache.remove_orphan_blobs();
-        Ok(cache)
+        })
     }
 
     pub fn disabled(root: impl Into<PathBuf>) -> Self {
@@ -162,84 +149,26 @@ impl ResultCache {
         self.cas.read_chunk(hash, offset, len)
     }
 
-    pub fn pin(&self, action_digest: &Hash32) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(entry) = inner.entries.get_mut(action_digest) else {
-            return false;
-        };
-        entry.pin_count = entry.pin_count.saturating_add(1);
-        entry.expires_at = Instant::now() + RESULT_TTL;
-        true
-    }
-
-    pub fn release(&self, action_digest: &Hash32) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = inner.entries.get_mut(action_digest) {
-            entry.pin_count = entry.pin_count.saturating_sub(1);
-        }
-    }
-
-    pub fn total_bytes(&self) -> u64 {
-        self.inner
-            .lock()
-            .map(|inner| inner.total_bytes)
-            .unwrap_or(0)
-    }
-
-    pub fn lookup_and_materialize(
-        &self,
-        action_digest: &Hash32,
-        out_dir: &Path,
-    ) -> Option<CachedResult> {
+    /// 命中即续期；查询时顺手删掉过期条目。
+    pub fn lookup(&self, action_digest: &Hash32) -> Option<Vec<OutputFile>> {
         if !self.enabled {
             return None;
         }
-        self.sweep();
 
+        let now = Instant::now();
         let outputs = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
-            let entry = inner.entries.get_mut(action_digest)?;
-            if entry.expires_at <= now && entry.pin_count == 0 {
-                self.remove_entry_locked(&mut inner, action_digest);
-                return None;
+            let expired: Vec<Hash32> = inner
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.expires_at <= now)
+                .map(|(digest, _)| *digest)
+                .collect();
+            for digest in expired {
+                self.remove_entry_locked(&mut inner, &digest);
             }
-            entry.pin_count = entry.pin_count.saturating_add(1);
-            entry.expires_at = now + RESULT_TTL;
-            entry.outputs.clone()
-        };
 
-        let materialized = self.materialize_outputs(&outputs, out_dir);
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = inner.entries.get_mut(action_digest) {
-            entry.pin_count = entry.pin_count.saturating_sub(1);
-        }
-
-        if materialized.is_err() {
-            self.remove_entry_locked(&mut inner, action_digest);
-            return None;
-        }
-
-        Some(CachedResult { outputs })
-    }
-
-    pub fn cached_outputs(&self, action_digest: &Hash32) -> Option<Vec<OutputFile>> {
-        if !self.enabled {
-            return None;
-        }
-        self.sweep();
-
-        let outputs = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
             let entry = inner.entries.get_mut(action_digest)?;
-            if entry.expires_at <= now && entry.pin_count == 0 {
-                self.remove_entry_locked(&mut inner, action_digest);
-                return None;
-            }
             entry.expires_at = now + RESULT_TTL;
             entry.outputs.clone()
         };
@@ -251,6 +180,13 @@ impl ResultCache {
         }
 
         Some(outputs)
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .map(|inner| inner.total_bytes)
+            .unwrap_or(0)
     }
 
     pub fn store(&self, action_digest: Hash32, outputs: Vec<OutputFile>) -> io::Result<bool> {
@@ -289,16 +225,9 @@ impl ResultCache {
         inner.add_entry(CacheEntry {
             action_digest,
             outputs,
-            pin_count: 0,
             expires_at: Instant::now() + RESULT_TTL,
         });
-        self.evict_to_fit_locked(&mut inner, Some(action_digest));
-
-        let stored = inner.entries.contains_key(&action_digest);
-        if !stored {
-            let _ = fs::remove_dir_all(self.action_dir(&action_digest));
-        }
-        Ok(stored)
+        Ok(true)
     }
 
     pub fn collect_outputs(&self, staging_out: &Path) -> io::Result<Vec<OutputFile>> {
@@ -338,20 +267,22 @@ impl ResultCache {
         Ok(())
     }
 
-    pub fn sweep(&self) {
+    /// 超过配额时按最久未用（到期时间最早）删除。
+    pub fn evict(&self) {
         if !self.enabled {
             return;
         }
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let expired: Vec<Hash32> = inner
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.pin_count == 0 && entry.expires_at <= now)
-            .map(|(digest, _)| *digest)
-            .collect();
-        for digest in expired {
-            self.remove_entry_locked(&mut inner, &digest);
+        while inner.total_bytes > self.max_bytes {
+            let victim = inner
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(digest, _)| *digest);
+            let Some(victim) = victim else {
+                break;
+            };
+            self.remove_entry_locked(&mut inner, &victim);
         }
     }
 
@@ -381,58 +312,6 @@ impl ResultCache {
             }
         }
         Some(entry)
-    }
-
-    fn evict_to_fit_locked(&self, inner: &mut Inner, exclude: Option<Hash32>) {
-        while inner.total_bytes > self.max_bytes {
-            let candidates: Vec<Hash32> = inner
-                .entries
-                .iter()
-                .filter(|(digest, entry)| entry.pin_count == 0 && Some(**digest) != exclude)
-                .map(|(digest, _)| *digest)
-                .collect();
-            if candidates.is_empty() {
-                break;
-            }
-            let victim = inner
-                .entries
-                .iter()
-                .filter(|(digest, entry)| entry.pin_count == 0 && Some(**digest) != exclude)
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(digest, _)| *digest);
-            let Some(victim) = victim else {
-                break;
-            };
-            self.remove_entry_locked(inner, &victim);
-        }
-
-        if inner.total_bytes > self.max_bytes
-            && let Some(digest) = exclude
-            && inner
-                .entries
-                .get(&digest)
-                .map(|entry| entry.pin_count == 0)
-                .unwrap_or(false)
-        {
-            self.remove_entry_locked(inner, &digest);
-        }
-    }
-
-    fn remove_orphan_blobs(&self) {
-        let referenced: std::collections::HashSet<String> = self
-            .inner
-            .lock()
-            .map(|inner| inner.blob_refs.keys().map(hex_hash).collect())
-            .unwrap_or_default();
-        let Ok(entries) = fs::read_dir(self.cas.blobs_dir()) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !referenced.contains(&name) {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
     }
 }
 
@@ -488,8 +367,9 @@ mod tests {
             let cache = cache(&root, 10 * 1024 * 1024);
             let digest = store_payload(&cache, 1, b"compiled bytes");
             let out = root.join("out");
-            let hit = cache.lookup_and_materialize(&digest, &out).unwrap();
-            assert_eq!(hit.outputs.len(), 1);
+            let outputs = cache.lookup(&digest).expect("hit");
+            assert_eq!(outputs.len(), 1);
+            cache.materialize_outputs(&outputs, &out).unwrap();
             assert_eq!(
                 fs::read(out.join("libdemo.rlib")).unwrap(),
                 b"compiled bytes"
@@ -499,51 +379,39 @@ mod tests {
         };
 
         let reopened = cache(&root, 10 * 1024 * 1024);
-        assert!(
-            reopened
-                .lookup_and_materialize(&digest, &root.join("out-reopen"))
-                .is_some()
-        );
+        assert!(reopened.lookup(&digest).is_some());
     }
 
     #[test]
-    fn quota_and_pin_eviction() {
-        let quota_root = TempDir::new("cache-quota");
-        let quota = cache(&quota_root, 10);
-        let first = store_payload(&quota, 3, b"123456");
-        let second = store_payload(&quota, 4, b"abcdef");
-        assert!(quota.total_bytes() <= 10);
-        let hits = [
-            quota.lookup_and_materialize(&first, &quota_root.join("out3")),
-            quota.lookup_and_materialize(&second, &quota_root.join("out4")),
-        ]
-        .into_iter()
-        .flatten()
-        .count();
-        assert_eq!(hits, 1);
+    fn quota_eviction_removes_oldest() {
+        let root = TempDir::new("cache-quota");
+        let cache = cache(&root, 10);
+        let first = store_payload(&cache, 3, b"123456");
+        let second = store_payload(&cache, 4, b"abcdef");
+        assert!(cache.total_bytes() > 10);
 
-        let pin_root = TempDir::new("cache-pin");
-        let pin = cache(&pin_root, 10);
-        let pinned = store_payload(&pin, 7, b"123456");
-        assert!(pin.pin(&pinned));
-        let second = store_payload(&pin, 8, b"abcdef");
-        assert!(pin.total_bytes() <= 10);
-        assert!(
-            pin.lookup_and_materialize(&pinned, &pin_root.join("out-pinned"))
-                .is_some()
-        );
-        pin.release(&pinned);
-        let third = store_payload(&pin, 9, b"ghijkl");
-        let hits = [
-            pin.lookup_and_materialize(&pinned, &pin_root.join("out-pinned-2")),
-            pin.lookup_and_materialize(&second, &pin_root.join("out-second")),
-            pin.lookup_and_materialize(&third, &pin_root.join("out-third")),
-        ]
-        .into_iter()
-        .flatten()
-        .count();
-        assert!(hits <= 1);
-        assert!(pin.total_bytes() <= 10);
+        cache.evict();
+
+        assert!(cache.total_bytes() <= 10);
+        let hits = [cache.lookup(&first), cache.lookup(&second)]
+            .into_iter()
+            .flatten()
+            .count();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn expired_entry_is_removed_on_lookup() {
+        let root = TempDir::new("cache-expired");
+        let cache = cache(&root, 10 * 1024 * 1024);
+        let digest = store_payload(&cache, 6, b"stale");
+        {
+            let mut inner = cache.inner.lock().unwrap();
+            inner.entries.get_mut(&digest).unwrap().expires_at =
+                Instant::now() - Duration::from_secs(1);
+        }
+        assert!(cache.lookup(&digest).is_none());
+        assert!(cache.inner.lock().unwrap().entries.is_empty());
     }
 
     #[test]
@@ -573,7 +441,7 @@ mod tests {
         let cache = cache(&root, 10 * 1024 * 1024);
         let digest = store_payload(&cache, 5, b"gone");
 
-        let outputs = cache.cached_outputs(&digest).unwrap();
+        let outputs = cache.lookup(&digest).unwrap();
         assert_eq!(outputs.len(), 1);
 
         let blobs: Vec<PathBuf> = fs::read_dir(cache.cas.blobs_dir())
@@ -585,11 +453,7 @@ mod tests {
             fs::remove_file(blob).unwrap();
         }
 
-        assert!(cache.cached_outputs(&digest).is_none());
-        assert!(
-            cache
-                .lookup_and_materialize(&digest, &root.join("out-missing"))
-                .is_none()
-        );
+        assert!(cache.lookup(&digest).is_none());
+        assert!(cache.lookup(&digest).is_none());
     }
 }

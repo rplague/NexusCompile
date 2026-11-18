@@ -25,6 +25,7 @@ use crate::paths;
 use crate::pool;
 use crate::pool::{Consumer, Provider};
 use crate::remote::Coordinator;
+use crate::scheduler::{TaskQueue, TaskScheduler};
 use crate::state::AppState;
 use crate::workspace::Workspace;
 
@@ -199,6 +200,7 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
         LogStruct::new(LogLevel::Warning, "清理 staging 失败", error.to_string()).emit();
     }
     let control = new_control();
+    let task_queue = Arc::new(TaskQueue::new());
     let app = AppState::new(
         provider.clone(),
         consumer.clone(),
@@ -206,6 +208,7 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
         workspace.clone(),
         config_handle.clone(),
         control.clone(),
+        task_queue.clone(),
     );
     let coordinator = Arc::new(Coordinator::new(
         provider.clone(),
@@ -215,12 +218,15 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
         control.clone(),
         config.clone(),
     ));
+    let scheduler = Arc::new(TaskScheduler::new(task_queue.clone(), coordinator.clone()));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (done_tx, done_rx) = watch::channel(None);
     let services = RuntimeServices {
         app,
         coordinator,
+        scheduler,
+        task_queue,
         cache,
         workspace,
         control,
@@ -248,6 +254,8 @@ pub async fn start(options: RuntimeOptions) -> Result<RuntimeHandle, RuntimeErro
 struct RuntimeServices {
     app: AppState,
     coordinator: Arc<Coordinator>,
+    scheduler: Arc<TaskScheduler>,
+    task_queue: Arc<TaskQueue>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
     control: ControlHandle,
@@ -261,6 +269,7 @@ struct RuntimeServices {
 struct ServerTasks {
     cache_sweeper: Option<JoinHandle<()>>,
     pool: Option<JoinHandle<()>>,
+    scheduler: Option<JoinHandle<()>>,
     task_service: Option<JoinHandle<()>>,
     task_socket: PathBuf,
 }
@@ -271,6 +280,13 @@ impl ServerTasks {
             task.abort();
         }
         if let Some(mut task) = self.pool.take()
+            && tokio::time::timeout(Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+        }
+        if let Some(mut task) = self.scheduler.take()
             && tokio::time::timeout(Duration::from_secs(3), &mut task)
                 .await
                 .is_err()
@@ -292,6 +308,9 @@ impl Drop for ServerTasks {
         if let Some(task) = self.pool.take() {
             task.abort();
         }
+        if let Some(task) = self.scheduler.take() {
+            task.abort();
+        }
         if let Some(task) = self.task_service.take() {
             task.abort();
         }
@@ -307,6 +326,8 @@ async fn run_server(
     let RuntimeServices {
         app,
         coordinator,
+        scheduler,
+        task_queue,
         cache,
         workspace,
         control,
@@ -321,16 +342,23 @@ async fn run_server(
         control,
         provider,
         consumer,
-        cache.clone(),
         config.clone(),
         shutdown_rx.clone(),
         source,
     ));
-    let task_service = bind_task_service(&task_socket, coordinator, cache.clone(), workspace);
+    let scheduler_task = tokio::spawn(scheduler.run(shutdown_rx.clone()));
+    let task_service = bind_task_service(
+        &task_socket,
+        coordinator,
+        task_queue,
+        cache.clone(),
+        workspace,
+    );
 
     let mut tasks = ServerTasks {
         cache_sweeper: Some(cache_sweep_task),
         pool: Some(pool_task),
+        scheduler: Some(scheduler_task),
         task_service,
         task_socket: task_socket.clone(),
     };
@@ -383,7 +411,7 @@ fn spawn_cache_sweeper(cache: Arc<ResultCache>) -> JoinHandle<()> {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            cache.sweep();
+            cache.evict();
         }
     })
 }
@@ -391,6 +419,7 @@ fn spawn_cache_sweeper(cache: Arc<ResultCache>) -> JoinHandle<()> {
 fn bind_task_service(
     socket: &std::path::Path,
     coordinator: Arc<Coordinator>,
+    task_queue: Arc<TaskQueue>,
     cache: Arc<ResultCache>,
     workspace: Arc<Workspace>,
 ) -> Option<JoinHandle<()>> {
@@ -405,6 +434,7 @@ fn bind_task_service(
             Some(tokio::spawn(local_task::run(
                 listener,
                 coordinator,
+                task_queue,
                 cache,
                 workspace,
                 tokio::runtime::Handle::current(),

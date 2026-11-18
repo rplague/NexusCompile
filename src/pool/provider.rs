@@ -93,13 +93,13 @@ impl Provider {
     }
 
     pub fn active_slots(&self) -> u32 {
-        self.read()
-            .tasks
-            .values()
-            .filter(|entry| matches!(entry.state, TaskState::Queued | TaskState::Running))
-            .count()
-            .try_into()
-            .unwrap_or(u32::MAX)
+        let inner = self.read();
+        active_slot_count(&inner)
+    }
+
+    pub fn available_slots(&self) -> u32 {
+        let inner = self.read();
+        inner.free_slots.saturating_sub(active_slot_count(&inner))
     }
 
     pub fn queue_len(&self) -> u32 {
@@ -144,7 +144,7 @@ impl Provider {
                 .count()
                 .try_into()
                 .unwrap_or(u32::MAX),
-            accepting: inner.free_slots > 0,
+            accepting: inner.free_slots.saturating_sub(active_slot_count(&inner)) > 0,
         }
     }
 
@@ -247,27 +247,20 @@ impl Provider {
         let mut inner = self.write();
         if let Some(existing) = inner.tasks.get(&task_id).cloned() {
             match &existing.state {
-                TaskState::Done { outputs } => {
-                    let lease_id = new_lease(&mut inner, task_id);
-                    return AppResponse::Cached {
-                        task_id,
-                        outputs: outputs.clone(),
-                        lease_id,
-                    };
-                }
                 TaskState::Queued | TaskState::Running => {
                     return AppResponse::Granted {
                         task_id,
                         lease_id: existing.lease_id,
                     };
                 }
-                TaskState::Failed { .. } | TaskState::Cancelled => {
+                _ => {
                     inner.tasks.remove(&task_id);
+                    inner.leases.retain(|_, lease| lease.task_id != task_id);
                 }
             }
         }
 
-        if inner.free_slots == 0 {
+        if inner.free_slots.saturating_sub(active_slot_count(&inner)) == 0 {
             return AppResponse::Busy {
                 retry_after_ms: 1_000,
             };
@@ -322,9 +315,8 @@ impl Provider {
         new_lease(&mut inner, task_id)
     }
 
-    /// Drop expired leases and return the affected tasks so the caller can
-    /// release cache pins. A finished task is removed once no lease remains.
-    pub fn expire_leases(&self, now: u64) -> Vec<(TaskId, u32)> {
+    /// Drop expired leases. A finished task is removed once no lease remains.
+    pub fn expire_leases(&self, now: u64) {
         let mut inner = self.write();
         let expired: Vec<LeaseId> = inner
             .leases
@@ -332,24 +324,16 @@ impl Provider {
             .filter(|(_, lease)| lease.expires_at_ms <= now)
             .map(|(id, _)| *id)
             .collect();
-        let mut affected: Vec<(TaskId, u32)> = Vec::new();
         for lease_id in expired {
-            if let Some(lease) = inner.leases.remove(&lease_id) {
-                if !inner.leases.values().any(|l| l.task_id == lease.task_id)
-                    && inner
-                        .tasks
-                        .get(&lease.task_id)
-                        .is_some_and(|entry| matches!(entry.state, TaskState::Done { .. }))
-                {
-                    inner.tasks.remove(&lease.task_id);
-                }
-                match affected.iter_mut().find(|(id, _)| *id == lease.task_id) {
-                    Some((_, count)) => *count += 1,
-                    None => affected.push((lease.task_id, 1)),
-                }
+            if let Some(lease) = inner.leases.remove(&lease_id)
+                && !inner.leases.values().any(|l| l.task_id == lease.task_id)
+                && inner.tasks.get(&lease.task_id).is_some_and(|entry| {
+                    matches!(entry.state, TaskState::Done { .. } | TaskState::Queued)
+                })
+            {
+                inner.tasks.remove(&lease.task_id);
             }
         }
-        affected
     }
 
     pub fn lease_count_for(&self, task_id: TaskId) -> u32 {
@@ -460,6 +444,16 @@ impl Provider {
     }
 }
 
+fn active_slot_count(inner: &Inner) -> u32 {
+    inner
+        .tasks
+        .values()
+        .filter(|entry| matches!(entry.state, TaskState::Queued | TaskState::Running))
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
 fn new_lease(inner: &mut Inner, task_id: TaskId) -> LeaseId {
     let lease_id = LeaseId::new();
     inner.leases.insert(
@@ -542,7 +536,6 @@ fn run_task_blocking(
         return;
     }
 
-    cache.pin(&task_id.0);
     LogStruct::new(
         LogLevel::Debug,
         "远端任务完成",
@@ -641,6 +634,10 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(provider.available_slots(), 0);
+
+        provider.fail_task(id, ErrorCode::Internal, "reset");
+        provider.discard_task(id);
 
         provider.set_capacity(1, 0);
         assert_eq!(
@@ -697,8 +694,9 @@ mod tests {
         );
         assert!(matches!(
             provider.reserve(peer("consumer"), id, 1, manifest(2)),
-            AppResponse::Cached { .. }
+            AppResponse::Granted { .. }
         ));
+        provider.discard_task(id);
 
         let cancelled = task(3);
         assert!(matches!(
@@ -733,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_done_task_needs_all_lease_acks() {
+    fn done_task_is_dropped_on_new_reservation() {
         let provider = Provider::new(peer("local"), 1);
         let id = task(1);
         let lease_one = match provider.reserve(peer("a"), id, 1, manifest(2)) {
@@ -749,25 +747,40 @@ mod tests {
         };
         provider.complete_task(id, vec![output]);
 
+        // Done 条目不再参与命中：下次申请按新任务处理，并清掉旧租约。
         let lease_two = match provider.reserve(peer("b"), id, 1, manifest(2)) {
-            AppResponse::Cached { lease_id, .. } => lease_id,
-            other => panic!("expected cached, got {other:?}"),
+            AppResponse::Granted { lease_id, .. } => lease_id,
+            other => panic!("expected granted, got {other:?}"),
         };
         assert_ne!(lease_one, lease_two);
-
-        assert_eq!(provider.result_ack(lease_one), Some(id));
-        assert!(provider.task_entry(&id).is_some());
-
-        assert_eq!(provider.result_ack(lease_two), Some(id));
-        assert!(provider.task_entry(&id).is_none());
+        assert_eq!(provider.lease_count_for(id), 1);
+        assert_eq!(provider.result_ack(lease_one), None);
+        assert!(matches!(
+            provider.task_entry(&id).unwrap().state,
+            TaskState::Queued
+        ));
     }
 
     #[test]
-    fn expired_leases_are_returned_for_pin_release() {
+    fn expired_queued_reservation_releases_capacity() {
         let provider = Provider::new(peer("local"), 1);
         let id = task(1);
-        let _lease = provider.create_lease(id);
-        let affected = provider.expire_leases(now_ms().saturating_add(LEASE_TTL_MS + 1));
-        assert_eq!(affected, vec![(id, 1)]);
+        let _lease = provider.reserve(peer("consumer"), id, 1, manifest(2));
+        assert_eq!(provider.available_slots(), 0);
+
+        provider.expire_leases(now_ms().saturating_add(LEASE_TTL_MS + 1));
+
+        assert!(provider.task_entry(&id).is_none());
+        assert_eq!(provider.available_slots(), 1);
+    }
+
+    #[test]
+    fn expired_lease_is_dropped() {
+        let provider = Provider::new(peer("local"), 1);
+        let id = task(1);
+        let lease = provider.create_lease(id);
+        provider.expire_leases(now_ms().saturating_add(LEASE_TTL_MS + 1));
+        assert_eq!(provider.lease_count_for(id), 0);
+        assert_eq!(provider.result_ack(lease), None);
     }
 }

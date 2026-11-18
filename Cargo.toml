@@ -1,6 +1,6 @@
 [package]
 name = "NexusCompile"
-version = "0.1.4-11177"
+version = "0.1.4-11184"
 edition = "2024"
 
 [lib]
