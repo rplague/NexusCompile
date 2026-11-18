@@ -108,10 +108,14 @@ impl Coordinator {
     pub(crate) fn admit_local(&self, job: &TaskJob) -> LocalAdmission {
         let task_id = TaskId(job.task_id);
         let consumer = self.provider.provider_id();
-        match self
-            .provider
-            .reserve(consumer, task_id, job.requirements.slots, job.bundle_hash)
-        {
+        match self.provider.reserve(
+            consumer,
+            task_id,
+            job.requirements.slots,
+            job.bundle_hash,
+            job.requirements.toolchain.id.clone(),
+            job.requirements.toolchain.target.clone(),
+        ) {
             AppResponse::Granted { lease_id, .. } => LocalAdmission::Reserved(lease_id),
             AppResponse::Cached { .. } => {
                 // 本地缓存已在 process_task 查过且未命中，这个 Done 条目不可用；
@@ -270,8 +274,8 @@ impl Coordinator {
                     task_id,
                     slots: 1,
                     input_manifest: job.bundle_hash,
-                    toolchain_id: job.manifest.toolchain_id.clone(),
-                    target: job.manifest.target.clone(),
+                    toolchain_id: job.requirements.toolchain.id.clone(),
+                    target: job.requirements.toolchain.target.clone(),
                 },
             )
             .await

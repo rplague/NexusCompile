@@ -25,6 +25,8 @@ pub fn execute_job(
     source: TaskSource,
 ) -> Result<TaskResult, TaskError> {
     let digest_prefix = &hex_hash(&job.task_id)[..8];
+    let prepared_job = job.prepare()?;
+    let task = &prepared_job.prepared;
 
     let staging = workspace
         .staging_dir(&job.task_id)
@@ -35,7 +37,7 @@ pub fn execute_job(
         return Err(TaskError::new("cache_error", error.to_string()));
     }
 
-    let exec_args = match rewrite_out_dir(&job.prepared.args, &staging_out) {
+    let exec_args = match rewrite_out_dir(&task.args, &staging_out) {
         Some(args) => args,
         None => {
             let _ = fs::remove_dir_all(&staging);
@@ -53,15 +55,15 @@ pub fn execute_job(
         topic,
         format!(
             "action={digest_prefix}, crate={}",
-            args::value(&job.prepared.args, "--crate-name").unwrap_or_default()
+            args::value(&task.args, "--crate-name").unwrap_or_default()
         ),
     )
     .emit();
 
     let output = Command::new(rustc)
         .args(&exec_args)
-        .current_dir(&job.prepared.cwd)
-        .envs(&job.prepared.env)
+        .current_dir(&task.cwd)
+        .envs(&task.env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -81,19 +83,19 @@ pub fn execute_job(
         log_compile_failure(
             source.as_str(),
             &hex_hash(&job.task_id),
-            &job.manifest.crate_name,
+            &prepared_job.manifest.crate_name,
             rustc,
-            &job.prepared.cwd.to_string_lossy(),
+            &task.cwd.to_string_lossy(),
             exit_code,
             duration_ms,
-            &job.prepared.args,
-            &job.prepared.env,
+            &task.args,
+            &task.env,
             &output.stdout,
             &output.stderr,
-            Some(&job.manifest),
+            Some(&prepared_job.manifest),
             Some(&job.bundle_hash),
             Some(job.bundle_size),
-            Some(job.bundle.files.len()),
+            Some(prepared_job.file_count),
         );
         let _ = fs::remove_dir_all(&staging);
         return Ok(TaskResult {
@@ -107,7 +109,7 @@ pub fn execute_job(
         });
     }
 
-    if let Err(error) = rewrite_dep_info_files(&staging_out, &job.prepared.out_dir) {
+    if let Err(error) = rewrite_dep_info_files(&staging_out, &task.out_dir) {
         let _ = fs::remove_dir_all(&staging);
         return Err(TaskError::new("output_error", error.to_string()));
     }
@@ -124,7 +126,7 @@ pub fn execute_job(
         }
     };
 
-    if let Err(error) = cache.materialize_outputs(&outputs, &job.prepared.out_dir) {
+    if let Err(error) = cache.materialize_outputs(&outputs, &task.out_dir) {
         let _ = fs::remove_dir_all(&staging);
         return Err(TaskError::new("output_error", error.to_string()));
     }

@@ -78,7 +78,9 @@ mod local_remote {
             task_id,
             bundle_hash,
             bundle_len,
-            &root.join("work"),
+            root.join("work"),
+            manifest.toolchain_id.clone(),
+            manifest.target.clone(),
         )
         .unwrap();
         (root, cache, job)
@@ -94,7 +96,7 @@ mod local_remote {
             executor::execute_job(&job, "rustc", &cache, &workspace, TaskSource::Local).unwrap();
         assert_eq!(first.exit_code, 0);
         assert!(!first.cache_hit);
-        assert!(job.prepared.out_dir.join("libdemo.rlib").is_file());
+        assert!(job.prepare().unwrap().prepared.out_dir.join("libdemo.rlib").is_file());
         assert!(cache.lookup(&job.task_id).is_some());
     }
 
@@ -265,7 +267,7 @@ mod local_remote {
         let workspace = Arc::new(Workspace::new(&cache_dir));
 
         let digest = job.task_id;
-        let out_dir = job.prepared.out_dir.clone();
+        let out_dir = job.prepare().unwrap().prepared.out_dir.clone();
         let payload = b"remote rlib bytes";
         let blob = cache.cas().put_bytes(payload).unwrap();
         let output = OutputRef {

@@ -104,6 +104,8 @@ struct Session {
     bundle_path: PathBuf,
     bundle_hash: Hash32,
     bundle_len: u64,
+    toolchain_id: String,
+    target: String,
     bundle: File,
     received: u64,
 }
@@ -144,6 +146,8 @@ fn handle_stream(
                 task_id,
                 bundle_hash,
                 bundle_len,
+                toolchain_id,
+                target,
             } => {
                 if session.is_some() {
                     local_task_protocol::write_message(
@@ -168,6 +172,8 @@ fn handle_stream(
                     bundle_path,
                     bundle_hash,
                     bundle_len,
+                    toolchain_id,
+                    target,
                     bundle,
                     received: 0,
                 });
@@ -253,6 +259,8 @@ fn handle_stream(
                         bundle_path: current.bundle_path,
                         bundle_hash: current.bundle_hash,
                         bundle_len: current.bundle_len,
+                        toolchain_id: current.toolchain_id,
+                        target: current.target,
                         bundle: current.bundle,
                         received: current.received,
                     });
@@ -327,7 +335,9 @@ fn process_task(
         session.task_id,
         session.bundle_hash,
         session.bundle_len,
-        &session.task_dir.join("work"),
+        session.task_dir.join("work"),
+        session.toolchain_id.clone(),
+        session.target.clone(),
     ) {
         Ok(job) => job,
         Err(error) => return LocalTaskResponse::error(error.code, error.message),

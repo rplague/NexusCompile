@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile::hash::hash_file;
 use crate::compile::manifest::ActionManifest;
-use crate::compile::{TaskError, TaskRequirements, review_task};
+use crate::compile::{TaskError, TaskRequirements, ToolchainRequirement, review_task};
 use crate::compile_protocol::Hash32;
 use crate::util::args;
 use crate::util::fs::{file_mode, set_mode};
@@ -148,17 +148,23 @@ pub struct PreparedTask {
     pub out_dir: PathBuf,
 }
 
-/// A fully validated and materialized task.
+/// A task that has been accepted into the queue but not yet decoded.
 #[derive(Debug)]
 pub struct TaskJob {
     pub task_id: Hash32,
     pub bundle_hash: Hash32,
     pub bundle_size: u64,
     pub bundle_bytes: Vec<u8>,
-    pub manifest: ActionManifest,
-    pub bundle: TaskBundle,
-    pub prepared: PreparedTask,
+    pub work_dir: PathBuf,
     pub requirements: TaskRequirements,
+}
+
+/// A decoded task, materialized into its work directory.
+#[derive(Debug)]
+pub struct PreparedJob {
+    pub manifest: ActionManifest,
+    pub prepared: PreparedTask,
+    pub file_count: usize,
 }
 
 impl TaskJob {
@@ -167,7 +173,9 @@ impl TaskJob {
         task_id: Hash32,
         bundle_hash: Hash32,
         bundle_len: u64,
-        work: &Path,
+        work_dir: PathBuf,
+        toolchain_id: String,
+        target: String,
     ) -> Result<Self, TaskError> {
         let metadata = fs::metadata(bundle_path)
             .map_err(|error| TaskError::new("bundle_error", format!("read bundle: {error}")))?;
@@ -179,41 +187,59 @@ impl TaskJob {
         if actual_hash != bundle_hash {
             return Err(TaskError::new("bundle_error", "bundle hash mismatch"));
         }
-        let bytes = fs::read(bundle_path)
+        let bundle_bytes = fs::read(bundle_path)
             .map_err(|error| TaskError::new("bundle_error", format!("read bundle: {error}")))?;
-        let bundle_bytes = bytes.clone();
-        let bundle =
-            decode_bundle(&bytes).map_err(|error| TaskError::new("bundle_error", error))?;
-        let digest = bundle
-            .manifest
-            .digest()
-            .map_err(|error| TaskError::new("manifest_error", error.to_string()))?;
-        if digest != task_id {
-            return Err(TaskError::new("manifest_error", "manifest digest mismatch"));
-        }
-        let requirements = review_task(&bundle.manifest, bundle_hash)
-            .map_err(|error| TaskError::new(error.code, error.message))?;
-        let work_out = work.join("out");
-        let work_extern = work.join("extern");
-        fs::create_dir_all(work)
-            .and_then(|_| materialize_bundle(&bundle, work))
-            .and_then(|_| fs::create_dir_all(&work_out))
-            .and_then(|_| fs::create_dir_all(&work_extern))
-            .and_then(|_| fs::create_dir_all(work.join("target")))
-            .map_err(|error| {
-                TaskError::new("bundle_error", format!("materialize bundle: {error}"))
-            })?;
-        let prepared =
-            prepare_task(&bundle, work).map_err(|error| TaskError::new("bundle_error", error))?;
+
         Ok(Self {
             task_id,
             bundle_hash,
             bundle_size: bundle_len,
             bundle_bytes,
-            manifest: bundle.manifest.clone(),
-            bundle,
+            work_dir,
+            requirements: TaskRequirements {
+                task_id,
+                bundle_hash,
+                toolchain: ToolchainRequirement {
+                    id: toolchain_id,
+                    target,
+                },
+                slots: 1,
+            },
+        })
+    }
+
+    /// Decode, validate, and materialize the bundle. Called once a slot is assigned.
+    pub fn prepare(&self) -> Result<PreparedJob, TaskError> {
+        let bundle = decode_bundle(&self.bundle_bytes)
+            .map_err(|error| TaskError::new("bundle_error", error))?;
+        let digest = bundle
+            .manifest
+            .digest()
+            .map_err(|error| TaskError::new("manifest_error", error.to_string()))?;
+        if digest != self.task_id {
+            return Err(TaskError::new("manifest_error", "manifest digest mismatch"));
+        }
+        review_task(&bundle.manifest, self.bundle_hash)
+            .map_err(|error| TaskError::new(error.code, error.message))?;
+
+        let work_out = self.work_dir.join("out");
+        let work_extern = self.work_dir.join("extern");
+        fs::create_dir_all(&self.work_dir)
+            .and_then(|_| materialize_bundle(&bundle, &self.work_dir))
+            .and_then(|_| fs::create_dir_all(&work_out))
+            .and_then(|_| fs::create_dir_all(&work_extern))
+            .and_then(|_| fs::create_dir_all(self.work_dir.join("target")))
+            .map_err(|error| {
+                TaskError::new("bundle_error", format!("materialize bundle: {error}"))
+            })?;
+        let prepared = prepare_task(&bundle, &self.work_dir)
+            .map_err(|error| TaskError::new("bundle_error", error))?;
+
+        let file_count = bundle.files.len();
+        Ok(PreparedJob {
+            manifest: bundle.manifest,
             prepared,
-            requirements,
+            file_count,
         })
     }
 }
@@ -502,7 +528,7 @@ mod tests {
         assert!(decode_bundle(&bytes).is_err(), "case: unsupported schema");
     }
     #[test]
-    fn task_job_rejects_unsupported_invocation_before_materializing() {
+    fn task_job_prepare_rejects_unsupported_invocation() {
         let root = TempDir::new("task-job-unsupported");
         let mut task = bundle(BUNDLE_SCHEMA, "pkg/src/lib.rs");
         task.manifest.args[3] = "bin".into();
@@ -514,11 +540,48 @@ mod tests {
         let hash = crate::compile::hash::hash_bytes(&bytes);
         let work = root.join("work");
 
-        let error =
-            TaskJob::from_bundle_file(&bundle_path, task_id, hash, bytes.len() as u64, &work)
-                .unwrap_err();
+        let job = TaskJob::from_bundle_file(
+            &bundle_path,
+            task_id,
+            hash,
+            bytes.len() as u64,
+            work.clone(),
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        let error = job.prepare().unwrap_err();
         assert_eq!(error.code, "unsupported");
         assert!(!work.exists());
+    }
+
+    #[test]
+    fn task_job_defers_materialization_until_prepare() {
+        let root = TempDir::new("task-job-defer");
+        let bundle = bundle(BUNDLE_SCHEMA, "pkg/src/lib.rs");
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&bundle, &mut bytes).unwrap();
+        let bundle_path = root.join("bundle");
+        fs::write(&bundle_path, &bytes).unwrap();
+        let task_id = bundle.manifest.digest().unwrap();
+        let hash = crate::compile::hash::hash_bytes(&bytes);
+        let work = root.join("work");
+
+        let job = TaskJob::from_bundle_file(
+            &bundle_path,
+            task_id,
+            hash,
+            bytes.len() as u64,
+            work.clone(),
+            "toolchain".into(),
+            String::new(),
+        )
+        .unwrap();
+
+        assert!(!work.exists(), "绑定入队时不应展开文件");
+        let prepared = job.prepare().unwrap();
+        assert!(work.exists(), "分配到 slot 后才展开");
+        assert!(prepared.prepared.out_dir.is_dir());
     }
 
     #[test]
@@ -534,16 +597,41 @@ mod tests {
         let len = bytes.len() as u64;
         let work = root.join("work");
 
-        let job = TaskJob::from_bundle_file(&bundle_path, task_id, hash, len, &work).unwrap();
+        let job = TaskJob::from_bundle_file(
+            &bundle_path,
+            task_id,
+            hash,
+            len,
+            work.clone(),
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
         assert_eq!(job.task_id, task_id);
         assert_eq!(job.bundle_bytes, bytes);
 
-        let error = TaskJob::from_bundle_file(&bundle_path, task_id, Hash32([9; 32]), len, &work)
-            .unwrap_err();
+        let error = TaskJob::from_bundle_file(
+            &bundle_path,
+            task_id,
+            Hash32([9; 32]),
+            len,
+            work.clone(),
+            String::new(),
+            String::new(),
+        )
+        .unwrap_err();
         assert_eq!(error.code, "bundle_error");
 
-        let error =
-            TaskJob::from_bundle_file(&bundle_path, task_id, hash, len + 1, &work).unwrap_err();
+        let error = TaskJob::from_bundle_file(
+            &bundle_path,
+            task_id,
+            hash,
+            len + 1,
+            work,
+            String::new(),
+            String::new(),
+        )
+        .unwrap_err();
         assert_eq!(error.code, "bundle_error");
     }
 }

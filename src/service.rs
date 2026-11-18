@@ -100,9 +100,8 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
             toolchain_id,
             target,
         } => {
-            let _ = (toolchain_id, target);
             app.provider
-                .reserve(consumer, task_id, slots, input_manifest)
+                .reserve(consumer, task_id, slots, input_manifest, toolchain_id, target)
         }
         AppRequest::TaskReady { task_id, lease_id } => {
             let Some(entry) = app.provider.task_entry(&task_id) else {
@@ -153,7 +152,9 @@ fn dispatch(request: AppRequest, app: &AppState) -> AppResponse {
                 task_id.0,
                 entry.input_manifest,
                 bundle_len,
-                &task_dir.join("work"),
+                task_dir.join("work"),
+                entry.toolchain_id.clone(),
+                entry.target.clone(),
             ) {
                 Ok(job) => job,
                 Err(error) => {
@@ -377,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn task_ready_rejects_unsupported_bundle_and_cleans_up() {
+    fn task_ready_enqueues_unsupported_bundle_without_decoding() {
         let dir = TempDir::new("service-task-ready");
         let context = context(&dir);
         let project = dir.join("project");
@@ -428,14 +429,10 @@ mod tests {
 
         let request = encode_request(AppRequest::TaskReady { task_id, lease_id });
         let response = decode_response(&handle_app_payload(&request, &context).unwrap());
-        assert!(matches!(
-            response.body,
-            AppResponse::Rejected {
-                code: ErrorCode::Rejected,
-                ..
-            }
-        ));
-        assert!(!task_dir.exists());
+        // 校验推迟到分配 slot 之后：这里只接收，不解码。
+        assert_eq!(response.body, AppResponse::Ack);
+        assert_eq!(context.task_queue.len(), 1);
+        assert!(task_dir.exists());
     }
 
     #[test]
@@ -555,7 +552,14 @@ mod tests {
         assert!(matches!(
             context
                 .provider
-                .reserve(PeerId::new("consumer"), task_id, 1, bundle.hash),
+                .reserve(
+                    PeerId::new("consumer"),
+                    task_id,
+                    1,
+                    bundle.hash,
+                    String::new(),
+                    String::new()
+                ),
             AppResponse::Granted { .. }
         ));
 
@@ -628,6 +632,8 @@ mod tests {
             ack_task,
             1,
             Hash32([7; 32]),
+            String::new(),
+            String::new(),
         ) {
             AppResponse::Granted { lease_id, .. } => lease_id,
             other => panic!("expected granted, got {other:?}"),

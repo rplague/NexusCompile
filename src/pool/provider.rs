@@ -40,6 +40,8 @@ pub struct TaskEntry {
     pub consumer: PeerId,
     pub lease_id: LeaseId,
     pub input_manifest: Hash32,
+    pub toolchain_id: String,
+    pub target: String,
     pub state: TaskState,
 }
 
@@ -236,6 +238,8 @@ impl Provider {
         task_id: TaskId,
         slots: u32,
         input_manifest: Hash32,
+        toolchain_id: String,
+        target: String,
     ) -> AppResponse {
         if slots != 1 {
             return AppResponse::Rejected {
@@ -273,6 +277,8 @@ impl Provider {
                 consumer,
                 lease_id,
                 input_manifest,
+                toolchain_id,
+                target,
                 state: TaskState::Queued,
             },
         );
@@ -620,15 +626,15 @@ mod tests {
         let id = task(1);
 
         assert!(matches!(
-            provider.reserve(peer("consumer"), id, 1, manifest(2)),
+            provider.reserve(peer("consumer"), id, 1, manifest(2), String::new(), String::new()),
             AppResponse::Granted { .. }
         ));
         assert!(matches!(
-            provider.reserve(peer("consumer"), id, 1, manifest(2)),
+            provider.reserve(peer("consumer"), id, 1, manifest(2), String::new(), String::new()),
             AppResponse::Granted { .. }
         ));
         assert!(matches!(
-            provider.reserve(peer("consumer"), task(2), 2, manifest(3)),
+            provider.reserve(peer("consumer"), task(2), 2, manifest(3), String::new(), String::new()),
             AppResponse::Rejected {
                 code: ErrorCode::BadRequest,
                 ..
@@ -641,7 +647,7 @@ mod tests {
 
         provider.set_capacity(1, 0);
         assert_eq!(
-            provider.reserve(peer("consumer"), task(3), 1, manifest(4)),
+            provider.reserve(peer("consumer"), task(3), 1, manifest(4), String::new(), String::new()),
             AppResponse::Busy {
                 retry_after_ms: 1_000
             }
@@ -651,7 +657,7 @@ mod tests {
         provider.set_capacity(1, 1);
         assert_eq!(provider.free_slots(), 1);
         assert!(matches!(
-            provider.reserve(peer("consumer"), task(2), 1, manifest(3)),
+            provider.reserve(peer("consumer"), task(2), 1, manifest(3), String::new(), String::new()),
             AppResponse::Granted { .. }
         ));
     }
@@ -661,7 +667,7 @@ mod tests {
         let provider = Provider::new(peer("local"), 1);
         let id = task(1);
 
-        let lease = match provider.reserve(peer("consumer"), id, 1, manifest(2)) {
+        let lease = match provider.reserve(peer("consumer"), id, 1, manifest(2), String::new(), String::new()) {
             AppResponse::Granted { lease_id, .. } => lease_id,
             other => panic!("expected granted, got {other:?}"),
         };
@@ -693,14 +699,14 @@ mod tests {
             }
         );
         assert!(matches!(
-            provider.reserve(peer("consumer"), id, 1, manifest(2)),
+            provider.reserve(peer("consumer"), id, 1, manifest(2), String::new(), String::new()),
             AppResponse::Granted { .. }
         ));
         provider.discard_task(id);
 
         let cancelled = task(3);
         assert!(matches!(
-            provider.reserve(peer("consumer"), cancelled, 1, manifest(4)),
+            provider.reserve(peer("consumer"), cancelled, 1, manifest(4), String::new(), String::new()),
             AppResponse::Granted { .. }
         ));
         assert_eq!(provider.cancel(cancelled), AppResponse::Ack);
@@ -713,7 +719,7 @@ mod tests {
 
         let failed = task(5);
         assert!(matches!(
-            provider.reserve(peer("consumer"), failed, 1, manifest(6)),
+            provider.reserve(peer("consumer"), failed, 1, manifest(6), String::new(), String::new()),
             AppResponse::Granted { .. }
         ));
         assert_eq!(
@@ -734,7 +740,7 @@ mod tests {
     fn done_task_is_dropped_on_new_reservation() {
         let provider = Provider::new(peer("local"), 1);
         let id = task(1);
-        let lease_one = match provider.reserve(peer("a"), id, 1, manifest(2)) {
+        let lease_one = match provider.reserve(peer("a"), id, 1, manifest(2), String::new(), String::new()) {
             AppResponse::Granted { lease_id, .. } => lease_id,
             other => panic!("expected granted, got {other:?}"),
         };
@@ -748,7 +754,7 @@ mod tests {
         provider.complete_task(id, vec![output]);
 
         // Done 条目不再参与命中：下次申请按新任务处理，并清掉旧租约。
-        let lease_two = match provider.reserve(peer("b"), id, 1, manifest(2)) {
+        let lease_two = match provider.reserve(peer("b"), id, 1, manifest(2), String::new(), String::new()) {
             AppResponse::Granted { lease_id, .. } => lease_id,
             other => panic!("expected granted, got {other:?}"),
         };
@@ -765,7 +771,7 @@ mod tests {
     fn expired_queued_reservation_releases_capacity() {
         let provider = Provider::new(peer("local"), 1);
         let id = task(1);
-        let _lease = provider.reserve(peer("consumer"), id, 1, manifest(2));
+        let _lease = provider.reserve(peer("consumer"), id, 1, manifest(2), String::new(), String::new());
         assert_eq!(provider.available_slots(), 0);
 
         provider.expire_leases(now_ms().saturating_add(LEASE_TTL_MS + 1));
