@@ -43,8 +43,10 @@ pub fn build_bundle(
         .get("CARGO_MANIFEST_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| cwd.to_path_buf());
-    let out_dir = args::value(args, "--out-dir")
-        .or_else(|| env.get("OUT_DIR").cloned())
+    let out_dir = env
+        .get("OUT_DIR")
+        .cloned()
+        .or_else(|| args::value(args, "--out-dir"))
         .ok_or_else(|| "missing --out-dir / OUT_DIR".to_string())?;
     let out_dir = resolve_path(cwd, &out_dir);
 
