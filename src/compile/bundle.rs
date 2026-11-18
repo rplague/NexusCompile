@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::compile::hash::hash_file;
+use crate::compile::hash::{hash_file, hex_hash};
 use crate::compile::manifest::ActionManifest;
 use crate::compile::{TaskError, TaskRequirements, ToolchainRequirement, review_task};
 use crate::compile_protocol::Hash32;
+use crate::log::{LogLevel, LogStruct};
 use crate::util::args;
 use crate::util::fs::{file_mode, set_mode};
 use crate::util::path::{resolve_path, safe_relative};
@@ -216,6 +217,16 @@ impl TaskJob {
             .manifest
             .digest()
             .map_err(|error| TaskError::new("manifest_error", error.to_string()))?;
+        LogStruct::new(
+            LogLevel::Debug,
+            "清单",
+            format!(
+                "digest={} manifest={}",
+                hex_hash(&digest),
+                serde_json::to_string(&bundle.manifest).unwrap_or_default()
+            ),
+        )
+        .emit();
         if digest != self.task_id {
             return Err(TaskError::new("manifest_error", "manifest digest mismatch"));
         }
