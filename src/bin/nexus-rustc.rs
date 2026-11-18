@@ -10,7 +10,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use nexuscompile::compile::bundle::build_bundle;
 use nexuscompile::compile::hash::hash_bytes;
@@ -124,6 +125,7 @@ pub fn run() -> ! {
 
 fn try_remote(invocation: &Invocation) -> Result<CompileOutcome, WrapperError> {
     let cwd = env::current_dir()?;
+    wait_for_extern_siblings(&cwd, &invocation.args);
     let manifest = collect_manifest(
         &cwd,
         Path::new(&invocation.rustc),
@@ -185,6 +187,58 @@ fn try_remote(invocation: &Invocation) -> Result<CompileOutcome, WrapperError> {
         other => Err(WrapperError::Protocol(format!(
             "unexpected probe response: {other:?}"
         ))),
+    }
+}
+
+const EXTERN_WAIT: Duration = Duration::from_millis(500);
+const EXTERN_POLL: Duration = Duration::from_millis(10);
+
+/// Pairs of `(primary, sibling)` artifacts referenced by `--extern` flags.
+fn extern_sibling_pairs(cwd: &Path, args: &[String]) -> Vec<(PathBuf, PathBuf)> {
+    let mut pairs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let value = if args[index] == "--extern" {
+            index += 1;
+            args.get(index).map(String::as_str)
+        } else {
+            args[index].strip_prefix("--extern=")
+        };
+        if let Some(value) = value
+            && let Some((_, path)) = value.split_once('=')
+        {
+            let path = resolve_path(cwd, path);
+            let sibling = match path.extension().and_then(|ext| ext.to_str()) {
+                Some("rmeta") => Some(path.with_extension("rlib")),
+                Some("rlib") => Some(path.with_extension("rmeta")),
+                _ => None,
+            };
+            if let Some(sibling) = sibling {
+                pairs.push((path, sibling));
+            }
+        }
+        index += 1;
+    }
+    pairs
+}
+
+/// Give a dependency a short grace period to finish writing its sibling
+/// artifact, so a task is never uploaded with half of a crate's outputs.
+fn wait_for_extern_siblings(cwd: &Path, args: &[String]) {
+    let pending: Vec<PathBuf> = extern_sibling_pairs(cwd, args)
+        .into_iter()
+        .filter(|(primary, sibling)| primary.is_file() && !sibling.exists())
+        .map(|(_, sibling)| sibling)
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + EXTERN_WAIT;
+    while Instant::now() < deadline {
+        if pending.iter().all(|sibling| sibling.exists()) {
+            return;
+        }
+        thread::sleep(EXTERN_POLL);
     }
 }
 
@@ -628,5 +682,30 @@ mod tests {
 
         let text = fs::read_to_string(dir.join("libdemo.rlib.nexus")).unwrap();
         assert_eq!(text, "07".repeat(32));
+    }
+
+    #[test]
+    fn extern_pairs_cover_both_argument_forms() {
+        let args = vec![
+            "--extern".into(),
+            "a=/tmp/liba.rlib".into(),
+            "--extern=b=/tmp/libb.rmeta".into(),
+            "--extern".into(),
+            "c=/tmp/libc.d".into(),
+        ];
+        let pairs = extern_sibling_pairs(Path::new("/tmp"), &args);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, PathBuf::from("/tmp/liba.rlib"));
+        assert_eq!(pairs[0].1, PathBuf::from("/tmp/liba.rmeta"));
+        assert_eq!(pairs[1].0, PathBuf::from("/tmp/libb.rmeta"));
+        assert_eq!(pairs[1].1, PathBuf::from("/tmp/libb.rlib"));
+    }
+
+    #[test]
+    fn wait_returns_immediately_without_pending_siblings() {
+        let args = vec!["--extern".into(), "a=/nonexistent/liba.rlib".into()];
+        let started = Instant::now();
+        wait_for_extern_siblings(Path::new("/tmp"), &args);
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }
