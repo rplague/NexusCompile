@@ -42,6 +42,8 @@ pub struct InputBlob {
     pub path: String,
     pub hash: Hash32,
     pub size: u64,
+    /// True when `hash` is the producing task id instead of the file content.
+    pub identity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,7 +184,7 @@ fn add_extern(
         return Ok(());
     }
     let logical = format!("extern/{name}");
-    add_file(&path, &logical, inputs)
+    add_artifact(&path, &logical, inputs)
 }
 
 fn link_paths(cwd: &Path, args: &[String]) -> Vec<(String, PathBuf)> {
@@ -333,7 +335,7 @@ fn add_dependency_files(
         }
         matched = true;
         let logical = format!("deps/{kind}/{name}");
-        add_file(&file, &logical, inputs)?;
+        add_artifact(&file, &logical, inputs)?;
     }
 
     if closure.is_some() && !matched {
@@ -354,7 +356,7 @@ fn add_dependency_files(
             }
             let name = file.file_name().unwrap_or_default().to_string_lossy();
             let logical = format!("deps/{kind}/{name}");
-            add_file(&file, &logical, inputs)?;
+            add_artifact(&file, &logical, inputs)?;
         }
     }
     Ok(())
@@ -421,9 +423,49 @@ fn add_file(
             path: logical.to_string(),
             hash,
             size,
+            identity: false,
         },
     );
     Ok(())
+}
+
+/// Record an upstream artifact by the task id that produced it, when available.
+fn add_artifact(
+    path: &Path,
+    logical: &str,
+    inputs: &mut BTreeMap<String, InputBlob>,
+) -> Result<(), ManifestError> {
+    if inputs.contains_key(logical) {
+        return Ok(());
+    }
+    if let Some(identity) = read_identity(path) {
+        inputs.insert(
+            logical.to_string(),
+            InputBlob {
+                path: logical.to_string(),
+                hash: identity,
+                size: 0,
+                identity: true,
+            },
+        );
+        return Ok(());
+    }
+    add_file(path, logical, inputs)
+}
+
+fn read_identity(path: &Path) -> Option<Hash32> {
+    let sidecar = PathBuf::from(format!("{}.nexus", path.display()));
+    let text = std::fs::read_to_string(sidecar).ok()?;
+    let text = text.trim();
+    if text.len() != 64 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for index in 0..32 {
+        let start = index * 2;
+        bytes[index] = u8::from_str_radix(&text[start..start + 2], 16).ok()?;
+    }
+    Some(Hash32(bytes))
 }
 
 fn hash_file(path: &Path) -> Result<(Hash32, u64), ManifestError> {
@@ -648,6 +690,32 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::fs;
+
+    #[test]
+    fn artifact_identity_overrides_content_hash() {
+        let root = TempDir::new("artifact-identity");
+        let artifact = root.join("libfoo.rlib");
+        let logical = "deps/dependency/libfoo.rlib";
+        fs::write(&artifact, b"one").unwrap();
+        fs::write(root.join("libfoo.rlib.nexus"), "aa".repeat(32)).unwrap();
+
+        let mut inputs = BTreeMap::new();
+        add_artifact(&artifact, logical, &mut inputs).unwrap();
+        let blob = inputs.get(logical).unwrap();
+        assert!(blob.identity);
+        assert_eq!(blob.size, 0);
+        assert_eq!(blob.hash, Hash32([0xaa; 32]));
+
+        fs::write(&artifact, b"two").unwrap();
+        let mut again = BTreeMap::new();
+        add_artifact(&artifact, logical, &mut again).unwrap();
+        assert_eq!(inputs, again);
+
+        fs::remove_file(root.join("libfoo.rlib.nexus")).unwrap();
+        let mut fallback = BTreeMap::new();
+        add_artifact(&artifact, logical, &mut fallback).unwrap();
+        assert!(!fallback.get(logical).unwrap().identity);
+    }
 
     fn base_env(root: &Path, out: &Path) -> HashMap<String, String> {
         HashMap::from([

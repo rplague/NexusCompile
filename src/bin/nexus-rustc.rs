@@ -332,6 +332,7 @@ struct OutputStager {
     out_dir: PathBuf,
     temp_dir: PathBuf,
     files: Vec<(PathBuf, PathBuf)>,
+    task_id: Hash32,
 }
 
 impl OutputStager {
@@ -347,6 +348,7 @@ impl OutputStager {
             out_dir: out_dir.to_path_buf(),
             temp_dir,
             files: Vec::new(),
+            task_id,
         })
     }
 
@@ -366,9 +368,21 @@ impl OutputStager {
                 fs::create_dir_all(parent)?;
             }
             fs::rename(staged, target)?;
+            write_identity(target, self.task_id)?;
         }
         Ok(())
     }
+}
+
+/// Record the producing task id next to a materialized artifact.
+fn write_identity(target: &Path, task_id: Hash32) -> Result<(), WrapperError> {
+    let sidecar = PathBuf::from(format!("{}.nexus", target.display()));
+    let mut text = String::with_capacity(64);
+    for byte in task_id.0 {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    fs::write(sidecar, text)?;
+    Ok(())
 }
 
 impl Drop for OutputStager {
@@ -597,5 +611,22 @@ mod tests {
         let first = OutputStager::new(&dir, Hash32([6; 32])).unwrap();
         let second = OutputStager::new(&dir, Hash32([6; 32])).unwrap();
         assert_ne!(first.temp_dir, second.temp_dir);
+    }
+
+    #[test]
+    fn committed_output_records_task_identity() {
+        let dir = TempDir::new("wrapper-identity");
+        let mut stager = OutputStager::new(&dir, Hash32([7; 32])).unwrap();
+        let output = OutputRef {
+            path: "libdemo.rlib".into(),
+            hash: Hash32([1; 32]),
+            size: 3,
+            mode: 0o644,
+        };
+        stager.stage(&output, b"abc".to_vec()).unwrap();
+        stager.commit().unwrap();
+
+        let text = fs::read_to_string(dir.join("libdemo.rlib.nexus")).unwrap();
+        assert_eq!(text, "07".repeat(32));
     }
 }
