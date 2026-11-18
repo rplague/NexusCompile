@@ -396,6 +396,22 @@ fn normalize_extern_value(value: &str, extern_dir: &Path) -> String {
     if let Some(file) = candidates.first() {
         return format!("{name}={}", extern_dir.join(file).display());
     }
+
+    if let Ok(entries) = fs::read_dir(extern_dir) {
+        let listing: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(|name| name.to_string()))
+            .collect();
+        LogStruct::new(
+            LogLevel::Debug,
+            "外部依赖缺失",
+            format!(
+                "value={value} dir={} entries={listing:?}",
+                extern_dir.display()
+            ),
+        )
+        .emit();
+    }
     value.to_string()
 }
 
