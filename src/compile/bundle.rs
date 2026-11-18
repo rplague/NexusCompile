@@ -90,6 +90,14 @@ pub fn build_bundle(
         };
 
         let data = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let digest = crate::compile::hash::hash_bytes(&data);
+        crate::compile::manifest::scan_log(
+            "bundle",
+            &path,
+            &input.path,
+            &digest,
+            data.len() as u64,
+        );
         let bundle_path = if input.path.starts_with("extern/") {
             path.file_name()
                 .map(|name| format!("extern/{}", name.to_string_lossy()))

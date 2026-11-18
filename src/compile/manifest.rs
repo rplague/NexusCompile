@@ -424,6 +424,7 @@ fn add_file(
         return Ok(());
     }
     let (hash, size) = hash_file(path)?;
+    scan_log("manifest", path, logical, &hash, size);
     inputs.insert(
         logical.to_string(),
         InputBlob {
@@ -473,6 +474,36 @@ fn read_identity(path: &Path) -> Option<Hash32> {
         bytes[index] = u8::from_str_radix(&text[start..start + 2], 16).ok()?;
     }
     Some(Hash32(bytes))
+}
+
+/// Append one line describing a file at a specific phase, for diagnosing
+/// mismatches between hashing and bundling.
+pub(crate) fn scan_log(phase: &str, path: &Path, logical: &str, hash: &Hash32, size: u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(log_path) = std::env::var_os("NEXUSCOMPILE_SCAN_LOG") else {
+        return;
+    };
+    let (ino, mtime) = std::fs::metadata(path)
+        .map(|meta| {
+            (
+                meta.ino(),
+                format!("{}.{:09}", meta.mtime(), meta.mtime_nsec()),
+            )
+        })
+        .unwrap_or((0, "none".to_string()));
+    let line = format!(
+        "phase={phase} path={logical} size={size} hash={} ino={ino} mtime={mtime}\n",
+        crate::compile::hash::hex_hash(hash)
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 fn hash_file(path: &Path) -> Result<(Hash32, u64), ManifestError> {
