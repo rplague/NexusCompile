@@ -88,9 +88,9 @@ impl Coordinator {
 
     /// 订阅视图里当前可用的远端 provider。
     pub(crate) fn remote_candidates(&self, job: &TaskJob) -> Vec<PeerId> {
-        self.consumer
-            .providers()
-            .into_iter()
+        let views = self.consumer.providers();
+        let providers: Vec<PeerId> = views
+            .iter()
             .filter(|view| {
                 view.accepting
                     && view.free_slots > 0
@@ -100,8 +100,38 @@ impl Coordinator {
                                 && capability.target == job.requirements.toolchain.target
                         }))
             })
-            .map(|view| view.provider)
-            .collect()
+            .map(|view| view.provider.clone())
+            .collect();
+
+        if providers.is_empty() && !views.is_empty() {
+            let detail: Vec<String> = views
+                .iter()
+                .map(|view| {
+                    let caps: Vec<String> = view
+                        .capabilities
+                        .iter()
+                        .map(|capability| format!("{}@{}", capability.id, capability.target))
+                        .collect();
+                    format!(
+                        "{} accepting={} free={} queue={} caps={:?}",
+                        view.provider, view.accepting, view.free_slots, view.queue_len, caps
+                    )
+                })
+                .collect();
+            LogStruct::new(
+                LogLevel::Debug,
+                "远端候选",
+                format!(
+                    "required={}@{} views=[{}]",
+                    job.requirements.toolchain.id,
+                    job.requirements.toolchain.target,
+                    detail.join("; ")
+                ),
+            )
+            .emit();
+        }
+
+        providers
     }
 
     /// 在调度线程内同步完成「判断 + 扣减」。
