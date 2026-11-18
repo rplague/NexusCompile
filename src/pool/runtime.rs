@@ -265,10 +265,13 @@ async fn subscribe_capacity_tick(
     .await;
 }
 
-fn expire_capacity_tick(consumer: &Arc<Consumer>, subscription: &SubscriptionConfig) {
-    for peer in expire_providers(consumer, subscription.ttl_secs.max(1).saturating_mul(1_000)) {
+fn expire_capacity_tick(consumer: &Arc<Consumer>, subscription: &SubscriptionConfig) -> bool {
+    let expired =
+        expire_providers(consumer, subscription.ttl_secs.max(1).saturating_mul(1_000));
+    for peer in &expired {
         LogStruct::new(LogLevel::Debug, "订阅过期", peer.to_string()).emit();
     }
+    !expired.is_empty()
 }
 
 fn expire_leases(provider: &Arc<Provider>) {
@@ -333,7 +336,11 @@ pub async fn run_pool(
                 .await;
             }
             _ = ttl_tick.tick() => {
-                expire_capacity_tick(&consumer, &subscription);
+                if expire_capacity_tick(&consumer, &subscription) {
+                    // A dropped provider view makes the last discovery result stale.
+                    discovery.last_abnormal = true;
+                    discovery.last_attempt_ms = None;
+                }
                 expire_leases(&provider);
             }
         }
@@ -586,5 +593,19 @@ mod tests {
         discovery.last_abnormal = false;
         assert!(!discovery_due(&discovery, 1_000 + 29_999, 0));
         assert!(discovery_due(&discovery, 1_000 + 30_000, 0));
+    }
+
+    #[test]
+    fn expiry_reactivates_discovery_immediately() {
+        let mut discovery = DiscoveryState {
+            last_attempt_ms: Some(1_000),
+            last_abnormal: false,
+        };
+        assert!(!discovery_due(&discovery, 1_000 + 30_000, 6));
+
+        // What the ttl tick does once a provider view expires.
+        discovery.last_abnormal = true;
+        discovery.last_attempt_ms = None;
+        assert!(discovery_due(&discovery, 1_000 + 30_000, 6));
     }
 }
