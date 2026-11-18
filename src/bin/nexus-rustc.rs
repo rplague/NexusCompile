@@ -113,14 +113,30 @@ pub fn run() -> ! {
     let invocation = Invocation::from_env();
     let incremental = invocation.env.get("CARGO_INCREMENTAL").map(String::as_str);
     if let Err(error) = review_invocation(&invocation.args, incremental) {
+        log_fallback(&invocation.args, &format!("unsupported: {}", error.message));
         debug_review(&error);
     } else {
         match try_remote(&invocation) {
             Ok(outcome) => replay(outcome),
-            Err(error) => debug(&error),
+            Err(error) => {
+                log_fallback(&invocation.args, &error.to_string());
+                debug(&error);
+            }
         }
     }
     exec_rustc(&invocation.rustc, &invocation.args);
+}
+
+/// Record why this invocation fell back to the real rustc.
+fn log_fallback(args: &[String], reason: &str) {
+    let Some(path) = env::var_os("NEXUSCOMPILE_SCAN_LOG") else {
+        return;
+    };
+    let crate_name = args::value(args, "--crate-name").unwrap_or_default();
+    let line = format!("fallback crate={crate_name} reason={reason}\n");
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
 }
 
 fn try_remote(invocation: &Invocation) -> Result<CompileOutcome, WrapperError> {
