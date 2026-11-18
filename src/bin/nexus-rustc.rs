@@ -153,7 +153,13 @@ fn try_remote(invocation: &Invocation) -> Result<CompileOutcome, WrapperError> {
             let bundle = build_bundle(&cwd, &invocation.args, &invocation.env, &manifest)
                 .map_err(WrapperError::Bundle)?;
             let bundle_hash = hash_bytes(&bundle);
-            client.start(task_id, bundle_hash, bundle.len() as u64)?;
+            client.start(
+                task_id,
+                bundle_hash,
+                bundle.len() as u64,
+                manifest.toolchain_id.clone(),
+                manifest.target.clone(),
+            )?;
             client.upload_bundle(task_id, &bundle)?;
 
             match client.ready(task_id)? {
@@ -225,11 +231,15 @@ impl<S: Read + Write> TaskSocketClient<S> {
         task_id: Hash32,
         bundle_hash: Hash32,
         bundle_len: u64,
+        toolchain_id: String,
+        target: String,
     ) -> Result<(), WrapperError> {
         self.expect_ack(LocalTaskRequestBody::Start {
             task_id,
             bundle_hash,
             bundle_len,
+            toolchain_id,
+            target,
         })
     }
 

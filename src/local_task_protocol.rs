@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compile_protocol::{Hash32, OutputRef};
 
-pub const LOCAL_TASK_PROTOCOL_VERSION: u16 = 1;
+pub const LOCAL_TASK_PROTOCOL_VERSION: u16 = 2;
 pub const TASK_CHUNK_SIZE: usize = 1024 * 1024;
 pub const MAX_FRAME: usize = 16 << 20;
 
@@ -39,6 +39,8 @@ pub enum LocalTaskRequestBody {
         task_id: Hash32,
         bundle_hash: Hash32,
         bundle_len: u64,
+        toolchain_id: String,
+        target: String,
     },
     Chunk {
         task_id: Hash32,
