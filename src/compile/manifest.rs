@@ -153,8 +153,9 @@ fn collect_inputs(
     }
 
     let extern_names = extern_names(args);
+    let crate_name = args::value(args, "--crate-name").unwrap_or_default();
     for (kind, path) in link_paths(cwd, args) {
-        add_dependency_files(&kind, &path, &extern_names, out_dir, &mut inputs)?;
+        add_dependency_files(&crate_name, &kind, &path, &extern_names, out_dir, &mut inputs)?;
     }
 
     if let Some(source) = args
@@ -293,6 +294,7 @@ fn dependency_closure(
 }
 
 fn add_dependency_files(
+    crate_name: &str,
     kind: &str,
     path: &Path,
     externs: &[String],
@@ -310,6 +312,7 @@ fn add_dependency_files(
         std::collections::HashSet::from_iter(externs.iter().cloned())
     };
 
+    let mut matched: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(path)
         .map_err(|error| ManifestError::new(format!("read deps {}: {error}", path.display())))?
     {
@@ -333,8 +336,35 @@ fn add_dependency_files(
         if !keep {
             continue;
         }
+        matched.push(name.to_string());
         let logical = format!("deps/{kind}/{name}");
         add_artifact(&file, &logical, inputs)?;
+    }
+
+    if let Some(log_path) = std::env::var_os("NEXUSCOMPILE_SCAN_LOG") {
+        let missing: Vec<String> = closure
+            .iter()
+            .filter(|crate_name| {
+                !matched.iter().any(|name| {
+                    name.starts_with(&format!("lib{crate_name}-"))
+                        || name.starts_with(&format!("lib{crate_name}."))
+                })
+            })
+            .cloned()
+            .collect();
+        let line = format!(
+            "crate={crate_name} kind={kind} externs={externs:?} closure={} matched={} missing={missing:?}\n",
+            closure.len(),
+            matched.len()
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
     }
     Ok(())
 }
