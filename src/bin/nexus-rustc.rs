@@ -559,7 +559,15 @@ mod tests {
         });
 
         let mut client = TaskSocketClient { stream: client };
-        client.start(Hash32([4; 32]), Hash32([5; 32]), 3).unwrap();
+        client
+            .start(
+                Hash32([4; 32]),
+                Hash32([5; 32]),
+                3,
+                "toolchain".into(),
+                String::new(),
+            )
+            .unwrap();
         client.upload_bundle(Hash32([4; 32]), b"abc").unwrap();
         server.join().unwrap();
     }

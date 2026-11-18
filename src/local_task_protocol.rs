@@ -157,6 +157,8 @@ mod tests {
             task_id: Hash32([1; 32]),
             bundle_hash: Hash32([2; 32]),
             bundle_len: 3,
+            toolchain_id: "1.99.0".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
         });
         let mut bytes = Vec::new();
         write_message(&mut bytes, &request).unwrap();
