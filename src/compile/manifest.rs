@@ -524,7 +524,7 @@ fn hash_file(path: &Path) -> Result<(Hash32, u64), ManifestError> {
         size = size.saturating_add(read as u64);
     }
 
-    Ok((hash_bytes(&hasher.finalize()), size))
+    Ok((Hash32(hasher.finalize().into()), size))
 }
 
 fn canonicalize_args(
@@ -728,6 +728,16 @@ mod tests {
     use super::*;
     use crate::test_support::TempDir;
     use std::fs;
+
+    #[test]
+    fn hash_file_matches_hash_bytes() {
+        let dir = TempDir::new("hash-match");
+        let file = dir.join("f");
+        fs::write(&file, b"{\"v\":1}").unwrap();
+        let (hash, size) = hash_file(&file).unwrap();
+        assert_eq!(size, 7);
+        assert_eq!(hash, crate::compile::hash::hash_bytes(b"{\"v\":1}"));
+    }
 
     #[test]
     fn artifact_identity_overrides_content_hash() {
