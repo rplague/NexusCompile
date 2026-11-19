@@ -1,6 +1,6 @@
 //! Action manifest and canonical action digest for a single rustc invocation.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 use crate::compile::ToolchainInfo;
 use crate::compile::hash::hash_bytes;
 use crate::compile_protocol::Hash32;
+use crate::log::{LogLevel, LogStruct};
 use crate::util::args;
 use crate::util::path::resolve_path;
 
@@ -226,10 +227,7 @@ fn extern_names(args: &[String]) -> Vec<String> {
     result
 }
 
-fn dependency_closure(
-    out_dir: &Path,
-    externs: &[String],
-) -> Option<std::collections::HashSet<String>> {
+fn dependency_closure(out_dir: &Path, externs: &[String]) -> Option<HashSet<String>> {
     let profile_dir = out_dir.parent()?;
     let fingerprint_dir = profile_dir.join(".fingerprint");
     if !fingerprint_dir.is_dir() {
@@ -280,7 +278,7 @@ fn dependency_closure(
         return None;
     }
 
-    let mut closure = std::collections::HashSet::new();
+    let mut closure = HashSet::new();
     let mut queue: Vec<String> = externs.to_vec();
     while let Some(name) = queue.pop() {
         if !closure.insert(name.clone()) {
@@ -291,6 +289,73 @@ fn dependency_closure(
         }
     }
     Some(closure)
+}
+
+/// Which artifacts of a `-L` directory must be bundled.
+#[derive(Debug)]
+enum LinkSelection {
+    /// Conservative superset: keep every artifact in the directory.
+    All,
+    /// Keep artifacts whose file name references one of these extern crates.
+    Closure(HashSet<String>),
+}
+
+fn artifact_files(dir: &Path) -> Result<Vec<PathBuf>, ManifestError> {
+    const EXTENSIONS: [&str; 6] = ["rmeta", "rlib", "so", "a", "dylib", "dll"];
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .map_err(|error| ManifestError::new(format!("read deps {}: {error}", dir.display())))?
+    {
+        let entry = entry.map_err(|error| ManifestError::new(error.to_string()))?;
+        let file = entry.path();
+        if !file.is_file() {
+            continue;
+        }
+        let extension = file
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if EXTENSIONS.contains(&extension) {
+            files.push(file);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn artifact_matches(file: &Path, crate_name: &str) -> bool {
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    name.starts_with(&format!("lib{crate_name}-")) || name.starts_with(&format!("lib{crate_name}."))
+}
+
+/// Select the artifacts of a `-L dependency` directory.
+///
+/// `dependency_closure` keys crates by the extern name the dependent uses.
+/// A dependency renamed in `Cargo.toml` (`package = "..."`) is only visible
+/// under its alias there, so the closure may name crates that match no
+/// artifact and silently drop whole subtrees. rustc needs a superset of what
+/// it loads, so an unresolvable closure falls back to the whole directory.
+fn dependency_selection(out_dir: &Path, externs: &[String], files: &[PathBuf]) -> LinkSelection {
+    let Some(closure) = dependency_closure(out_dir, externs) else {
+        return LinkSelection::All;
+    };
+    let unresolved: Vec<&String> = closure
+        .iter()
+        .filter(|crate_name| !files.iter().any(|file| artifact_matches(file, crate_name)))
+        .collect();
+    if unresolved.is_empty() {
+        return LinkSelection::Closure(closure);
+    }
+    LogStruct::new(
+        LogLevel::Warning,
+        "依赖闭包回退",
+        format!(
+            "closure={} unresolved={unresolved:?} reason=renamed-or-unknown-extern",
+            closure.len()
+        ),
+    )
+    .emit();
+    LinkSelection::All
 }
 
 fn add_dependency_files(
@@ -304,58 +369,39 @@ fn add_dependency_files(
     if !path.is_dir() {
         return Ok(());
     }
-    // rustc needs the transitive closure of the direct externs available in the
-    // link path, even though we only key the digest on the direct ones below.
-    let closure = if kind == "dependency" {
-        dependency_closure(out_dir, externs).unwrap_or_default()
+    let files = artifact_files(path)?;
+    // Only `-L dependency` carries the transitive crate artifacts. Other kinds
+    // (native, framework, ...) point at directories whose contents are already
+    // part of the action inputs, so they keep the direct-extern filter.
+    let selection = if kind == "dependency" {
+        dependency_selection(out_dir, externs, &files)
     } else {
-        std::collections::HashSet::from_iter(externs.iter().cloned())
+        LinkSelection::Closure(externs.iter().cloned().collect())
     };
 
-    let mut matched: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(path)
-        .map_err(|error| ManifestError::new(format!("read deps {}: {error}", path.display())))?
-    {
-        let entry = entry.map_err(|error| ManifestError::new(error.to_string()))?;
-        let file = entry.path();
-        if !file.is_file() {
+    let mut matched = 0usize;
+    for file in &files {
+        if let LinkSelection::Closure(closure) = &selection
+            && !closure
+                .iter()
+                .any(|crate_name| artifact_matches(file, crate_name))
+        {
             continue;
         }
-        let extension = file
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if !matches!(extension, "rmeta" | "rlib" | "so" | "a" | "dylib" | "dll") {
-            continue;
-        }
+        matched += 1;
         let name = file.file_name().unwrap_or_default().to_string_lossy();
-        let keep = closure.iter().any(|crate_name| {
-            name.starts_with(&format!("lib{crate_name}-"))
-                || name.starts_with(&format!("lib{crate_name}."))
-        });
-        if !keep {
-            continue;
-        }
-        matched.push(name.to_string());
         let logical = format!("deps/{kind}/{name}");
-        add_artifact(&file, &logical, inputs)?;
+        add_artifact(file, &logical, inputs)?;
     }
 
     if let Some(log_path) = std::env::var_os("NEXUSCOMPILE_SCAN_LOG") {
-        let missing: Vec<String> = closure
-            .iter()
-            .filter(|crate_name| {
-                !matched.iter().any(|name| {
-                    name.starts_with(&format!("lib{crate_name}-"))
-                        || name.starts_with(&format!("lib{crate_name}."))
-                })
-            })
-            .cloned()
-            .collect();
+        let selection_name = match &selection {
+            LinkSelection::All => "all",
+            LinkSelection::Closure(_) => "closure",
+        };
         let line = format!(
-            "crate={crate_name} kind={kind} externs={externs:?} closure={} matched={} missing={missing:?}\n",
-            closure.len(),
-            matched.len()
+            "crate={crate_name} kind={kind} externs={externs:?} selection={selection_name} files={} matched={matched}\n",
+            files.len()
         );
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -774,9 +820,14 @@ mod tests {
         ])
     }
 
-    fn collect(root: &Path, out: &Path, extern_path: &Path) -> ActionManifest {
+    fn collect_with(
+        root: &Path,
+        out: &Path,
+        extern_path: &Path,
+        links: &[(&str, &Path)],
+    ) -> ActionManifest {
         let env = base_env(root, out);
-        let args = vec![
+        let mut args = vec![
             "--crate-name".into(),
             "demo".into(),
             "--crate-type".into(),
@@ -787,8 +838,27 @@ mod tests {
             "--extern".into(),
             format!("dep={}", extern_path.display()),
         ];
-        let rustc = Path::new("rustc");
-        collect_manifest(root, rustc, &args, &env).unwrap()
+        for (kind, path) in links {
+            args.push("-L".into());
+            args.push(format!("{kind}={}", path.display()));
+        }
+        collect_manifest(root, Path::new("rustc"), &args, &env).unwrap()
+    }
+
+    fn collect(root: &Path, out: &Path, extern_path: &Path) -> ActionManifest {
+        collect_with(root, out, extern_path, &[])
+    }
+
+    fn fingerprint(profile: &Path, unit: &str, deps: &str) {
+        // The manifest reads the crate name from `lib-<crate>.json`.
+        let crate_name = unit.split_once('-').map_or(unit, |(name, _)| name);
+        let dir = profile.join(".fingerprint").join(unit);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("lib-{crate_name}.json")),
+            format!("{{\"deps\":{deps}}}"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -834,5 +904,83 @@ mod tests {
     fn target_installed_checks_sysroot() {
         assert!(target_installed(Path::new("rustc"), "").unwrap());
         assert!(!target_installed(Path::new("rustc"), "definitely-not-a-target").unwrap());
+    }
+
+    #[test]
+    fn renamed_dependency_falls_back_to_full_link_dir() {
+        let root = TempDir::new("manifest-alias");
+        let profile = root.join("profile");
+        let out = profile.join("deps");
+        let links = root.join("linkdeps");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&links).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}").unwrap();
+        // `dep` depends on a renamed crate: the fingerprint records the alias,
+        // the artifact carries the target name.
+        fingerprint(&profile, "dep-0000000000000001", "[[1,\"yamux012\",false,2]]");
+        fs::write(links.join("libdep-0000000000000001.rmeta"), b"dep").unwrap();
+        fs::write(links.join("libyamux-0000000000000001.rmeta"), b"yamux").unwrap();
+        let extern_path = root.join("libdep.rlib");
+        fs::write(&extern_path, b"rlib").unwrap();
+
+        let manifest = collect_with(&root, &out, &extern_path, &[("dependency", &links)]);
+        let paths: Vec<&str> = manifest.inputs.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"deps/dependency/libdep-0000000000000001.rmeta"));
+        assert!(
+            paths.contains(&"deps/dependency/libyamux-0000000000000001.rmeta"),
+            "renamed dependency artifact must stay in the link dir"
+        );
+    }
+
+    #[test]
+    fn closure_still_filters_unrelated_artifacts() {
+        let root = TempDir::new("manifest-closure");
+        let profile = root.join("profile");
+        let out = profile.join("deps");
+        let links = root.join("linkdeps");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&links).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}").unwrap();
+        fingerprint(&profile, "dep-0000000000000001", "[[1,\"dep_child\",false,2]]");
+        fingerprint(&profile, "dep_child-0000000000000001", "[]");
+        fs::write(links.join("libdep-0000000000000001.rmeta"), b"dep").unwrap();
+        fs::write(links.join("libdep_child-0000000000000001.rmeta"), b"child").unwrap();
+        fs::write(links.join("libunrelated-0000000000000001.rmeta"), b"no").unwrap();
+        let extern_path = root.join("libdep.rlib");
+        fs::write(&extern_path, b"rlib").unwrap();
+
+        let manifest = collect_with(&root, &out, &extern_path, &[("dependency", &links)]);
+        let paths: Vec<&str> = manifest.inputs.iter().map(|i| i.path.as_str()).collect();
+        assert!(paths.contains(&"deps/dependency/libdep_child-0000000000000001.rmeta"));
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.starts_with("deps/dependency/libunrelated")),
+            "unrelated artifacts must stay filtered"
+        );
+    }
+
+    #[test]
+    fn missing_fingerprints_keep_all_link_artifacts() {
+        let root = TempDir::new("manifest-no-fingerprint");
+        let profile = root.join("profile");
+        let out = profile.join("deps");
+        let links = root.join("linkdeps");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&links).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn demo() {}").unwrap();
+        fs::write(links.join("libany-0000000000000001.rmeta"), b"any").unwrap();
+        let extern_path = root.join("libdep.rlib");
+        fs::write(&extern_path, b"rlib").unwrap();
+
+        let manifest = collect_with(&root, &out, &extern_path, &[("dependency", &links)]);
+        let paths: Vec<&str> = manifest.inputs.iter().map(|i| i.path.as_str()).collect();
+        assert!(
+            paths.contains(&"deps/dependency/libany-0000000000000001.rmeta"),
+            "without a fingerprint graph the whole link dir is kept"
+        );
     }
 }
