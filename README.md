@@ -188,10 +188,10 @@ NexusCompile config-check    --config <file>   # parse + warnings; exit 2 on inv
 ### Execution flow
 
 1. Compute the action digest (toolchain, target, normalized args/env, input file hashes).
-2. On a local result-cache hit, materialize the outputs into `--out-dir` and return success.
-3. On a miss, rewrite `--out-dir` to a staging directory and run rustc.
-4. On success, rewrite staging paths in `.d` files, store outputs in the CAS, then cache and materialize them into the real `--out-dir`.
-5. On compile failure, return the exit code, stdout, and stderr unchanged.
+2. Ask the task socket: local cache lookup first, then the remote cache table recorded from earlier remote results.
+3. On a hit, download the outputs over the task socket and write them into `--out-dir`.
+4. On a miss, wait briefly for any `--extern` sibling (`.rmeta` ↔ `.rlib`), build the bundle, and upload it (`Start` carries `toolchain_id` and `target`).
+5. The backend decodes and materializes the bundle only when a slot is assigned, runs rustc, and returns the outputs; the wrapper writes them into `--out-dir`.
 
 The wrapper replays the local result to cargo as stdout/stderr and an exit code. If the node is offline, the invocation is unsupported, or infrastructure fails, the wrapper `exec`s the real rustc.
 
@@ -212,7 +212,10 @@ as a compatibility path base; the legacy `nexus.sock` server has been removed.
 ### Cache behavior
 
 - The cache is partitioned by action digest; outputs are stored by SHA-256 content address in the CAS.
-- Result TTL is fixed at 24 hours; hits renew the TTL; the TTL resets after a restart.
+- Result TTL is fixed at 24 hours; a lookup renews the entry at the moment it hits, and the TTL resets after a restart.
+- A lookup is the only read path: it drops expired entries while it scans, validates that the blobs still exist, and returns the output list. Hits never materialize into the build directory.
+- Upstream artifacts are keyed by the task id that produced them: `nexus-rustc` writes `<artifact>.nexus` next to each output, and a later manifest uses that id instead of the file content. This keeps digests independent of the staging directory and the target path.
+- Eviction runs in a background thread every 60 seconds and reclaims the least recently used entries. There is no pinning: an in-flight download does not protect its entry.
 - The cache is local only and is not shared across nodes. The consumer keeps an in-memory location hint for remote providers that successfully served a digest; a later `FetchCached` asks that provider for the result, and a failure removes the hint before falling back to the compile pool.
 - If the cache cannot be opened, it degrades to disabled; if local execution fails, the wrapper falls back to the real rustc.
 
@@ -266,7 +269,7 @@ try local result cache
 - `Reserve` never consults the cache; `Status` reports only the task entry.
 - `Cancel` marks the task `Cancelled` and frees the slot.
 
-`Reserve` only reserves a slot and creates a lease; it does not inspect the task. The provider side performs the full review after `TaskReady`, once the bundle has been uploaded:
+`Reserve` only reserves a slot and creates a lease; it does not inspect the task. The backend checks the bundle file hash and enqueues it, then performs the full review when a slot is assigned:
 
 1. verifies that the bundle file hash equals `Reserve.input_manifest`;
 2. reviews the invocation shape and recomputes the manifest digest against `TaskId`;
@@ -285,7 +288,7 @@ If `TaskReady` review fails, the provider fails the task, removes the bundle dir
 - Local admission uses `available_slots = free_slots - active_slots`; this prevents the shared queue from oversubscribing one sampling window.
 - Providers send `CapacityUpdate` to subscribers; `seq` is monotonically increasing and older sequence numbers are ignored.
 - Consumers build provider views through `Subscribe`/`Subscribed` and drop a provider if no update arrives within `ttl_secs`.
-- Providers are discovered automatically through NexusNet `discover_providers`. Discovery runs only when capacity is insufficient: every 30 seconds when visible capacity is zero or the last discovery failed, otherwise every 1 hour.
+- Providers are discovered automatically through NexusNet `discover_providers`. Discovery runs only when capacity is insufficient: every 30 seconds when visible capacity is zero or the last discovery failed, otherwise every 1 hour. A provider view that expires counts as an abnormal result, so a dropped peer triggers rediscovery within seconds instead of waiting for the hourly interval.
 
 ### Cache and CAS
 
@@ -294,6 +297,23 @@ If `TaskReady` review fails, the provider fails the task, removes the bundle dir
 - Compile staging lives at `<cache>/staging/`; provider task bundles and work dirs live at `<cache>/work/<digest>/`.
 - The quota is controlled by `result_cache_mb`; a background thread checks every 60 seconds and reclaims the oldest entries first.
 - Entries are renewed on every cache hit; expired entries are removed while a lookup runs. There is no pinning: eviction and expiry do not wait for in-flight downloads.
+
+## Toolchain identity
+
+- A rustc identity is `SHA-256(rustc -vV output || target)`.
+- `target` is the configured target; an empty target means a host build.
+- Capability broadcasts use that same string for both the id and the advertised target, so a client requirement computed from the same string matches.
+- The hash covers the whole `-vV` output, so peers must run the same toolchain build — the same commit hash and LLVM version, not merely the same release number.
+
+## Diagnostics
+
+- `NEXUSCOMPILE_WRAPPER_DEBUG` — print the wrapper's fallback reason to stderr.
+- `NEXUSCOMPILE_SCAN_LOG=<file>` — append dependency scan results, per-file hashes at manifest and bundle time, wrapper fallback reasons, and the decoded manifest of each task that starts executing.
+
+## Known limits
+
+- Remote bundles travel as `service_request` messages. A NexusNet node with a small `max_request_bytes` rejects large bundles (observed around 2 MB); newer NexusNet releases raise this limit.
+- Invocations that are not `lib`/`rlib` (proc-macros, bin targets, build scripts) always run through the real rustc, so their artifacts carry no task id and dependents fall back to content hashing.
 
 ## NexusNet integration
 

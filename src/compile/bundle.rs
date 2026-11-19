@@ -227,16 +227,18 @@ impl TaskJob {
             .manifest
             .digest()
             .map_err(|error| TaskError::new("manifest_error", error.to_string()))?;
-        LogStruct::new(
-            LogLevel::Debug,
-            "清单",
-            format!(
-                "digest={} manifest={}",
-                hex_hash(&digest),
-                serde_json::to_string(&bundle.manifest).unwrap_or_default()
-            ),
-        )
-        .emit();
+        if std::env::var_os("NEXUSCOMPILE_SCAN_LOG").is_some() {
+            LogStruct::new(
+                LogLevel::Debug,
+                "清单",
+                format!(
+                    "digest={} manifest={}",
+                    hex_hash(&digest),
+                    serde_json::to_string(&bundle.manifest).unwrap_or_default()
+                ),
+            )
+            .emit();
+        }
         if digest != self.task_id {
             return Err(TaskError::new("manifest_error", "manifest digest mismatch"));
         }

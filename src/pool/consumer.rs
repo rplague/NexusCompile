@@ -21,7 +21,6 @@ pub struct ProviderView {
 #[derive(Debug, Default)]
 struct Inner {
     providers: HashMap<PeerId, ProviderView>,
-    cooldowns: HashMap<PeerId, u64>,
     remote_cache: HashMap<Hash32, Vec<PeerId>>,
 }
 
@@ -104,15 +103,6 @@ impl Consumer {
         AppResponse::Ack
     }
 
-    pub fn cool_down_provider(&self, provider: &PeerId, duration_ms: u64) {
-        let until = now_ms().saturating_add(duration_ms.max(1));
-        self.write().cooldowns.insert(provider.clone(), until);
-    }
-
-    pub fn clear_cooldown(&self, provider: &PeerId) {
-        self.write().cooldowns.remove(provider);
-    }
-
     pub fn remove_provider(&self, provider: &PeerId) {
         let mut inner = self.write();
         inner.providers.remove(provider);
@@ -136,15 +126,7 @@ impl Consumer {
     }
 
     pub fn providers(&self) -> Vec<ProviderView> {
-        let now = now_ms();
-        let mut inner = self.write();
-        inner.cooldowns.retain(|_, until| *until > now);
-        inner
-            .providers
-            .iter()
-            .filter(|(provider, _)| !inner.cooldowns.contains_key(*provider))
-            .map(|(_, view)| view.clone())
-            .collect()
+        self.read().providers.values().cloned().collect()
     }
 
     pub fn record_remote_cache(&self, task_id: Hash32, provider: &PeerId) {
@@ -182,15 +164,7 @@ impl Consumer {
     }
 
     pub fn visible_max_slots(&self) -> u32 {
-        let now = now_ms();
-        let mut inner = self.write();
-        inner.cooldowns.retain(|_, until| *until > now);
-        inner
-            .providers
-            .iter()
-            .filter(|(provider, _)| !inner.cooldowns.contains_key(*provider))
-            .map(|(_, view)| view.max_slots)
-            .sum()
+        self.read().providers.values().map(|view| view.max_slots).sum()
     }
 
     /// Remove all views and return the peers that were dropped.
@@ -318,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_and_cooldown() {
+    fn expiry_removes_views() {
         let consumer = Consumer::new();
         consumer.record_pending(peer("provider"));
         let expired = consumer.expire_providers(now_ms().saturating_add(61_000), 60_000);
@@ -327,14 +301,6 @@ mod tests {
 
         let consumer = Consumer::new();
         consumer.record_subscribed(peer("provider"), 4);
-        consumer.cool_down_provider(&peer("provider"), 60_000);
-        assert!(consumer.providers().is_empty());
-        assert_eq!(consumer.visible_max_slots(), 0);
-
-        consumer.record_subscribed(peer("provider"), 4);
-        assert!(consumer.providers().is_empty());
-
-        consumer.clear_cooldown(&peer("provider"));
         assert_eq!(consumer.providers().len(), 1);
         assert_eq!(consumer.visible_max_slots(), 4);
     }

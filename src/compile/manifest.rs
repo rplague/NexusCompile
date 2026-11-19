@@ -469,9 +469,8 @@ fn read_identity(path: &Path) -> Option<Hash32> {
         return None;
     }
     let mut bytes = [0u8; 32];
-    for index in 0..32 {
-        let start = index * 2;
-        bytes[index] = u8::from_str_radix(&text[start..start + 2], 16).ok()?;
+    for (slot, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+        *slot = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(Hash32(bytes))
 }

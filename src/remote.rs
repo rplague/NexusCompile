@@ -311,7 +311,6 @@ impl Coordinator {
             .await
             {
                 Ok(AppResponse::Granted { lease_id, .. }) => {
-                    self.consumer.clear_cooldown(&provider);
                     lease_id
                 }
                 Ok(AppResponse::Busy { .. }) => {
@@ -394,7 +393,6 @@ impl Coordinator {
             {
                 RemoteOutcome::Success(outputs) => {
                     self.consumer.record_remote_cache(job.task_id, &provider);
-                    self.consumer.clear_cooldown(&provider);
                     LogStruct::new(
                         LogLevel::Debug,
                         "远端编译完成",
